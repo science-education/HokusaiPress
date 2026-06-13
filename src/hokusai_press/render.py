@@ -76,21 +76,22 @@ def render_page_image(
     original_bgr: np.ndarray,
     params: PageParams,
     settings: RenderSettings,
-) -> tuple[np.ndarray, list[dict], str]:
-    """Return (output_bgr, text_lines_for_pdf, page_mode).
+) -> tuple[np.ndarray, list[dict], str, list[tuple]]:
+    """Return (output_bgr, text_lines, page_mode, photo_boxes_px).
 
-    output_bgr is the single-pass warped page. text_lines are in OUTPUT
-    pixels, ready for the searchable text overlay.
+    output_bgr is the single-pass warped page. text_lines and photo_boxes are
+    in OUTPUT pixels, ready for the searchable text overlay and MRC layering.
     """
     M, out_size, _ = compose_transform(original_bgr.shape, params, settings)
     out = cv2.warpAffine(original_bgr, M, out_size, flags=cv2.INTER_AREA,
                          borderValue=(255, 255, 255))
 
     lines = []
-    has_photo = False
+    photo_boxes: list[tuple] = []
     for r in params.regions:
         if r.kind == RegionKind.PHOTO:
-            has_photo = True
+            b = _map_box(r.box, M)
+            photo_boxes.append((b.x0, b.y0, b.x1, b.y1))
         if r.ocr_text:
             b = _map_box(r.box, M)
             lines.append({
@@ -100,11 +101,12 @@ def render_page_image(
                 "direction": "h" if b.width >= b.height else "v",
             })
 
-    if params.page_kind != PageKind.AUTO:
-        mode = params.page_kind.value if params.page_kind != PageKind.MRC else "bw"
+    if params.page_kind in (PageKind.GRAY, PageKind.COLOR):
+        mode = params.page_kind.value   # whole-page forced encoding
     else:
-        mode = "auto" if has_photo else "bw"
-    return out, lines, mode
+        # AUTO / BW / MRC -> bilevel base, photo regions become overlays
+        mode = "bw"
+    return out, lines, mode, photo_boxes
 
 
 def build_pdf(
@@ -112,15 +114,19 @@ def build_pdf(
     originals: list[np.ndarray],
     out_path: str,
 ) -> str:
-    """Assemble the searchable PDF from per-page params + originals."""
-    from hybrid_ocr.pdf_export import SearchablePdfBuilder
+    """Assemble the searchable MRC PDF from per-page params + originals."""
+    from .mrc import MrcPageBuilder
 
-    builder = SearchablePdfBuilder(
-        mode="auto", compress=document.render.bilevel_codec
+    builder = MrcPageBuilder(
+        compress=document.render.bilevel_codec,
+        target_dpi=document.render.target_dpi,
+        jpeg_quality=document.render.jpeg_quality,
     )
     for params, original in zip(document.pages, originals):
-        out_bgr, lines, mode = render_page_image(original, params, document.render)
-        builder.add_page(out_bgr, lines, mode=None if mode == "auto" else mode)
+        out_bgr, lines, mode, photo_boxes = render_page_image(
+            original, params, document.render
+        )
+        builder.add_page(out_bgr, lines, photo_boxes, mode)
     builder.save(out_path)
     _set_physical_page_size(out_path, document.render.target_dpi)
     return out_path

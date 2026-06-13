@@ -50,18 +50,24 @@ def test_render_one_shot_output_shape_and_mode():
     regions = [Region(kind=RegionKind.TEXT, box=Box(60, 110, 240, 130),
                       ocr_text="あいう")]
     params = _params(Box(50, 100, 250, 500), regions=regions)
-    out, lines, mode = render_page_image(img, params, settings)
+    out, lines, mode, photo_boxes = render_page_image(img, params, settings)
     assert out.shape[0] == 400 and out.shape[1] == 200
     assert mode == "bw"  # no photo region -> bilevel
+    assert photo_boxes == []
     assert lines and lines[0]["text"] == "あいう"
     # text box mapped into output space (origin shifted by crop)
     assert lines[0]["box"][0] >= 0 and lines[0]["box"][1] >= 0
 
 
-def test_photo_region_triggers_auto():
+def test_photo_region_becomes_overlay_box():
     settings = RenderSettings(output_margin_mm=0.0)
     regions = [Region(kind=RegionKind.PHOTO, box=Box(60, 200, 240, 400))]
     params = _params(Box(50, 100, 250, 500), regions=regions)
-    _, _, mode = render_page_image(np.full((800, 600, 3), 255, np.uint8),
-                                   params, settings)
-    assert mode == "auto"
+    _, _, mode, photo_boxes = render_page_image(
+        np.full((800, 600, 3), 255, np.uint8), params, settings)
+    assert mode == "bw"  # MRC: bilevel base, photo as overlay
+    assert len(photo_boxes) == 1
+    # mapped into output space: original (60,200)-(240,400) shifted by crop origin
+    x0, y0, x1, y1 = photo_boxes[0]
+    assert abs(x0 - 10) < 1e-6 and abs(y0 - 100) < 1e-6
+    assert abs(x1 - 190) < 1e-6 and abs(y1 - 300) < 1e-6
