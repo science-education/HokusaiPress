@@ -68,10 +68,11 @@ def analyze_document(
         originals.append(original)
         margins.append(mg)
 
-    # 5. cross-page margin consistency
+    # 5. cross-page margin consistency + nombre-anchored normalization
     for params, flag in zip(doc.pages, margin_mod.align_margins(margins)):
         if flag is not None:
             params.flags.append(flag)
+    margin_mod.normalize_margins(doc.pages, doc.render.output_margin_mm)
 
     # 6. assign review status
     for params in doc.pages:

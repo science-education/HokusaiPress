@@ -90,6 +90,71 @@ def _detect_nombre(binary: np.ndarray, content: Box) -> Box | None:
     return best[1] if best else None
 
 
+def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
+    """Nombre-anchored margin normalization (mutates each page's margin.crop).
+
+    The value ScanTailorAdvancedTATEGAKI adds over generic tools: make the body
+    occupy the *same* place on every page so the finished book is visually even.
+
+    Pages are grouped by parity (recto/verso) because inner/outer margins
+    differ between facing pages. Within a group:
+    - the output crop SIZE is uniform, taken as the largest content extent in
+      the group (in physical inches when dpi is known, so mixed-dpi sources
+      still yield equal output pages) plus the output margin -- the max
+      guarantees no page's body is ever clipped;
+    - each page's content is placed at a common anchor inside that crop: the
+      head (top) margin is constant, and when a nombre was found its center is
+      driven to the group's common position (the literal "nombre-based margin");
+      pages without a nombre fall back to horizontal centering.
+
+    Safety: normalization never shrinks the crop below a page's own content, so
+    it cannot clip text. Outlier pages (content far larger than the group) are
+    left correct but flagged elsewhere for review.
+    """
+    by_parity: dict[int, list] = {0: [], 1: []}
+    for p in pages:
+        if p.margin and p.margin.content:
+            by_parity[p.source.page_index % 2].append(p)
+
+    for group in by_parity.values():
+        if not group:
+            continue
+        use_dpi = all(p.dpi for p in group)
+
+        def extent(p, px):  # content size in inches (if dpi) else pixels
+            return px / p.dpi if use_dpi else px
+
+        max_w = max(extent(p, p.margin.content.width) for p in group)
+        max_h = max(extent(p, p.margin.content.height) for p in group)
+
+        # common nombre vertical position (inches/px from crop top), if any
+        nombre_offsets = []
+        for p in group:
+            if p.margin.nombre_box:
+                margin_px_p = output_margin_mm / 25.4 * (p.dpi or 1) if use_dpi \
+                    else output_margin_mm / 25.4 * 96
+                top = p.margin.content.y0 - margin_px_p
+                noff = extent(p, p.margin.nombre_box.y0 - top)
+                nombre_offsets.append(noff)
+        common_noff = float(np.median(nombre_offsets)) if nombre_offsets else None
+
+        for p in group:
+            dpi = p.dpi if use_dpi else 1.0
+            margin_px = output_margin_mm / 25.4 * (p.dpi if use_dpi else 96)
+            crop_w = (max_w + 2 * (output_margin_mm / 25.4)) * (dpi if use_dpi else 1)
+            crop_h = (max_h + 2 * (output_margin_mm / 25.4)) * (dpi if use_dpi else 1)
+            c = p.margin.content
+            # horizontal: center the content within the crop
+            x0 = c.x0 + c.width / 2 - crop_w / 2
+            # vertical: anchor by nombre if available, else constant head margin
+            if common_noff is not None and p.margin.nombre_box:
+                noff_px = common_noff * (dpi if use_dpi else 1)
+                y0 = p.margin.nombre_box.y0 - noff_px
+            else:
+                y0 = c.y0 - margin_px
+            p.margin.crop = Box(x0, y0, x0 + crop_w, y0 + crop_h)
+
+
 def align_margins(margins: list[Margin]) -> list[Flag | None]:
     """Cross-page consistency check. Returns a per-page flag (or None).
 

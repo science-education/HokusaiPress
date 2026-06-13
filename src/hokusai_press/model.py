@@ -105,6 +105,11 @@ class Margin:
     confidence: float = 0.0
     # nombre (page-number) anchor used to align margins across pages, if found
     nombre_box: Optional[Box] = None
+    # normalized output crop (deskewed coords), set by margin normalization so
+    # every page in a parity group renders to the same size with the body in a
+    # consistent position. Already includes the output margin. When present the
+    # renderer crops to this instead of content+margin.
+    crop: Optional[Box] = None
 
 
 @dataclass
@@ -197,6 +202,7 @@ def _decode_page(d) -> PageParams:
             content=_box(margin["content"]),
             confidence=margin.get("confidence", 0.0),
             nombre_box=_box(margin.get("nombre_box")),
+            crop=_box(margin.get("crop")),
         ),
         regions=[_decode_region(r) for r in d.get("regions", [])],
         page_kind=PageKind(d.get("page_kind", "auto")),

@@ -41,17 +41,20 @@ def compose_transform(
     R = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle, 1.0)
     R_h = np.vstack([R, [0, 0, 1]])
 
-    # crop box in deskewed frame: content padded by the normalized margin
-    if params.margin and params.margin.content:
-        c = params.margin.content
-    else:
-        c = Box(0, 0, w, h)
     dpi = params.dpi or settings.target_dpi
-    margin_px = settings.output_margin_mm / 25.4 * dpi
-    cx0 = c.x0 - margin_px
-    cy0 = c.y0 - margin_px
-    crop_w = c.width + 2 * margin_px
-    crop_h = c.height + 2 * margin_px
+    # crop box in deskewed frame. Prefer the normalized crop (uniform size,
+    # nombre-anchored) when margin normalization has run; otherwise fall back
+    # to the raw content box padded by the output margin.
+    if params.margin and params.margin.crop:
+        crop = params.margin.crop
+        cx0, cy0, crop_w, crop_h = crop.x0, crop.y0, crop.width, crop.height
+    elif params.margin and params.margin.content:
+        c = params.margin.content
+        margin_px = settings.output_margin_mm / 25.4 * dpi
+        cx0, cy0 = c.x0 - margin_px, c.y0 - margin_px
+        crop_w, crop_h = c.width + 2 * margin_px, c.height + 2 * margin_px
+    else:
+        cx0, cy0, crop_w, crop_h = 0, 0, w, h
 
     scale = settings.target_dpi / dpi if dpi else 1.0
     # scale + translate so (cx0,cy0) -> (0,0) and then upscale to target dpi
@@ -119,4 +122,27 @@ def build_pdf(
         out_bgr, lines, mode = render_page_image(original, params, document.render)
         builder.add_page(out_bgr, lines, mode=None if mode == "auto" else mode)
     builder.save(out_path)
+    _set_physical_page_size(out_path, document.render.target_dpi)
     return out_path
+
+
+def _set_physical_page_size(pdf_path: str, dpi: int) -> None:
+    """Rewrite each page's MediaBox from pixels (1px=1pt) to physical points
+    at `dpi`, wrapping the content in a scale so the image still fills the
+    page and the searchable-text layer stays aligned. Without this an ebook
+    page reports a giant point size (e.g. 2820pt instead of ~340pt)."""
+    import pikepdf
+
+    s = 72.0 / dpi
+    with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
+        for page in pdf.pages:
+            mb = [float(v) for v in page.MediaBox]
+            w_px, h_px = mb[2] - mb[0], mb[3] - mb[1]
+            pg = pikepdf.Page(page)
+            pg.contents_add(
+                pikepdf.Stream(pdf, f"q {s} 0 0 {s} 0 0 cm".encode()),
+                prepend=True,
+            )
+            pg.contents_add(pikepdf.Stream(pdf, b"Q"), prepend=False)
+            page.MediaBox = [0, 0, round(w_px * s, 3), round(h_px * s, 3)]
+        pdf.save()
