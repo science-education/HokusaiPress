@@ -79,6 +79,21 @@ def load_page(path: str) -> Iterator[tuple[SourceRef, np.ndarray, np.ndarray, fl
         doc.close()
 
 
+def load_single(path: str, page_index: int) -> tuple[np.ndarray, float | None]:
+    """Re-extract one page's original image (for the review UI / re-render)."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext != ".pdf":
+        return _imread_unicode(path), None
+    import pypdfium2 as pdfium
+
+    doc = pdfium.PdfDocument(path)
+    try:
+        original, dpi, _ = _extract_original(doc[page_index], doc, page_index)
+        return original, dpi
+    finally:
+        doc.close()
+
+
 def _extract_original(page, doc, index: int) -> tuple[np.ndarray, float | None, str | None]:
     """Prefer the single embedded full-page image (lossless original). Fall
     back to a 300 dpi rasterization when a page is not a simple scan."""

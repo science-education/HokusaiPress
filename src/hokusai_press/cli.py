@@ -33,6 +33,13 @@ def main(argv=None) -> int:
     p_web.add_argument("--host", default="127.0.0.1")
     p_web.add_argument("--port", type=int, default=8765)
 
+    p_re = sub.add_parser("rebuild",
+                          help="regenerate a PDF from stored (corrected) params")
+    p_re.add_argument("source", help="original source PDF/image")
+    p_re.add_argument("--doc", required=True, help="doc id (source basename)")
+    p_re.add_argument("--out", required=True, help="output PDF path")
+    p_re.add_argument("--db", default="hokusai.db")
+
     args = parser.parse_args(argv)
 
     if args.command == "run":
@@ -68,6 +75,14 @@ def main(argv=None) -> int:
         from .webui.app import serve
 
         serve(args.db, host=args.host, port=args.port)
+        return 0
+
+    if args.command == "rebuild":
+        from .pipeline import rebuild
+
+        summary = rebuild(args.doc, args.source, args.out, db_path=args.db)
+        print(f"[OK] rebuilt {summary['doc_id']}: {summary['pages']} pages "
+              f"-> {summary['out_pdf']}")
         return 0
 
     return 1

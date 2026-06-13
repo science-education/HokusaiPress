@@ -56,7 +56,10 @@ class PageRow:
 
 class Store:
     def __init__(self, db_path: str = "hokusai.db"):
-        self.conn = sqlite3.connect(db_path)
+        # check_same_thread=False: the review web UI serves sync endpoints from
+        # a threadpool; this is a local single-user store so cross-thread use
+        # of one connection is safe.
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
         self.conn.commit()
@@ -102,6 +105,18 @@ class Store:
                 "ORDER BY doc_id, page_index"
             ).fetchall()
         return [_row_to_page(r) for r in rows]
+
+    def list_pages(self, doc_id: str) -> list[PageRow]:
+        rows = self.conn.execute(
+            "SELECT * FROM pages WHERE doc_id=? ORDER BY page_index", (doc_id,)
+        ).fetchall()
+        return [_row_to_page(r) for r in rows]
+
+    def doc_ids(self) -> list[str]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT doc_id FROM pages ORDER BY doc_id"
+        ).fetchall()
+        return [r["doc_id"] for r in rows]
 
     def log_decision(
         self,

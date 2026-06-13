@@ -121,3 +121,32 @@ def run(
         "needs_review": flagged,
         "out_pdf": out_pdf,
     }
+
+
+def rebuild(doc_id: str, source_path: str, out_pdf: str,
+            db_path: str = "hokusai.db") -> dict:
+    """Regenerate the PDF purely from stored (possibly corrected) parameters.
+
+    The output is a pure function of the parameters + the original image, so a
+    review correction is realized simply by re-rendering — no image was ever
+    destructively edited. This is the non-destructive model paying off.
+    """
+    from .render import build_pdf
+    from .source import load_single
+
+    store = Store(db_path)
+    try:
+        rows = store.list_pages(doc_id)
+    finally:
+        store.close()
+    if not rows:
+        raise ValueError(f"no stored pages for doc_id={doc_id}")
+
+    doc = Document(source_path=source_path)
+    originals = []
+    for row in rows:
+        doc.pages.append(row.params)
+        original, _ = load_single(source_path, row.params.source.page_index)
+        originals.append(original)
+    build_pdf(doc, originals, out_pdf)
+    return {"doc_id": doc_id, "pages": len(rows), "out_pdf": out_pdf}

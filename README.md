@@ -34,12 +34,18 @@
 
 ```bash
 pip install -e .[ocr,web]
-hokusai-press run scan.pdf --out book.pdf --device npu   # バッチ
-hokusai-press queue                                       # 要レビュー一覧
-hokusai-press review                                      # レビューWeb UI
+hokusai-press run scan.pdf --out book.pdf --device npu      # バッチ解析+生成
+hokusai-press queue                                          # 要レビュー一覧
+hokusai-press review                                         # レビューWeb UI
+hokusai-press rebuild scan.pdf --doc scan.pdf --out book.pdf  # 修正後に再生成
 ```
 
 `--no-ocr` で OCR を省略し幾何処理＋ヒューリスティック分離のみでも動作します。
+
+レビュー UI はフラグ付きページのみを表示し、各ページの「解析オーバーレイ
+（傾き補正後＋内容枠＋領域分類＋ノンブル）」と「出力プレビュー」を並べて表示。
+ページ種別（bw/gray/color）を上書きすると判断が特徴量つきでログされ、`rebuild`
+が修正済みパラメータから PDF を無劣化再生成します（出力はパラメータの純関数）。
 
 ## ライセンス
 
@@ -53,6 +59,14 @@ hokusai-press review                                      # レビューWeb UI
 
 ## 状態
 
-v0 骨格。データモデル・ジョブ/判断ストア・deskew（確信度つき）・1パスレンダラ・
-バッチCLI・レビューUIの骨組みが稼働。ノンブル基準マージンのページ間最適化（C++
-からの移植）と多層 MRC は次段。
+実装済み・検証済み（21テスト、CI ubuntu+windows）:
+- 非破壊パラメータモデル + JSON/SQLite 永続化
+- deskew（確信度つき、縦横書き両対応）
+- ノンブル基準マージン正規化（パリティ別・均一判型・クリップなし）
+- 1パスレンダラ + 物理ページサイズ（実書籍で 4.70×7.27 inch 均一を確認）
+- 多層 MRC（二値テキスト層 G4/JBIG2 + 写真層 JPEG、字は鮮明・写真は軽量）
+- バッチ → 低確信ページのみレビュー（画像オーバーレイ表示）→ 判断ログ → rebuild
+- 検索可能テキスト層
+
+次段: ノンブル基準マージンのページ間最適化の本格 C++ 移植、RT-DETRv2 図領域の
+content.py 配線、レビュー UI の領域編集、判断ログからの自動判定学習。
