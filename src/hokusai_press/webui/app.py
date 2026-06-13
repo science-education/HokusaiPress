@@ -159,27 +159,6 @@ button{{padding:3px 8px}}
     bw ページでは <b>photo 領域</b>だけがグレー/カラーで残り、文字・線画は二値化されます。</p>
   </div>
 </div>
-<p>finish（編集を終えてキューへ戻す）:
-  <button onclick="finish()" style="font-weight:bold">done（修正完了）</button>
-  <button onclick="approve()">approve as-is（無修正で承認）</button>
-</p>
-
-<details style="max-width:760px;margin:8px 0;padding:8px 12px;background:#f6f6f6;border:1px solid #ddd">
-<summary><b>page kind とは？「bw の中のグレー画像」はどうする？</b></summary>
-<p style="margin:6px 0">処理は<b>2軸</b>です。混同しないでください。</p>
-<ul style="margin:6px 0">
-  <li><b>page kind</b>（bw / gray / color）= ページ<b>全体</b>のベース層コーデック。
-      <code>gray</code>/<code>color</code> は「全面が写真・図版」「地紙ごと退色」など
-      <b>全面トーン維持</b>が要るときの<b>フォールバック</b>です。</li>
-  <li><b>region</b>（text / figure / photo）= <b>領域ごと</b>のトーン処理。これが本命。
-      <code>text</code>・<code>figure</code>(線画) は二値（くっきり）、
-      <code>photo</code>(連続調) はその矩形だけグレー/カラーJPEGで上に重ねます（MRC）。</li>
-</ul>
-<p style="margin:6px 0"><b>「bw ページの中のグレー写真」→ page kind は bw のまま、
-その範囲を <code>photo</code> 領域として追加</b>してください。
-文字は二値で鮮明・写真だけグレーで軽い、が同一ページ内で両立します。
-gray/color は自動判定（領域の彩度）ですが、<i>tone</i> で固定もできます。</p>
-</details>
 <script>
 const ORIG_W={ow}, ORIG_H={oh};
 (function(){{
@@ -231,18 +210,6 @@ async function decide(kind){{
   await fetch('/api/page/{doc_id}/{page_index}/decide',{{method:'POST',
     headers:{{'Content-Type':'application/json'}},
     body:JSON.stringify({{page_kind:kind}})}});
-  location.href='/';
-}}
-async function approve(){{
-  await fetch('/api/page/{doc_id}/{page_index}/decide',{{method:'POST',
-    headers:{{'Content-Type':'application/json'}},
-    body:JSON.stringify({{approve:true}})}});
-  location.href='/';
-}}
-async function finish(){{
-  await fetch('/api/page/{doc_id}/{page_index}/decide',{{method:'POST',
-    headers:{{'Content-Type':'application/json'}},
-    body:JSON.stringify({{finish:true}})}});
   location.href='/';
 }}
 async function delRegion(i){{
