@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hokusai-press"
+version = "0.0.1"
+description = "Scan PDF to clean, light, searchable e-book PDF (non-destructive, batch-first, with a review queue)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-or-later" }
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "pypdfium2",
+    "pikepdf",
+]
+
+[project.optional-dependencies]
+# OCR + searchable-PDF assembly engine (detector is CC BY-NC-SA 4.0 -> output
+# is non-commercial; see README).
+ocr = ["hybrid-ocr"]
+# Review web UI.
+web = ["fastapi", "uvicorn", "pydantic"]
+dev = ["pytest"]
+
+[project.scripts]
+hokusai-press = "hokusai_press.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hokusai_press"]

@@ -1,0 +1,106 @@
+"""Page ingest.
+
+Principle (non-destructive): the final image layer must be computed from the
+highest-fidelity *original* pixels. For scan PDFs that means the embedded
+page image (extracted losslessly via pikepdf), not a rasterization. The
+300 dpi render is only the working resolution for OCR/geometry; the scale
+factor back to original pixels is recorded so every box maps both ways.
+
+load_page() yields (SourceRef, original_bgr, ocr_bgr) per page:
+- original_bgr : full-resolution original (embedded image, or the image file)
+- ocr_bgr      : downscaled to ~OCR_DPI for detection/recognition
+- SourceRef.ocr_scale : ocr_px = original_px * ocr_scale
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Iterator
+
+import cv2
+import numpy as np
+
+from .model import SourceRef
+
+OCR_DPI = 300
+IMAGE_EXT = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".jp2", ".webp")
+
+
+def _imread_unicode(path: str) -> np.ndarray:
+    data = np.fromfile(path, dtype=np.uint8)
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError(f"cannot decode image: {path}")
+    return img
+
+
+def _downscale_for_ocr(img: np.ndarray, src_dpi: float | None) -> tuple[np.ndarray, float]:
+    """Return (ocr_image, ocr_scale). If src dpi unknown, only downscale very
+    large images so OCR stays fast; ocr_scale records the mapping."""
+    h, w = img.shape[:2]
+    if src_dpi and src_dpi > OCR_DPI:
+        scale = OCR_DPI / src_dpi
+    elif max(h, w) > 3000:
+        scale = 3000 / max(h, w)
+    else:
+        scale = 1.0
+    if scale >= 0.999:
+        return img, 1.0
+    ocr = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),
+                     interpolation=cv2.INTER_AREA)
+    return ocr, scale
+
+
+def load_page(path: str) -> Iterator[tuple[SourceRef, np.ndarray, np.ndarray, float | None]]:
+    """Yield (SourceRef, original_bgr, ocr_bgr, dpi) for each page."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext != ".pdf":
+        img = _imread_unicode(path)
+        ocr, scale = _downscale_for_ocr(img, None)
+        yield SourceRef(path=path, ocr_scale=scale), img, ocr, None
+        return
+
+    import pypdfium2 as pdfium
+
+    doc = pdfium.PdfDocument(path)
+    try:
+        for i in range(len(doc)):
+            page = doc[i]
+            original, dpi, img_id = _extract_original(page, doc, i)
+            ocr, scale = _downscale_for_ocr(original, dpi)
+            yield (
+                SourceRef(path=path, page_index=i, embedded_image_id=img_id,
+                          ocr_scale=scale),
+                original,
+                ocr,
+                dpi,
+            )
+    finally:
+        doc.close()
+
+
+def _extract_original(page, doc, index: int) -> tuple[np.ndarray, float | None, str | None]:
+    """Prefer the single embedded full-page image (lossless original). Fall
+    back to a 300 dpi rasterization when a page is not a simple scan."""
+    import pypdfium2 as pdfium
+    import pypdfium2.raw as pdfium_c
+
+    images = [obj for obj in page.get_objects()
+              if obj.type == pdfium_c.FPDF_PAGEOBJ_IMAGE]
+    page_w_pt, page_h_pt = page.get_size()
+
+    if len(images) == 1:
+        img_obj = images[0]
+        try:
+            pil = img_obj.get_bitmap(render=False).to_pil()
+            arr = np.array(pil.convert("RGB"))
+            bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            # dpi from embedded pixel size vs page point size
+            dpi = bgr.shape[1] / (page_w_pt / 72.0) if page_w_pt else None
+            return bgr, dpi, "img0"
+        except Exception:
+            pass
+
+    bitmap = page.render(scale=OCR_DPI / 72)
+    bgr = cv2.cvtColor(bitmap.to_numpy()[..., :3], cv2.COLOR_RGB2BGR)
+    return bgr, float(OCR_DPI), None
