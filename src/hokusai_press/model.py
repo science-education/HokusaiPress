@@ -61,6 +61,8 @@ class Flag(str, Enum):
     OCR_DROPOUT_RETRY = "ocr_dropout_retry_fired"
     DETECTION_DENSITY = "detection_density_anomaly"
     NO_TEXT = "no_text_detected"
+    NOMBRE_UNREADABLE = "nombre_unreadable"      # no readable page number found
+    PAGE_NUMBER_GAP = "page_number_gap"          # sequence break (possible miss)
 
 
 @dataclass
@@ -137,6 +139,9 @@ class PageParams:
     flags: list[Flag] = field(default_factory=list)
     review_status: ReviewStatus = ReviewStatus.AUTO
     decided_by: Optional[DecidedBy] = None
+    # page number read from the nombre region (OCR), and its parsed integer
+    nombre_text: Optional[str] = None
+    page_number: Optional[int] = None
 
     def needs_review(self) -> bool:
         return self.review_status == ReviewStatus.NEEDS_REVIEW
@@ -215,6 +220,8 @@ def _decode_page(d) -> PageParams:
         flags=[Flag(f) for f in d.get("flags", [])],
         review_status=ReviewStatus(d.get("review_status", "auto")),
         decided_by=None if d.get("decided_by") is None else DecidedBy(d["decided_by"]),
+        nombre_text=d.get("nombre_text"),
+        page_number=d.get("page_number"),
     )
 
 

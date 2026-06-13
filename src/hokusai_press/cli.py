@@ -119,6 +119,8 @@ def main(argv=None) -> int:
                 flagged_docs += 1
                 line += f"  (needs review: {len(summary['needs_review'])} pages)"
             print(line)
+            for w in summary.get("warnings", []):
+                print(f"  [warn] {w}")
         if len(sources) > 1:
             print(f"[done] {len(sources)} files, {flagged_docs} need review")
         if flagged_docs:

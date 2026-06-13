@@ -32,6 +32,11 @@ from .store import Store
 class AnalyzeResult:
     document: Document
     originals: list[np.ndarray]
+    warnings: list[str] = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.warnings is None:
+            self.warnings = []
 
 
 def analyze_document(
@@ -71,7 +76,15 @@ def analyze_document(
         originals.append(original)
         margins.append(mg)
 
-    # 5. cross-page margin consistency + nombre-anchored normalization
+    # 5. read page numbers from OCR and snap nombre to the real number (one
+    # consistent band), so normalization anchors correctly and missing pages
+    # can be detected. Runs before align/normalize so the better nombre feeds them.
+    from . import nombre as nombre_mod
+
+    heights = [o.shape[0] for o in originals]
+    warnings = nombre_mod.resolve(doc.pages, heights)
+
+    # 6. cross-page margin consistency + nombre-anchored normalization
     for params, flag in zip(doc.pages, margin_mod.align_margins(margins)):
         if flag is not None:
             params.flags.append(flag)
@@ -88,12 +101,12 @@ def analyze_document(
             elif Flag.KIND_BORDERLINE not in params.flags:
                 params.flags.append(Flag.KIND_BORDERLINE)
 
-    # 7. assign review status
+    # 8. assign review status
     for params in doc.pages:
         params.review_status = (
             ReviewStatus.NEEDS_REVIEW if params.flags else ReviewStatus.AUTO
         )
-    return AnalyzeResult(document=doc, originals=originals)
+    return AnalyzeResult(document=doc, originals=originals, warnings=warnings)
 
 
 def _apply_deskew(img: np.ndarray, angle: float) -> np.ndarray:
@@ -138,6 +151,7 @@ def run(
         "pages": len(result.document.pages),
         "needs_review": flagged,
         "out_pdf": out_pdf,
+        "warnings": result.warnings,
     }
 
 
