@@ -3,7 +3,22 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+
+
+def _resolve_out(out: str, source: str) -> str:
+    """Allow --out to be a folder: save as the source's name with a .pdf
+    extension inside it. A path is treated as a folder when it is an existing
+    directory, ends with a path separator, or has no extension. Otherwise it is
+    used as the output file path verbatim."""
+    is_dir = (os.path.isdir(out) or out.endswith(("/", "\\"))
+              or os.path.splitext(out)[1] == "")
+    if is_dir:
+        os.makedirs(out, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(source))[0]
+        return os.path.join(out, stem + ".pdf")
+    return out
 
 
 def main(argv=None) -> int:
@@ -16,7 +31,8 @@ def main(argv=None) -> int:
 
     p_run = sub.add_parser("run", help="analyze + render one source to a searchable PDF")
     p_run.add_argument("source", help="input PDF or image")
-    p_run.add_argument("--out", required=True, help="output PDF path")
+    p_run.add_argument("--out", required=True,
+                       help="output PDF path, or a folder (saves <source>.pdf)")
     p_run.add_argument("--db", default="hokusai.db", help="job/decision SQLite db")
     p_run.add_argument("--model-dir", default="models", help="hybrid-ocr model dir")
     p_run.add_argument("--device", default="auto",
@@ -39,7 +55,8 @@ def main(argv=None) -> int:
                           help="regenerate a PDF from stored (corrected) params")
     p_re.add_argument("source", help="original source PDF/image")
     p_re.add_argument("--doc", required=True, help="doc id (source basename)")
-    p_re.add_argument("--out", required=True, help="output PDF path")
+    p_re.add_argument("--out", required=True,
+                      help="output PDF path, or a folder (saves <source>.pdf)")
     p_re.add_argument("--db", default="hokusai.db")
 
     p_learn = sub.add_parser("learn",
@@ -52,8 +69,9 @@ def main(argv=None) -> int:
     if args.command == "run":
         from .pipeline import run
 
+        out = _resolve_out(args.out, args.source)
         summary = run(
-            args.source, args.out, db_path=args.db, model_dir=args.model_dir,
+            args.source, out, db_path=args.db, model_dir=args.model_dir,
             device=args.device, use_ocr=not args.no_ocr,
             learned_model_path=args.learned_model,
         )
@@ -88,7 +106,8 @@ def main(argv=None) -> int:
     if args.command == "rebuild":
         from .pipeline import rebuild
 
-        summary = rebuild(args.doc, args.source, args.out, db_path=args.db)
+        out = _resolve_out(args.out, args.source)
+        summary = rebuild(args.doc, args.source, out, db_path=args.db)
         print(f"[OK] rebuilt {summary['doc_id']}: {summary['pages']} pages "
               f"-> {summary['out_pdf']}")
         return 0
