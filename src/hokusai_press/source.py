@@ -15,6 +15,7 @@ load_page() yields (SourceRef, original_bgr, ocr_bgr) per page:
 from __future__ import annotations
 
 import os
+import threading
 from typing import Iterator
 
 import cv2
@@ -24,6 +25,13 @@ from .model import SourceRef
 
 OCR_DPI = 300
 IMAGE_EXT = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".jp2", ".webp")
+
+# pdfium (pypdfium2) is NOT thread-safe: concurrent document/page access from
+# the review UI's threadpool corrupts native state and crashes the process
+# ("Data format error" / "Failed to load page", then a hard exit). Serialize
+# every pdfium call through one process-wide lock. Pure-numpy work (downscale,
+# color convert) stays outside the lock so it still parallelizes.
+_PDFIUM_LOCK = threading.RLock()
 
 
 def _imread_unicode(path: str) -> np.ndarray:
@@ -62,11 +70,14 @@ def load_page(path: str) -> Iterator[tuple[SourceRef, np.ndarray, np.ndarray, fl
 
     import pypdfium2 as pdfium
 
-    doc = pdfium.PdfDocument(path)
+    with _PDFIUM_LOCK:
+        doc = pdfium.PdfDocument(path)
+        n = len(doc)
     try:
-        for i in range(len(doc)):
-            page = doc[i]
-            original, dpi, img_id = _extract_original(page, doc, i)
+        for i in range(n):
+            # extract under the lock; downscale (pure numpy) outside it
+            with _PDFIUM_LOCK:
+                original, dpi, img_id = _extract_original(doc[i], doc, i)
             ocr, scale = _downscale_for_ocr(original, dpi)
             yield (
                 SourceRef(path=path, page_index=i, embedded_image_id=img_id,
@@ -76,7 +87,8 @@ def load_page(path: str) -> Iterator[tuple[SourceRef, np.ndarray, np.ndarray, fl
                 dpi,
             )
     finally:
-        doc.close()
+        with _PDFIUM_LOCK:
+            doc.close()
 
 
 def load_single(path: str, page_index: int) -> tuple[np.ndarray, float | None]:
@@ -86,12 +98,13 @@ def load_single(path: str, page_index: int) -> tuple[np.ndarray, float | None]:
         return _imread_unicode(path), None
     import pypdfium2 as pdfium
 
-    doc = pdfium.PdfDocument(path)
-    try:
-        original, dpi, _ = _extract_original(doc[page_index], doc, page_index)
-        return original, dpi
-    finally:
-        doc.close()
+    with _PDFIUM_LOCK:
+        doc = pdfium.PdfDocument(path)
+        try:
+            original, dpi, _ = _extract_original(doc[page_index], doc, page_index)
+        finally:
+            doc.close()
+    return original, dpi
 
 
 def _extract_original(page, doc, index: int) -> tuple[np.ndarray, float | None, str | None]:

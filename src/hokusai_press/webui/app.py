@@ -26,6 +26,7 @@ from ..store import Store
 class Decision(BaseModel):
     page_kind: Optional[str] = None
     approve: bool = False
+    finish: bool = False          # finalize edits: mark corrected, leave queue
     decided_by: str = "human"
 
 
@@ -46,10 +47,26 @@ def create_app(db_path: str):
     app = FastAPI(title="HokusaiPress review")
     store = Store(db_path)
 
+    # Small cache of extracted originals: a single page view fires analysis.png
+    # and output.png back to back, both needing the same original. Re-extracting
+    # (a pdfium render) twice per view is wasteful and adds lock contention, so
+    # keep the few most-recent originals keyed by (path, page_index).
+    from collections import OrderedDict
+
+    _orig_cache: "OrderedDict[tuple, object]" = OrderedDict()
+    _ORIG_CACHE_MAX = 4
+
     def _load_original(params):
         from ..source import load_single
 
-        original, _ = load_single(params.source.path, params.source.page_index)
+        key = (params.source.path, params.source.page_index)
+        if key in _orig_cache:
+            _orig_cache.move_to_end(key)
+            return _orig_cache[key]
+        original, _ = load_single(*key)
+        _orig_cache[key] = original
+        while len(_orig_cache) > _ORIG_CACHE_MAX:
+            _orig_cache.popitem(last=False)
         return original
 
     @app.get("/", response_class=HTMLResponse)
@@ -84,6 +101,17 @@ def create_app(db_path: str):
             f'border:1px solid #888;margin-right:4px"></span>{label}</span>'
             for label, hexc in legend()
         )
+        regions_html = "".join(
+            f"<li>#{i} <b>{r.kind.value}</b>"
+            + (f"/{r.tone}" if r.tone else "")
+            + f" [{int(r.box.x0)},{int(r.box.y0)},{int(r.box.x1)},{int(r.box.y1)}]"
+            + f" <i>({r.source})</i></li>"
+            for i, r in enumerate(row.params.regions)
+        )
+        # cache-busting token so a reload after an edit refetches the previews
+        # instead of showing the browser-cached image at the same URL
+        import time
+        v = int(time.time() * 1000)
         return f"""
 <h2>{doc_id} &mdash; page {page_index}</h2>
 <p>flags: {flags} &middot; status: {row.review_status}</p>
@@ -91,17 +119,24 @@ def create_app(db_path: str):
 <div style="display:flex;gap:16px;flex-wrap:wrap">
   <div><h3>analysis <span style="font-weight:normal;font-size:80%">(ドラッグで領域指定)</span></h3>
     <div id="awrap" style="position:relative;display:inline-block;border:1px solid #ccc">
-      <img id="aimg" src="{base}/analysis.png" style="max-width:520px;display:block">
+      <img id="aimg" src="{base}/analysis.png?v={v}" style="max-width:520px;display:block">
       <div id="rb" style="position:absolute;border:2px dashed #d00;background:rgba(221,0,0,.12);display:none;pointer-events:none"></div>
     </div>
   </div>
-  <div><h3>output</h3><img src="{base}/output.png" style="max-width:520px;border:1px solid #ccc"></div>
+  <div><h3>output</h3><img src="{base}/output.png?v={v}" style="max-width:520px;border:1px solid #ccc">
+    <p style="color:#666;font-size:85%;max-width:520px">output に反映されるのは
+    <b>photo 領域</b>（写真を別レイヤーに分離）と <b>page kind</b> のみ。
+    text/figure は二値ベース層のままなので出力画素は変わりません。</p>
+  </div>
 </div>
-<p>set page kind:
+<p>set page kind (任意・全面コーデック):
   <button onclick="decide('bw')">bw</button>
   <button onclick="decide('gray')">gray</button>
   <button onclick="decide('color')">color</button>
-  <button onclick="approve()">approve as-is</button>
+</p>
+<p>finish（編集を終えてキューへ戻す）:
+  <button onclick="finish()" style="font-weight:bold">done（修正完了）</button>
+  <button onclick="approve()">approve as-is（無修正で承認）</button>
 </p>
 
 <details style="max-width:760px;margin:8px 0;padding:8px 12px;background:#f6f6f6;border:1px solid #ddd">
@@ -121,7 +156,9 @@ def create_app(db_path: str):
 gray/color は自動判定（領域の彩度）ですが、下の <i>tone</i> で固定もできます。</p>
 </details>
 
-<h3>add region（領域ごとの上書き）</h3>
+<h3>add region（領域ごとの上書き・連続追加可）</h3>
+<p>現在の領域: {len(row.params.regions)} 件</p>
+<ul style="font-size:90%;max-height:160px;overflow:auto">{regions_html or '<li>(none)</li>'}</ul>
 <p>
   kind:
   <select id="rk" onchange="tonevis()">
@@ -190,14 +227,23 @@ async function approve(){{
     body:JSON.stringify({{approve:true}})}});
   location.href='/';
 }}
+async function finish(){{
+  await fetch('/api/page/{doc_id}/{page_index}/decide',{{method:'POST',
+    headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{finish:true}})}});
+  location.href='/';
+}}
 async function addRegion(){{
   const v=id=>parseFloat(document.getElementById(id).value);
-  const r=await fetch('/api/page/{doc_id}/{page_index}/region',{{method:'POST',
+  await fetch('/api/page/{doc_id}/{page_index}/region',{{method:'POST',
     headers:{{'Content-Type':'application/json'}},
     body:JSON.stringify({{kind:document.getElementById('rk').value,
       tone:document.getElementById('rtone').value||null,
       x0:v('x0'),y0:v('y0'),x1:v('x1'),y1:v('y1')}})}});
-  const b=await r.json(); alert('added. regions='+b.regions); location.href='/';
+  // reload the same page: the new box appears on the analysis overlay and the
+  // region list updates, ready for the next add. The page stays in the queue
+  // until you click done/approve.
+  location.reload();
 }}
 tonevis();
 </script>"""
@@ -210,7 +256,8 @@ tonevis();
         if row is None:
             raise HTTPException(404, "page not found")
         png = analysis_overlay(_load_original(row.params), row.params)
-        return Response(content=png, media_type="image/png")
+        return Response(content=png, media_type="image/png",
+                        headers={"Cache-Control": "no-store"})
 
     @app.get("/img/{doc_id}/{page_index}/output.png")
     def output_png(doc_id: str, page_index: int):
@@ -221,7 +268,8 @@ tonevis();
         if row is None:
             raise HTTPException(404, "page not found")
         png = output_preview(_load_original(row.params), row.params, RenderSettings())
-        return Response(content=png, media_type="image/png")
+        return Response(content=png, media_type="image/png",
+                        headers={"Cache-Control": "no-store"})
 
     @app.get("/api/queue")
     def queue():
@@ -263,6 +311,12 @@ tonevis();
             params.decided_by = DecidedBy(decision.decided_by)
             store.log_decision(doc_id, page_index, decision.decided_by,
                                "approve", None, True, features)
+        elif decision.finish:
+            # finalize region edits: leave the queue as corrected
+            params.review_status = ReviewStatus.CORRECTED
+            params.decided_by = DecidedBy(decision.decided_by)
+            store.log_decision(doc_id, page_index, decision.decided_by,
+                               "finish", None, True, features)
         store.upsert_page(doc_id, page_index, params)
         return {"status": params.review_status.value}
 
@@ -281,8 +335,9 @@ tonevis();
             source="manual",
             tone=edit.tone if edit.kind == "photo" else None,
         ))
-        params.review_status = ReviewStatus.CORRECTED
-        params.decided_by = DecidedBy(edit.decided_by)
+        # Do NOT finalize here: the reviewer may add several regions in a row.
+        # The page stays in the queue (needs_review) until they click done/
+        # approve. The edit is still persisted and logged for learning.
         store.log_decision(doc_id, page_index, edit.decided_by, "region",
                            None, {"kind": edit.kind, "tone": edit.tone,
                                   "box": [edit.x0, edit.y0, edit.x1, edit.y1]},

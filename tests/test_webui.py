@@ -57,22 +57,31 @@ def test_queue_and_decide_flow(tmp_path):
         store.close()
 
 
-def test_region_edit_flow(tmp_path):
+def test_region_edit_keeps_page_in_queue_for_continuous_adds(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))
-    r = client.post("/api/page/scan.png/0/region",
-                    json={"kind": "photo", "x0": 10, "y0": 10, "x1": 90, "y1": 90})
-    body = r.json()
-    assert body["status"] == "corrected"
-    assert body["regions"] == 1
+    # add two regions in a row
+    r1 = client.post("/api/page/scan.png/0/region",
+                     json={"kind": "text", "x0": 10, "y0": 10, "x1": 90, "y1": 40})
+    r2 = client.post("/api/page/scan.png/0/region",
+                     json={"kind": "photo", "x0": 10, "y0": 50, "x1": 90, "y1": 90})
+    # page stays in the queue between adds (not finalized)
+    assert r1.json()["status"] == "needs_review" and r1.json()["regions"] == 1
+    assert r2.json()["status"] == "needs_review" and r2.json()["regions"] == 2
+    assert client.get("/api/queue").json()  # still listed
+
     store = Store(db)
     try:
-        row = store.get_page("scan.png", 0)
-        assert row.params.regions[0].source == "manual"
-        assert row.params.regions[0].kind.value == "photo"
-        assert len(store.decisions_for_training("region")) == 1
+        regs = store.get_page("scan.png", 0).params.regions
+        assert [x.source for x in regs] == ["manual", "manual"]
+        assert len(store.decisions_for_training("region")) == 2
     finally:
         store.close()
+
+    # done finalizes -> corrected, removed from queue
+    fin = client.post("/api/page/scan.png/0/decide", json={"finish": True})
+    assert fin.json()["status"] == "corrected"
+    assert client.get("/api/queue").json() == []
 
 
 def test_region_edit_photo_tone_persisted(tmp_path):
@@ -81,7 +90,7 @@ def test_region_edit_photo_tone_persisted(tmp_path):
     r = client.post("/api/page/scan.png/0/region",
                     json={"kind": "photo", "tone": "gray",
                           "x0": 10, "y0": 10, "x1": 90, "y1": 90})
-    assert r.json()["status"] == "corrected"
+    assert r.json()["status"] == "needs_review"  # stays until finish
     store = Store(db)
     try:
         reg = store.get_page("scan.png", 0).params.regions[0]
@@ -111,6 +120,18 @@ def test_analysis_preview_png(tmp_path):
     assert r.status_code == 200
     assert r.headers["content-type"] == "image/png"
     assert r.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_previews_are_not_cached_and_versioned(tmp_path):
+    db = _seed(tmp_path)
+    client = TestClient(create_app(db))
+    # page embeds cache-busting tokens so a reload after an edit refetches
+    html = client.get("/page/scan.png/0").text
+    assert "analysis.png?v=" in html and "output.png?v=" in html
+    # image responses opt out of caching
+    for kind in ("analysis", "output"):
+        r = client.get(f"/img/scan.png/0/{kind}.png")
+        assert r.headers.get("cache-control") == "no-store"
 
 
 def test_legend_colors_match_overlay():

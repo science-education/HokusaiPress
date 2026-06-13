@@ -44,3 +44,36 @@ def test_decision_log(tmp_path):
     rows = store.decisions_for_training("page_kind")
     assert len(rows) == 1
     assert rows[0]["new_value"] == '"bw"'
+
+
+def test_concurrent_access_is_consistent(tmp_path):
+    # A page load fires several requests at once, all sharing one connection
+    # from a threadpool. Without serialization, interleaved cursors return
+    # half-populated rows (NULL columns). Hammer it from many threads and
+    # assert every read is well-formed.
+    import threading
+
+    store = Store(str(tmp_path / "t.db"))
+    for i in range(8):
+        store.upsert_page("doc", i, _page(True))
+
+    errors: list[Exception] = []
+
+    def worker():
+        try:
+            for _ in range(60):
+                for i in range(8):
+                    row = store.get_page("doc", i)
+                    assert row is not None
+                    assert isinstance(row.flags, list)  # would be None on a race
+                store.review_queue("doc")
+                store.upsert_page("doc", 0, _page(True))
+        except Exception as e:  # pragma: no cover - only on regression
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors[0]
