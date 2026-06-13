@@ -25,6 +25,8 @@ SourceRef.ocr_scale).
 
 from __future__ import annotations
 
+import os
+
 import cv2
 import numpy as np
 
@@ -43,6 +45,15 @@ def _get_ocr_engine(model_dir: str, device: str):
     if _ocr_engine is None:
         from hybrid_ocr.pipeline import HybridOCR  # lazy, optional dependency
 
+        # auto-resolve the model dir (the default "models" is relative and
+        # usually absent from the cwd): fall back to hybrid-ocr's own resolver,
+        # which finds the models bundled next to that package.
+        if not os.path.isdir(model_dir):
+            try:
+                from hybrid_ocr.cli import resolve_model_dir
+                model_dir = resolve_model_dir(None)
+            except Exception:
+                pass
         _ocr_engine = HybridOCR(model_dir=model_dir, device=device)
     return _ocr_engine
 
@@ -61,10 +72,24 @@ def analyze(
     inv_scale = 1.0 / max(source.ocr_scale, 1e-6)
 
     text_mask = None
+    engine = None
     if use_ocr:
         try:
             engine = _get_ocr_engine(model_dir, device)
+        except ImportError:
+            # hybrid-ocr not installed: geometry-only is a supported mode
+            use_ocr = False
+        # NOTE: any other construction error (e.g. the requested device's
+        # onnxruntime provider is missing, or models can't be found) is NOT
+        # swallowed. OCR was explicitly requested, so failing loudly beats
+        # silently degrading a whole batch to geometry-only.
+    if engine is not None:
+        try:
             result = engine(ocr_bgr)
+        except Exception:
+            result = None
+            flags.append(Flag.OCR_FAILED)   # tolerate a single bad page
+        if result is not None:
             text_mask = np.zeros(ocr_bgr.shape[:2], dtype=np.uint8)
             for ln in result["lines"]:
                 poly = np.array(ln["polygon"], dtype=np.int32)
@@ -82,10 +107,6 @@ def analyze(
                 )
             if not result["lines"]:
                 flags.append(Flag.NO_TEXT)
-        except ImportError:
-            use_ocr = False
-        except Exception:
-            use_ocr = False
 
     # layout-model figure/photo regions (optional, e.g. RT-DETRv2)
     layout_boxes_px: list[tuple] = []

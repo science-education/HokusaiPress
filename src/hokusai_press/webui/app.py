@@ -111,7 +111,7 @@ def create_app(db_path: str):
         # the image at any display scale); double/right-click deletes. The solid
         # colored boxes themselves come from the analysis PNG underneath.
         from ..preview import (
-            _COLORS, _CONTENT_COLOR, _NOMBRE_COLOR, _bgr_to_hex,
+            _COLORS, _CONTENT_COLOR, _CROP_COLOR, _NOMBRE_COLOR, _bgr_to_hex,
         )
 
         kind_hex = {k.value: _bgr_to_hex(c) for k, c in _COLORS.items()}
@@ -145,6 +145,43 @@ def create_app(db_path: str):
             regions_overlay += _box_div(
                 mg.nombre_box, _bgr_to_hex(_NOMBRE_COLOR), "delBox('nombre')",
                 "ページ番号領域 — ダブルクリックで削除", "nombre")
+
+        # which box kinds exist on this page (drives the colored legend buttons)
+        has = {
+            "photo": any(r.kind.value == "photo" for r in row.params.regions),
+            "content": bool(mg and mg.content),
+            "crop": bool(mg and mg.crop),
+            "nombre": bool(mg and mg.nombre_box),
+        }
+
+        def _mode_btn(bid, mode, label, hexc, group):
+            present = has[group]
+            dim = "" if present else "opacity:.45;"
+            na = "" if present else "（なし）"
+            tip = "" if present else " title='この枠はありません（ドラッグで追加可）'"
+            return (f'<button id="{bid}" onclick="setMode(\'{mode}\')"{tip} '
+                    f'style="{dim}border-left:7px solid {hexc}">{label}{na}</button>')
+
+        mode_buttons = (
+            _mode_btn("mColor", "color", "写真（カラー）", kind_hex["photo"], "photo")
+            + _mode_btn("mGray", "gray", "写真（グレー）", kind_hex["photo"], "photo")
+            + "&nbsp;"
+            + _mode_btn("mContent", "content", "内容枠",
+                        _bgr_to_hex(_CONTENT_COLOR), "content")
+            + _mode_btn("mNombre", "nombre", "ノンブル",
+                        _bgr_to_hex(_NOMBRE_COLOR), "nombre")
+        )
+        # crop is derived (not editable): show it in the legend only
+        _crop_dim = "" if has["crop"] else "opacity:.45;"
+        crop_chip = (
+            f'<span style="{_crop_dim}display:inline-flex;align-items:center;'
+            f'margin-left:8px"><span style="width:13px;height:13px;'
+            f'background:{_bgr_to_hex(_CROP_COLOR)};border:1px solid #888;'
+            f'margin-right:4px"></span>出力枠{"" if has["crop"] else "（なし）"}</span>'
+        )
+        pageno = row.params.page_number
+        pageno_html = (f'　ページ番号: <b>{pageno}</b>' if pageno is not None
+                       else '　ページ番号: <span style="color:#a00">未読取</span>')
         # cache-busting token so a reload after an edit refetches the previews
         # instead of showing the browser-cached image at the same URL
         import time
@@ -169,11 +206,7 @@ button{{padding:3px 8px}}
     <h3>analysis <span style="font-weight:normal;font-size:80%">
       (ボタンを押してからドラッグで領域追加／領域内をダブルクリックで削除)</span></h3>
     <div style="margin:6px 0">
-      <button id="mColor" onclick="setMode('color')" style="background:#fde8e8">写真（カラー）</button>
-      <button id="mGray" onclick="setMode('gray')" style="background:#eeeeee">写真（グレー）</button>
-      &nbsp;
-      <button id="mContent" onclick="setMode('content')" style="background:#e7f0fb">内容領域</button>
-      <button id="mNombre" onclick="setMode('nombre')" style="background:#f7e7f7">ページ番号領域</button>
+      {mode_buttons}{crop_chip}{pageno_html}
     </div>
     <div id="awrap" style="position:relative;display:inline-block;border:1px solid #ccc">
       <img id="aimg" src="{base}/analysis.png?v={v}" style="max-width:520px;display:block">

@@ -61,6 +61,7 @@ class Flag(str, Enum):
     OCR_DROPOUT_RETRY = "ocr_dropout_retry_fired"
     DETECTION_DENSITY = "detection_density_anomaly"
     NO_TEXT = "no_text_detected"
+    OCR_FAILED = "ocr_failed_on_page"            # recognition error on one page
     NOMBRE_UNREADABLE = "nombre_unreadable"      # no readable page number found
     PAGE_NUMBER_GAP = "page_number_gap"          # sequence break (possible miss)
 
