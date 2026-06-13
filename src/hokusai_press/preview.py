@@ -90,8 +90,10 @@ def analysis_overlay(original_bgr: np.ndarray, params: PageParams) -> bytes:
 
 def output_preview(original_bgr: np.ndarray, params: PageParams,
                    settings: RenderSettings) -> bytes:
-    from .render import render_page_image
+    """PNG of the faithful output: binarized base + gray/color photo overlays
+    (or whole-page gray/color), so 'output' actually looks like the final PDF."""
+    from .render import render_output_preview
 
-    out_bgr, _, _, _ = render_page_image(original_bgr, params, settings)
+    out_bgr = render_output_preview(original_bgr, params, settings)
     ok, buf = cv2.imencode(".png", _downscale(out_bgr))
     return buf.tobytes()

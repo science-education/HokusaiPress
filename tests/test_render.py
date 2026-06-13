@@ -11,7 +11,12 @@ from hokusai_press.model import (
     RenderSettings,
     SourceRef,
 )
-from hokusai_press.render import compose_transform, render_page_image, _map_box
+from hokusai_press.render import (
+    compose_transform,
+    render_output_preview,
+    render_page_image,
+    _map_box,
+)
 
 
 def _params(margin_box, dpi=600, kind=PageKind.AUTO, regions=None):
@@ -72,6 +77,44 @@ def test_photo_region_becomes_overlay_box():
     assert abs(x0 - 10) < 1e-6 and abs(y0 - 100) < 1e-6
     assert abs(x1 - 190) < 1e-6 and abs(y1 - 300) < 1e-6
     assert tone is None  # no override -> auto gray/color at encode time
+
+
+def test_output_preview_bw_is_binarized():
+    # a gray page with no photo region -> bw preview is pure {0,255} per channel
+    settings = RenderSettings(output_margin_mm=0.0)
+    img = np.full((400, 300, 3), 128, dtype=np.uint8)
+    img[20:40, 20:280] = 30   # a dark bar
+    params = _params(Box(0, 0, 300, 400), dpi=600, kind=PageKind.BW)
+    prev = render_output_preview(img, params, settings)
+    assert prev.ndim == 3
+    assert set(np.unique(prev)).issubset({0, 255})  # binarized
+
+
+def test_output_preview_keeps_photo_region_gray():
+    # bw page with a colored photo region forced to gray: that region must carry
+    # mid-tones (not pure black/white) and be colorless (B==G==R).
+    settings = RenderSettings(output_margin_mm=0.0)
+    img = np.full((400, 300, 3), 255, dtype=np.uint8)
+    img[100:300, 50:250] = (200, 120, 40)  # a flat colored block
+    regions = [Region(kind=RegionKind.PHOTO, box=Box(50, 100, 250, 300),
+                      tone="gray")]
+    params = _params(Box(0, 0, 300, 400), dpi=600, kind=PageKind.BW,
+                     regions=regions)
+    prev = render_output_preview(img, params, settings)
+    patch = prev[150:250, 100:200]
+    assert np.any((patch > 0) & (patch < 255))            # has mid-tones (gray)
+    assert np.allclose(patch[..., 0], patch[..., 1]) and \
+           np.allclose(patch[..., 1], patch[..., 2])      # grayscale (B==G==R)
+
+
+def test_output_preview_color_page_stays_color():
+    settings = RenderSettings(output_margin_mm=0.0)
+    img = np.full((400, 300, 3), 255, dtype=np.uint8)
+    img[100:300, 50:250] = (200, 120, 40)
+    params = _params(Box(0, 0, 300, 400), dpi=600, kind=PageKind.COLOR)
+    prev = render_output_preview(img, params, settings)
+    patch = prev[150:250, 100:200]
+    assert not np.allclose(patch[..., 0], patch[..., 2])   # color preserved
 
 
 def test_photo_region_tone_override_is_carried():

@@ -112,6 +112,57 @@ def render_page_image(
     return out, lines, mode, photo_boxes
 
 
+def _binarize_for_preview(bgr: np.ndarray) -> np.ndarray:
+    """{0,255} single-channel. Use the same binarizer the PDF uses when it is
+    available, so the preview matches the real output; otherwise fall back to a
+    self-contained adaptive threshold (preview must work without the OCR extra).
+    """
+    try:
+        from hybrid_ocr.pdf_export import binarize
+        return binarize(bgr)
+    except Exception:
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        return cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15)
+
+
+def render_output_preview(
+    original_bgr: np.ndarray,
+    params: PageParams,
+    settings: RenderSettings,
+) -> np.ndarray:
+    """A BGR image that mirrors what the final PDF page will actually contain:
+    deskewed + cropped + dpi-normalized, then encoded the way the MRC builder
+    would — bilevel base with photo regions kept as gray/color overlays, or a
+    whole-page gray/color image when page_kind forces it. This is what the
+    review UI labels "output" (vs. the raw warped image, which hid binarization).
+    """
+    out, _, mode, photo_boxes = render_page_image(original_bgr, params, settings)
+    if mode == "gray":
+        g = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
+        return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+    if mode == "color":
+        return out
+
+    # bw / MRC: binarize the base, then paste photo regions back as gray/color
+    from .mrc import _is_grayish
+
+    h, w = out.shape[:2]
+    canvas = cv2.cvtColor(_binarize_for_preview(out), cv2.COLOR_GRAY2BGR)
+    for (x0, y0, x1, y1, tone) in photo_boxes:
+        x0i, y0i = max(0, int(x0)), max(0, int(y0))
+        x1i, y1i = min(w, int(x1)), min(h, int(y1))
+        if x1i - x0i < 4 or y1i - y0i < 4:
+            continue
+        crop = out[y0i:y1i, x0i:x1i]
+        cmode = tone or ("gray" if _is_grayish(crop) else "color")
+        if cmode == "gray":
+            g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            crop = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+        canvas[y0i:y1i, x0i:x1i] = crop
+    return canvas
+
+
 def build_pdf(
     document: Document,
     originals: list[np.ndarray],

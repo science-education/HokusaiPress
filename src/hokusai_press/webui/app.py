@@ -123,10 +123,11 @@ def create_app(db_path: str):
       <div id="rb" style="position:absolute;border:2px dashed #d00;background:rgba(221,0,0,.12);display:none;pointer-events:none"></div>
     </div>
   </div>
-  <div><h3>output</h3><img src="{base}/output.png?v={v}" style="max-width:520px;border:1px solid #ccc">
-    <p style="color:#666;font-size:85%;max-width:520px">output に反映されるのは
-    <b>photo 領域</b>（写真を別レイヤーに分離）と <b>page kind</b> のみ。
-    text/figure は二値ベース層のままなので出力画素は変わりません。</p>
+  <div><h3>output <span style="font-weight:normal;font-size:80%">(最終PDF相当)</span></h3>
+    <img src="{base}/output.png?v={v}" style="max-width:520px;border:1px solid #ccc">
+    <p style="color:#666;font-size:85%;max-width:520px">傾き補正後、<b>page kind</b>と
+    領域に応じて二値化／グレー／カラー合成した最終PDF相当の画像です。
+    bw ページでは <b>photo 領域</b>だけがグレー/カラーで残り、文字・線画は二値化されます。</p>
   </div>
 </div>
 <p>set page kind (任意・全面コーデック):
