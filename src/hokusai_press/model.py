@@ -119,6 +119,11 @@ class Region:
     source: str = "dbnet"           # dbnet | rtdetr | residual | manual
     ocr_text: Optional[str] = None
     ocr_conf: Optional[float] = None
+    # For PHOTO regions only: force the overlay's color treatment. None = auto
+    # (decide gray vs color from the crop's chroma). This is how a grayscale
+    # picture inside an otherwise bilevel ("bw") page is handled — the page
+    # stays bw and just this region renders as a gray JPEG overlay.
+    tone: Optional[str] = None       # None (auto) | "gray" | "color"
 
 
 @dataclass
@@ -187,6 +192,7 @@ def _decode_region(d) -> Region:
         source=d.get("source", "dbnet"),
         ocr_text=d.get("ocr_text"),
         ocr_conf=d.get("ocr_conf"),
+        tone=d.get("tone"),
     )
 
 

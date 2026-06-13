@@ -75,6 +75,35 @@ def test_region_edit_flow(tmp_path):
         store.close()
 
 
+def test_region_edit_photo_tone_persisted(tmp_path):
+    db = _seed(tmp_path)
+    client = TestClient(create_app(db))
+    r = client.post("/api/page/scan.png/0/region",
+                    json={"kind": "photo", "tone": "gray",
+                          "x0": 10, "y0": 10, "x1": 90, "y1": 90})
+    assert r.json()["status"] == "corrected"
+    store = Store(db)
+    try:
+        reg = store.get_page("scan.png", 0).params.regions[0]
+        assert reg.kind.value == "photo" and reg.tone == "gray"
+    finally:
+        store.close()
+
+
+def test_region_edit_tone_ignored_for_non_photo(tmp_path):
+    db = _seed(tmp_path)
+    client = TestClient(create_app(db))
+    client.post("/api/page/scan.png/0/region",
+                json={"kind": "figure", "tone": "gray",
+                      "x0": 10, "y0": 10, "x1": 90, "y1": 90})
+    store = Store(db)
+    try:
+        reg = store.get_page("scan.png", 0).params.regions[0]
+        assert reg.kind.value == "figure" and reg.tone is None
+    finally:
+        store.close()
+
+
 def test_analysis_preview_png(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))

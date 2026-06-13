@@ -68,6 +68,17 @@ def test_photo_region_becomes_overlay_box():
     assert mode == "bw"  # MRC: bilevel base, photo as overlay
     assert len(photo_boxes) == 1
     # mapped into output space: original (60,200)-(240,400) shifted by crop origin
-    x0, y0, x1, y1 = photo_boxes[0]
+    x0, y0, x1, y1, tone = photo_boxes[0]
     assert abs(x0 - 10) < 1e-6 and abs(y0 - 100) < 1e-6
     assert abs(x1 - 190) < 1e-6 and abs(y1 - 300) < 1e-6
+    assert tone is None  # no override -> auto gray/color at encode time
+
+
+def test_photo_region_tone_override_is_carried():
+    settings = RenderSettings(output_margin_mm=0.0)
+    regions = [Region(kind=RegionKind.PHOTO, box=Box(60, 200, 240, 400),
+                      tone="gray")]
+    params = _params(Box(50, 100, 250, 500), regions=regions)
+    _, _, _, photo_boxes = render_page_image(
+        np.full((800, 600, 3), 255, np.uint8), params, settings)
+    assert photo_boxes[0][4] == "gray"

@@ -35,6 +35,7 @@ class RegionEdit(BaseModel):
     y0: float
     x1: float
     y1: float
+    tone: Optional[str] = None   # photo only: None(auto) | gray | color
     decided_by: str = "human"
 
 
@@ -85,8 +86,53 @@ def create_app(db_path: str):
   <button onclick="decide('color')">color</button>
   <button onclick="approve()">approve as-is</button>
 </p>
+
+<details style="max-width:760px;margin:8px 0;padding:8px 12px;background:#f6f6f6;border:1px solid #ddd">
+<summary><b>page kind とは？「bw の中のグレー画像」はどうする？</b></summary>
+<p style="margin:6px 0">処理は<b>2軸</b>です。混同しないでください。</p>
+<ul style="margin:6px 0">
+  <li><b>page kind</b>（bw / gray / color）= ページ<b>全体</b>のベース層コーデック。
+      <code>gray</code>/<code>color</code> は「全面が写真・図版」「地紙ごと退色」など
+      <b>全面トーン維持</b>が要るときの<b>フォールバック</b>です。</li>
+  <li><b>region</b>（text / figure / photo）= <b>領域ごと</b>のトーン処理。これが本命。
+      <code>text</code>・<code>figure</code>(線画) は二値（くっきり）、
+      <code>photo</code>(連続調) はその矩形だけグレー/カラーJPEGで上に重ねます（MRC）。</li>
+</ul>
+<p style="margin:6px 0"><b>「bw ページの中のグレー写真」→ page kind は bw のまま、
+その範囲を <code>photo</code> 領域として下で追加</b>してください。
+文字は二値で鮮明・写真だけグレーで軽い、が同一ページ内で両立します。
+gray/color は自動判定（領域の彩度）ですが、下の <i>tone</i> で固定もできます。</p>
+</details>
+
+<h3>add region（領域ごとの上書き）</h3>
+<p>
+  kind:
+  <select id="rk" onchange="tonevis()">
+    <option value="text">text（二値）</option>
+    <option value="figure">figure 線画（二値）</option>
+    <option value="photo" selected>photo 写真（トーン維持）</option>
+  </select>
+  <span id="tonewrap">tone:
+    <select id="rtone">
+      <option value="">auto（彩度で判定）</option>
+      <option value="gray">gray 固定</option>
+      <option value="color">color 固定</option>
+    </select>
+  </span>
+  <br>
+  box (原画像px): x0<input id="x0" size="5"> y0<input id="y0" size="5">
+  x1<input id="x1" size="5"> y1<input id="y1" size="5">
+  <button onclick="addRegion()">add</button>
+</p>
+<p style="color:#666;font-size:90%">※ 座標は数値入力（ドラッグ描画は次段）。
+解析画像の枠を目安に原画像ピクセルで指定してください。</p>
+
 <p><a href="/">&larr; back to queue</a></p>
 <script>
+function tonevis(){{
+  document.getElementById('tonewrap').style.display =
+    document.getElementById('rk').value==='photo' ? 'inline' : 'none';
+}}
 async function decide(kind){{
   await fetch('/api/page/{doc_id}/{page_index}/decide',{{method:'POST',
     headers:{{'Content-Type':'application/json'}},
@@ -99,6 +145,16 @@ async function approve(){{
     body:JSON.stringify({{approve:true}})}});
   location.href='/';
 }}
+async function addRegion(){{
+  const v=id=>parseFloat(document.getElementById(id).value);
+  const r=await fetch('/api/page/{doc_id}/{page_index}/region',{{method:'POST',
+    headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{kind:document.getElementById('rk').value,
+      tone:document.getElementById('rtone').value||null,
+      x0:v('x0'),y0:v('y0'),x1:v('x1'),y1:v('y1')}})}});
+  const b=await r.json(); alert('added. regions='+b.regions); location.href='/';
+}}
+tonevis();
 </script>"""
 
     @app.get("/img/{doc_id}/{page_index}/analysis.png")
@@ -178,11 +234,12 @@ async function approve(){{
             kind=RegionKind(edit.kind),
             box=Box(edit.x0, edit.y0, edit.x1, edit.y1),
             source="manual",
+            tone=edit.tone if edit.kind == "photo" else None,
         ))
         params.review_status = ReviewStatus.CORRECTED
         params.decided_by = DecidedBy(edit.decided_by)
         store.log_decision(doc_id, page_index, edit.decided_by, "region",
-                           None, {"kind": edit.kind,
+                           None, {"kind": edit.kind, "tone": edit.tone,
                                   "box": [edit.x0, edit.y0, edit.x1, edit.y1]},
                            page_features(params))
         store.upsert_page(doc_id, page_index, params)

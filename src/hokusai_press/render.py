@@ -81,6 +81,9 @@ def render_page_image(
 
     output_bgr is the single-pass warped page. text_lines and photo_boxes are
     in OUTPUT pixels, ready for the searchable text overlay and MRC layering.
+    Each photo box is a 5-tuple (x0, y0, x1, y1, tone) where tone is None
+    (auto gray/color), "gray", or "color" — the per-region override that lets a
+    grayscale picture live inside an otherwise bilevel page.
     """
     M, out_size, _ = compose_transform(original_bgr.shape, params, settings)
     out = cv2.warpAffine(original_bgr, M, out_size, flags=cv2.INTER_AREA,
@@ -91,7 +94,7 @@ def render_page_image(
     for r in params.regions:
         if r.kind == RegionKind.PHOTO:
             b = _map_box(r.box, M)
-            photo_boxes.append((b.x0, b.y0, b.x1, b.y1))
+            photo_boxes.append((b.x0, b.y0, b.x1, b.y1, r.tone))
         if r.ocr_text:
             b = _map_box(r.box, M)
             lines.append({

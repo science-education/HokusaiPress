@@ -56,6 +56,33 @@ def test_mrc_page_has_bilevel_and_photo_layers(tmp_path):
         assert len(forms) >= 1
 
 
+def _photo_colorspaces(pdf) -> list:
+    """ColorSpace of every DCTDecode (JPEG) image in the document."""
+    out = []
+    for obj in pdf.objects:
+        try:
+            if (obj.get("/Subtype") == pikepdf.Name("/Image")
+                    and "DCTDecode" in str(obj.get("/Filter"))):
+                out.append(str(obj.get("/ColorSpace")))
+        except (AttributeError, TypeError):
+            continue
+    return out
+
+
+def test_mrc_photo_tone_override_forces_gray(tmp_path):
+    # crop is genuinely colored (B,R differ) -> auto would pick color;
+    # tone="gray" must force a DeviceGray overlay anyway.
+    img, lines, photo_boxes = _page_with_photo()
+    x0, y0, x1, y1 = photo_boxes[0]
+    builder = MrcPageBuilder(compress="g4", target_dpi=600, photo_dpi=150)
+    builder.add_page(img, lines, [(x0, y0, x1, y1, "gray")], mode="bw")
+    out = tmp_path / "forced_gray.pdf"
+    builder.save(str(out))
+    with pikepdf.open(out) as pdf:
+        spaces = _photo_colorspaces(pdf)
+        assert spaces and all("DeviceGray" in s for s in spaces)
+
+
 def test_mrc_text_only_page_is_pure_bilevel(tmp_path):
     img, lines, _ = _page_with_photo()
     builder = MrcPageBuilder(compress="g4", target_dpi=600)

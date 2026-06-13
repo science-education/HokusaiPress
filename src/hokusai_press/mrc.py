@@ -47,7 +47,9 @@ class MrcPageBuilder:
         else:
             binary = binarize(out_bgr)            # {0,255}
             overlays = []
-            for (x0, y0, x1, y1) in photo_boxes_px:
+            for box in photo_boxes_px:
+                x0, y0, x1, y1 = box[:4]
+                tone = box[4] if len(box) > 4 else None  # None|"gray"|"color"
                 x0i, y0i = max(0, int(x0)), max(0, int(y0))
                 x1i, y1i = min(w, int(x1)), min(h, int(y1))
                 if x1i - x0i < 4 or y1i - y0i < 4:
@@ -60,7 +62,8 @@ class MrcPageBuilder:
                      max(1, int((y1i - y0i) * self.scale))),
                     interpolation=cv2.INTER_AREA,
                 )
-                cmode = "gray" if _is_grayish(crop) else "color"
+                # explicit per-region override wins; else decide from chroma
+                cmode = tone or ("gray" if _is_grayish(crop) else "color")
                 overlays.append({
                     "pdf": encode_page_pdf(ds, cmode, self.compress),
                     "rect": (x0i, h - y1i, x1i, h - y0i),  # PDF y-up
