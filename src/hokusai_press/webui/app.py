@@ -85,22 +85,13 @@ def create_app(db_path: str):
 
     @app.get("/page/{doc_id}/{page_index}", response_class=HTMLResponse)
     def page_view(doc_id: str, page_index: int):
-        from ..preview import legend
-
         row = store.get_page(doc_id, page_index)
         if row is None:
             raise HTTPException(404, "page not found")
-        flags = ", ".join(row.flags) or "(none)"
         base = f"/img/{doc_id}/{page_index}"
         # deskewed-original dimensions (= original; deskew keeps the canvas
         # size), so the browser can map a drag back to region pixels.
         oh, ow = _load_original(row.params).shape[:2]
-        legend_html = "".join(
-            f'<span style="display:inline-flex;align-items:center;margin-right:14px">'
-            f'<span style="width:14px;height:14px;background:{hexc};'
-            f'border:1px solid #888;margin-right:4px"></span>{label}</span>'
-            for label, hexc in legend()
-        )
         regions_html = "".join(
             f"<li>#{i} <b>{r.kind.value}</b>"
             + (f"/{r.tone}" if r.tone else "")
@@ -108,20 +99,58 @@ def create_app(db_path: str):
             + f" <i>({r.source})</i></li>"
             for i, r in enumerate(row.params.regions)
         )
+        # clickable hit areas over each region (positioned in % so they track
+        # the image at any display scale); double/right-click deletes. The solid
+        # colored boxes themselves come from the analysis PNG underneath.
+        from ..preview import _COLORS, _bgr_to_hex
+
+        kind_hex = {k.value: _bgr_to_hex(c) for k, c in _COLORS.items()}
+        regions_overlay = "".join(
+            f'<div class="rbox" title="{r.kind.value}'
+            + (f"/{r.tone}" if r.tone else "")
+            + ' — ダブルクリックで削除"'
+            f' style="left:{r.box.x0 / ow * 100:.3f}%;top:{r.box.y0 / oh * 100:.3f}%;'
+            f'width:{max(0.0, r.box.x1 - r.box.x0) / ow * 100:.3f}%;'
+            f'height:{max(0.0, r.box.y1 - r.box.y0) / oh * 100:.3f}%;'
+            f'--c:{kind_hex.get(r.kind.value, "#888")}"'
+            f' ondblclick="delRegion({i})">'
+            f'</div>'
+            for i, r in enumerate(row.params.regions)
+        )
         # cache-busting token so a reload after an edit refetches the previews
         # instead of showing the browser-cached image at the same URL
         import time
         v = int(time.time() * 1000)
         return f"""
+<style>
+.rbox{{position:absolute;background:transparent;cursor:pointer;
+  outline:1px solid transparent}}
+.rbox:hover{{background:rgba(221,0,0,.20);outline:2px solid var(--c)}}
+button{{padding:3px 8px}}
+</style>
 <h2>{doc_id} &mdash; page {page_index}</h2>
-<p>flags: {flags} &middot; status: {row.review_status}</p>
-<p style="font-size:90%"><b>analysis 凡例:</b> {legend_html}</p>
+<p>紙面全体が同一要素なら押す:
+  <button onclick="decide('bw')">白黒二値</button>
+  <button onclick="decide('gray')">グレースケール</button>
+  <button onclick="decide('color')">カラー</button>
+  &nbsp;&nbsp;
+  <button onclick="location.href='/'">キューに戻る</button>
+</p>
 <div style="display:flex;gap:16px;flex-wrap:wrap">
-  <div><h3>analysis <span style="font-weight:normal;font-size:80%">(ドラッグで領域指定)</span></h3>
+  <div>
+    <h3>analysis <span style="font-weight:normal;font-size:80%">
+      (ボタンを押してからドラッグで領域追加／領域内をダブルクリックで削除)</span></h3>
+    <div style="margin:6px 0">
+      <button id="mColor" onclick="setMode('color')" style="background:#fde8e8">写真（カラー）</button>
+      <button id="mGray" onclick="setMode('gray')" style="background:#eeeeee">写真（グレー）</button>
+    </div>
     <div id="awrap" style="position:relative;display:inline-block;border:1px solid #ccc">
       <img id="aimg" src="{base}/analysis.png?v={v}" style="max-width:520px;display:block">
+      {regions_overlay}
       <div id="rb" style="position:absolute;border:2px dashed #d00;background:rgba(221,0,0,.12);display:none;pointer-events:none"></div>
     </div>
+    <ul style="font-size:85%;max-height:130px;overflow:auto;max-width:520px">
+      {regions_html or '<li>(none)</li>'}</ul>
   </div>
   <div><h3>output <span style="font-weight:normal;font-size:80%">(最終PDF相当)</span></h3>
     <img src="{base}/output.png?v={v}" style="max-width:520px;border:1px solid #ccc">
@@ -130,11 +159,6 @@ def create_app(db_path: str):
     bw ページでは <b>photo 領域</b>だけがグレー/カラーで残り、文字・線画は二値化されます。</p>
   </div>
 </div>
-<p>set page kind (任意・全面コーデック):
-  <button onclick="decide('bw')">bw</button>
-  <button onclick="decide('gray')">gray</button>
-  <button onclick="decide('color')">color</button>
-</p>
 <p>finish（編集を終えてキューへ戻す）:
   <button onclick="finish()" style="font-weight:bold">done（修正完了）</button>
   <button onclick="approve()">approve as-is（無修正で承認）</button>
@@ -152,37 +176,10 @@ def create_app(db_path: str):
       <code>photo</code>(連続調) はその矩形だけグレー/カラーJPEGで上に重ねます（MRC）。</li>
 </ul>
 <p style="margin:6px 0"><b>「bw ページの中のグレー写真」→ page kind は bw のまま、
-その範囲を <code>photo</code> 領域として下で追加</b>してください。
+その範囲を <code>photo</code> 領域として追加</b>してください。
 文字は二値で鮮明・写真だけグレーで軽い、が同一ページ内で両立します。
-gray/color は自動判定（領域の彩度）ですが、下の <i>tone</i> で固定もできます。</p>
+gray/color は自動判定（領域の彩度）ですが、<i>tone</i> で固定もできます。</p>
 </details>
-
-<h3>add region（領域ごとの上書き・連続追加可）</h3>
-<p>現在の領域: {len(row.params.regions)} 件</p>
-<ul style="font-size:90%;max-height:160px;overflow:auto">{regions_html or '<li>(none)</li>'}</ul>
-<p>
-  kind:
-  <select id="rk" onchange="tonevis()">
-    <option value="text">text（二値）</option>
-    <option value="figure">figure 線画（二値）</option>
-    <option value="photo" selected>photo 写真（トーン維持）</option>
-  </select>
-  <span id="tonewrap">tone:
-    <select id="rtone">
-      <option value="">auto（彩度で判定）</option>
-      <option value="gray">gray 固定</option>
-      <option value="color">color 固定</option>
-    </select>
-  </span>
-  <br>
-  box (原画像px): x0<input id="x0" size="5"> y0<input id="y0" size="5">
-  x1<input id="x1" size="5"> y1<input id="y1" size="5">
-  <button onclick="addRegion()">add</button>
-</p>
-<p style="color:#666;font-size:90%">※ 上の analysis 画像をドラッグすると座標が自動入力されます
-（数値で微調整も可）。</p>
-
-<p><a href="/">&larr; back to queue</a></p>
 <script>
 const ORIG_W={ow}, ORIG_H={oh};
 (function(){{
@@ -205,16 +202,30 @@ const ORIG_W={ow}, ORIG_H={oh};
     rb.style.width=Math.abs(p.x-sx)+'px'; rb.style.height=Math.abs(p.y-sy)+'px';
   }});
   window.addEventListener('mouseup',e=>{{
-    if(!drag) return; drag=false; const p=pos(e);
+    if(!drag) return; drag=false; rb.style.display='none';
+    const p=pos(e);
+    if(Math.abs(p.x-sx)<4 || Math.abs(p.y-sy)<4) return;   // ignore tiny drags
     const kx=ORIG_W/img.clientWidth, ky=ORIG_H/img.clientHeight;
-    const set=(id,v)=>document.getElementById(id).value=Math.round(v);
-    set('x0',Math.min(sx,p.x)*kx); set('y0',Math.min(sy,p.y)*ky);
-    set('x1',Math.max(sx,p.x)*kx); set('y1',Math.max(sy,p.y)*ky);
+    // drag completes the spec: add a photo region in the current mode at once
+    addPhoto(Math.round(Math.min(sx,p.x)*kx), Math.round(Math.min(sy,p.y)*ky),
+             Math.round(Math.max(sx,p.x)*kx), Math.round(Math.max(sy,p.y)*ky));
   }});
 }})();
-function tonevis(){{
-  document.getElementById('tonewrap').style.display =
-    document.getElementById('rk').value==='photo' ? 'inline' : 'none';
+let MODE='gray';
+function setMode(m){{
+  MODE=m;
+  localStorage.setItem('hp_mode', m);   // remember across reloads/pages
+  for(const [id,mm] of [['mGray','gray'],['mColor','color']]){{
+    const b=document.getElementById(id);
+    b.style.outline = m===mm ? '2px solid #06c' : 'none';
+    b.style.fontWeight = m===mm ? 'bold' : 'normal';
+  }}
+}}
+async function addPhoto(x0,y0,x1,y1){{
+  await fetch('/api/page/{doc_id}/{page_index}/region',{{method:'POST',
+    headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{kind:'photo',tone:MODE,x0:x0,y0:y0,x1:x1,y1:y1}})}});
+  location.reload();   // box appears on overlay; stays in queue until done
 }}
 async function decide(kind){{
   await fetch('/api/page/{doc_id}/{page_index}/decide',{{method:'POST',
@@ -234,19 +245,13 @@ async function finish(){{
     body:JSON.stringify({{finish:true}})}});
   location.href='/';
 }}
-async function addRegion(){{
-  const v=id=>parseFloat(document.getElementById(id).value);
-  await fetch('/api/page/{doc_id}/{page_index}/region',{{method:'POST',
-    headers:{{'Content-Type':'application/json'}},
-    body:JSON.stringify({{kind:document.getElementById('rk').value,
-      tone:document.getElementById('rtone').value||null,
-      x0:v('x0'),y0:v('y0'),x1:v('x1'),y1:v('y1')}})}});
-  // reload the same page: the new box appears on the analysis overlay and the
-  // region list updates, ready for the next add. The page stays in the queue
-  // until you click done/approve.
+async function delRegion(i){{
+  // double-click deletes immediately (no confirm); re-draw if it was a mistake
+  await fetch('/api/page/{doc_id}/{page_index}/region/'+i+'/delete',
+    {{method:'POST'}});
   location.reload();
 }}
-tonevis();
+setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
 </script>"""
 
     @app.get("/img/{doc_id}/{page_index}/analysis.png")
@@ -343,6 +348,27 @@ tonevis();
                            None, {"kind": edit.kind, "tone": edit.tone,
                                   "box": [edit.x0, edit.y0, edit.x1, edit.y1]},
                            page_features(params))
+        store.upsert_page(doc_id, page_index, params)
+        return {"status": params.review_status.value,
+                "regions": len(params.regions)}
+
+    @app.post("/api/page/{doc_id}/{page_index}/region/{index}/delete")
+    def delete_region(doc_id: str, page_index: int, index: int):
+        from ..learn import page_features
+
+        row = store.get_page(doc_id, page_index)
+        if row is None:
+            raise HTTPException(404, "page not found")
+        params = row.params
+        if not (0 <= index < len(params.regions)):
+            raise HTTPException(404, "region index out of range")
+        removed = params.regions.pop(index)
+        store.log_decision(
+            doc_id, page_index, "human", "region_delete",
+            {"kind": removed.kind.value, "source": removed.source,
+             "box": [removed.box.x0, removed.box.y0,
+                     removed.box.x1, removed.box.y1]},
+            None, page_features(params))
         store.upsert_page(doc_id, page_index, params)
         return {"status": params.review_status.value,
                 "regions": len(params.regions)}

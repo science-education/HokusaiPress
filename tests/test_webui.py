@@ -84,6 +84,48 @@ def test_region_edit_keeps_page_in_queue_for_continuous_adds(tmp_path):
     assert client.get("/api/queue").json() == []
 
 
+def test_region_delete_removes_and_logs(tmp_path):
+    db = _seed(tmp_path)
+    client = TestClient(create_app(db))
+    client.post("/api/page/scan.png/0/region",
+                json={"kind": "text", "x0": 0, "y0": 0, "x1": 30, "y1": 30})
+    client.post("/api/page/scan.png/0/region",
+                json={"kind": "photo", "x0": 40, "y0": 40, "x1": 90, "y1": 90})
+    # delete the first one
+    r = client.post("/api/page/scan.png/0/region/0/delete")
+    assert r.json()["regions"] == 1
+    store = Store(db)
+    try:
+        regs = store.get_page("scan.png", 0).params.regions
+        assert len(regs) == 1 and regs[0].kind.value == "photo"  # the survivor
+        assert len(store.decisions_for_training("region_delete")) == 1
+    finally:
+        store.close()
+
+
+def test_region_delete_out_of_range_404(tmp_path):
+    db = _seed(tmp_path)
+    client = TestClient(create_app(db))
+    assert client.post("/api/page/scan.png/0/region/5/delete").status_code == 404
+
+
+def test_page_view_has_mode_buttons_and_dblclick_delete(tmp_path):
+    db = _seed(tmp_path)
+    client = TestClient(create_app(db))
+    client.post("/api/page/scan.png/0/region",
+                json={"kind": "photo", "x0": 10, "y0": 10, "x1": 90, "y1": 90})
+    html = client.get("/page/scan.png/0").text
+    assert 'class="rbox"' in html               # clickable region overlay
+    assert "ondblclick=\"delRegion(0)\"" in html  # double-click deletes, no arg event
+    assert "oncontextmenu" not in html          # right-click delete removed
+    assert "setMode('gray')" in html and "setMode('color')" in html  # mode buttons
+    assert "addPhoto(" in html                  # drag adds immediately
+    assert "id=\"mGray\"" in html and "id=\"mColor\"" in html
+    # mode persists across reloads (saved + restored from localStorage)
+    assert "localStorage.setItem('hp_mode'" in html
+    assert "localStorage.getItem('hp_mode')" in html
+
+
 def test_region_edit_photo_tone_persisted(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))
@@ -147,11 +189,15 @@ def test_legend_colors_match_overlay():
     assert photo_hex == "#dc3c3c"
 
 
-def test_page_view_has_legend_and_drag(tmp_path):
+def test_page_view_has_page_kind_buttons_and_drag(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))
     html = client.get("/page/scan.png/0").text
-    assert "analysis 凡例" in html
-    assert "ドラッグで領域指定" in html
+    # whole-page kind buttons relocated to the top, relabeled in Japanese
+    assert "紙面全体が同一要素なら押す" in html
+    assert "白黒二値" in html and "グレースケール" in html and "キューに戻る" in html
+    assert "ボタンを押してからドラッグで領域追加" in html
+    # the old legend label is gone
+    assert "analysis 凡例" not in html
     # drag mapping needs the deskewed-original dims (seed image is 300x400)
     assert "ORIG_W=300" in html and "ORIG_H=400" in html
