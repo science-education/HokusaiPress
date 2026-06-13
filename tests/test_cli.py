@@ -1,6 +1,6 @@
 import os
 
-from hokusai_press.cli import _resolve_out
+from hokusai_press.cli import _expand_sources, _is_folder_out, _resolve_out
 
 
 def test_out_file_path_is_used_verbatim(tmp_path):
@@ -30,3 +30,38 @@ def test_extensionless_is_treated_as_folder(tmp_path):
 def test_image_source_becomes_pdf(tmp_path):
     out = _resolve_out(str(tmp_path), "/data/page01.png")
     assert out == os.path.join(str(tmp_path), "page01.pdf")
+
+
+def _touch(p):
+    with open(p, "wb") as f:
+        f.write(b"%PDF-1.4\n")
+    return str(p)
+
+
+def test_expand_directory_to_pdfs(tmp_path):
+    a = _touch(tmp_path / "b.pdf")
+    b = _touch(tmp_path / "a.pdf")
+    _touch(tmp_path / "note.txt")           # ignored
+    got = _expand_sources([str(tmp_path)])
+    assert [os.path.basename(p) for p in got] == ["a.pdf", "b.pdf"]  # sorted
+
+
+def test_expand_glob(tmp_path):
+    _touch(tmp_path / "scan1.pdf")
+    _touch(tmp_path / "scan2.pdf")
+    _touch(tmp_path / "other.pdf")
+    got = _expand_sources([os.path.join(str(tmp_path), "scan*.pdf")])
+    assert sorted(os.path.basename(p) for p in got) == ["scan1.pdf", "scan2.pdf"]
+
+
+def test_expand_plain_file_and_dedupe(tmp_path):
+    f = _touch(tmp_path / "x.pdf")
+    # same file via explicit path and via directory expansion -> de-duplicated
+    got = _expand_sources([f, str(tmp_path)])
+    assert got == [f]
+
+
+def test_is_folder_out():
+    assert _is_folder_out("C:/out") is True          # extensionless
+    assert _is_folder_out("C:/out/") is True          # trailing sep
+    assert _is_folder_out("C:/out/book.pdf") is False  # explicit file
