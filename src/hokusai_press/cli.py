@@ -23,6 +23,8 @@ def main(argv=None) -> int:
                        help="OCR device: auto|cpu|npu|cuda|dml|qnn")
     p_run.add_argument("--no-ocr", action="store_true",
                        help="skip OCR (geometry + heuristic separation only)")
+    p_run.add_argument("--learned-model", default=None,
+                       help="JSON page-kind model from `learn` to guide auto decisions")
 
     p_queue = sub.add_parser("queue", help="list pages awaiting review")
     p_queue.add_argument("--db", default="hokusai.db")
@@ -40,6 +42,11 @@ def main(argv=None) -> int:
     p_re.add_argument("--out", required=True, help="output PDF path")
     p_re.add_argument("--db", default="hokusai.db")
 
+    p_learn = sub.add_parser("learn",
+                             help="train a page-kind model from the decision log")
+    p_learn.add_argument("--db", default="hokusai.db")
+    p_learn.add_argument("--out", default="hokusai_model.json")
+
     args = parser.parse_args(argv)
 
     if args.command == "run":
@@ -48,6 +55,7 @@ def main(argv=None) -> int:
         summary = run(
             args.source, args.out, db_path=args.db, model_dir=args.model_dir,
             device=args.device, use_ocr=not args.no_ocr,
+            learned_model_path=args.learned_model,
         )
         print(f"[OK] {summary['doc_id']}: {summary['pages']} pages -> {summary['out_pdf']}")
         if summary["needs_review"]:
@@ -83,6 +91,25 @@ def main(argv=None) -> int:
         summary = rebuild(args.doc, args.source, args.out, db_path=args.db)
         print(f"[OK] rebuilt {summary['doc_id']}: {summary['pages']} pages "
               f"-> {summary['out_pdf']}")
+        return 0
+
+    if args.command == "learn":
+        from . import learn
+        from .store import Store
+
+        store = Store(args.db)
+        try:
+            decisions = store.decisions_for_training("page_kind")
+        finally:
+            store.close()
+        model = learn.train(decisions)
+        if model is None:
+            print(f"not enough labeled decisions yet "
+                  f"(need >= {learn.MIN_PER_CLASS} per class, >= 2 classes)")
+            return 1
+        learn.save(model, args.out)
+        print(f"[OK] trained page-kind model -> {args.out} "
+              f"(classes: {model['counts']})")
         return 0
 
     return 1

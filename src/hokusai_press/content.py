@@ -54,6 +54,7 @@ def analyze(
     model_dir: str = "models",
     device: str = "auto",
     use_ocr: bool = True,
+    layout_provider=None,
 ) -> tuple[list[Region], list[Flag]]:
     regions: list[Region] = []
     flags: list[Flag] = []
@@ -86,6 +87,26 @@ def analyze(
         except Exception:
             use_ocr = False
 
+    # layout-model figure/photo regions (optional, e.g. RT-DETRv2)
+    layout_boxes_px: list[tuple] = []
+    if layout_provider is not None:
+        try:
+            for b in layout_provider.figures(ocr_bgr):
+                x0, y0, x1, y1 = int(b.x0), int(b.y0), int(b.x1), int(b.y1)
+                if x1 - x0 < 4 or y1 - y0 < 4:
+                    continue
+                layout_boxes_px.append((x0, y0, x1, y1))
+                crop = ocr_bgr[max(0, y0):y1, max(0, x0):x1]
+                kind = RegionKind.PHOTO if _is_continuous_tone(crop) else RegionKind.FIGURE
+                regions.append(Region(
+                    kind=kind,
+                    box=Box(x0 * inv_scale, y0 * inv_scale,
+                            x1 * inv_scale, y1 * inv_scale),
+                    source="rtdetr",
+                ))
+        except Exception:
+            pass
+
     # residual / photo detection on the OCR-resolution binary
     gray = cv2.cvtColor(ocr_bgr, cv2.COLOR_BGR2GRAY)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
@@ -93,6 +114,8 @@ def analyze(
     total_ink = int(ink.sum())
 
     residual = ink.copy()
+    for (x0, y0, x1, y1) in layout_boxes_px:  # don't double-count layout figures
+        residual[max(0, y0):y1, max(0, x0):x1] = 0
     if text_mask is not None:
         dil = cv2.dilate(text_mask, np.ones((TEXT_DILATE_PX * 2 + 1,) * 2, np.uint8))
         residual[dil > 0] = 0
@@ -118,3 +141,14 @@ def analyze(
                 )
             )
     return regions, flags
+
+
+def _is_continuous_tone(crop: np.ndarray) -> bool:
+    """True for halftone/photo regions (many distinct gray levels) vs line art
+    (mostly two levels). Decides PHOTO vs FIGURE for a layout region."""
+    if crop is None or crop.size == 0:
+        return False
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+    hist = cv2.calcHist([gray], [0], None, [32], [0, 256]).ravel()
+    occupied = int((hist > gray.size * 0.01).sum())
+    return occupied >= 6

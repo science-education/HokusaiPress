@@ -29,6 +29,15 @@ class Decision(BaseModel):
     decided_by: str = "human"
 
 
+class RegionEdit(BaseModel):
+    kind: str               # text | figure | photo
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    decided_by: str = "human"
+
+
 def create_app(db_path: str):
     from fastapi import FastAPI, HTTPException
     from fastapi.responses import HTMLResponse, Response
@@ -137,8 +146,10 @@ async function approve(){{
         row = store.get_page(doc_id, page_index)
         if row is None:
             raise HTTPException(404, "page not found")
+        from ..learn import page_features
+
         params = row.params
-        features = _page_features(params)
+        features = page_features(params)
         if decision.page_kind:
             old = params.page_kind.value
             params.page_kind = PageKind(decision.page_kind)
@@ -154,19 +165,31 @@ async function approve(){{
         store.upsert_page(doc_id, page_index, params)
         return {"status": params.review_status.value}
 
+    @app.post("/api/page/{doc_id}/{page_index}/region")
+    def add_region(doc_id: str, page_index: int, edit: RegionEdit):
+        from ..learn import page_features
+        from ..model import Box, Region, RegionKind
+
+        row = store.get_page(doc_id, page_index)
+        if row is None:
+            raise HTTPException(404, "page not found")
+        params = row.params
+        params.regions.append(Region(
+            kind=RegionKind(edit.kind),
+            box=Box(edit.x0, edit.y0, edit.x1, edit.y1),
+            source="manual",
+        ))
+        params.review_status = ReviewStatus.CORRECTED
+        params.decided_by = DecidedBy(edit.decided_by)
+        store.log_decision(doc_id, page_index, edit.decided_by, "region",
+                           None, {"kind": edit.kind,
+                                  "box": [edit.x0, edit.y0, edit.x1, edit.y1]},
+                           page_features(params))
+        store.upsert_page(doc_id, page_index, params)
+        return {"status": params.review_status.value,
+                "regions": len(params.regions)}
+
     return app
-
-
-def _page_features(params) -> dict:
-    """Feature vector logged with each decision (training data for later)."""
-    return {
-        "deskew_angle": params.deskew.angle_deg,
-        "deskew_conf": params.deskew.confidence,
-        "margin_conf": params.margin.confidence if params.margin else 0.0,
-        "n_text": sum(1 for r in params.regions if r.kind.value == "text"),
-        "n_photo": sum(1 for r in params.regions if r.kind.value == "photo"),
-        "flags": [f.value for f in params.flags],
-    }
 
 
 def serve(db_path: str, host: str = "127.0.0.1", port: int = 8765) -> None:

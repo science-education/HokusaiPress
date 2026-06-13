@@ -57,6 +57,24 @@ def test_queue_and_decide_flow(tmp_path):
         store.close()
 
 
+def test_region_edit_flow(tmp_path):
+    db = _seed(tmp_path)
+    client = TestClient(create_app(db))
+    r = client.post("/api/page/scan.png/0/region",
+                    json={"kind": "photo", "x0": 10, "y0": 10, "x1": 90, "y1": 90})
+    body = r.json()
+    assert body["status"] == "corrected"
+    assert body["regions"] == 1
+    store = Store(db)
+    try:
+        row = store.get_page("scan.png", 0)
+        assert row.params.regions[0].source == "manual"
+        assert row.params.regions[0].kind.value == "photo"
+        assert len(store.decisions_for_training("region")) == 1
+    finally:
+        store.close()
+
+
 def test_analysis_preview_png(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))

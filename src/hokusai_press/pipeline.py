@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 
@@ -38,6 +39,8 @@ def analyze_document(
     model_dir: str = "models",
     device: str = "auto",
     use_ocr: bool = True,
+    learned_model: Optional[dict] = None,
+    layout_provider=None,
 ) -> AnalyzeResult:
     from .source import load_page
 
@@ -53,7 +56,7 @@ def analyze_document(
         # 3. content separation (text/figure/photo) + OCR text
         regions, cflags = content_mod.analyze(
             original, ocr_up, source, model_dir=model_dir,
-            device=device, use_ocr=use_ocr,
+            device=device, use_ocr=use_ocr, layout_provider=layout_provider,
         )
         # 4. margin / nombre on the deskewed original
         mg = margin_mod.find_content_box(original, sk)
@@ -74,7 +77,18 @@ def analyze_document(
             params.flags.append(flag)
     margin_mod.normalize_margins(doc.pages, doc.render.output_margin_mm)
 
-    # 6. assign review status
+    # 6. learned page-kind override (from accumulated review decisions)
+    if learned_model:
+        from . import learn
+
+        for params in doc.pages:
+            label, conf = learn.predict(learned_model, learn.page_features(params))
+            if label and learn.is_confident(conf):
+                params.page_kind = PageKind(label)
+            elif Flag.KIND_BORDERLINE not in params.flags:
+                params.flags.append(Flag.KIND_BORDERLINE)
+
+    # 7. assign review status
     for params in doc.pages:
         params.review_status = (
             ReviewStatus.NEEDS_REVIEW if params.flags else ReviewStatus.AUTO
@@ -100,11 +114,15 @@ def run(
     model_dir: str = "models",
     device: str = "auto",
     use_ocr: bool = True,
+    learned_model_path: Optional[str] = None,
 ) -> dict:
     """Full batch run: analyze, persist params, render the PDF."""
+    from . import learn
     from .render import build_pdf
 
-    result = analyze_document(path, model_dir=model_dir, device=device, use_ocr=use_ocr)
+    learned = learn.load(learned_model_path) if learned_model_path else None
+    result = analyze_document(path, model_dir=model_dir, device=device,
+                              use_ocr=use_ocr, learned_model=learned)
     doc_id = os.path.basename(path)
     store = Store(db_path)
     try:
