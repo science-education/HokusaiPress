@@ -38,6 +38,8 @@ hokusai-press run scan.pdf --out book.pdf --device npu      # バッチ解析+�
 hokusai-press queue                                          # 要レビュー一覧
 hokusai-press review                                         # レビューWeb UI
 hokusai-press rebuild scan.pdf --doc scan.pdf --out book.pdf  # 修正後に再生成
+hokusai-press learn --out model.json                        # 判断ログから学習
+hokusai-press run scan.pdf --out book.pdf --learned-model model.json
 ```
 
 `--no-ocr` で OCR を省略し幾何処理＋ヒューリスティック分離のみでも動作します。
@@ -59,14 +61,18 @@ hokusai-press rebuild scan.pdf --doc scan.pdf --out book.pdf  # 修正後に再�
 
 ## 状態
 
-実装済み・検証済み（21テスト、CI ubuntu+windows）:
+実装済み・検証済み（29テスト、CI ubuntu+windows）:
 - 非破壊パラメータモデル + JSON/SQLite 永続化
 - deskew（確信度つき、縦横書き両対応）
-- ノンブル基準マージン正規化（パリティ別・均一判型・クリップなし）
+- ノンブル基準マージン正規化（パリティ別・均一判型・クリップなし・ノンブル縦アンカー）
 - 1パスレンダラ + 物理ページサイズ（実書籍で 4.70×7.27 inch 均一を確認）
 - 多層 MRC（二値テキスト層 G4/JBIG2 + 写真層 JPEG、字は鮮明・写真は軽量）
-- バッチ → 低確信ページのみレビュー（画像オーバーレイ表示）→ 判断ログ → rebuild
+- 字/図/写真の峻別: DBNet 行+認識、RT-DETRv2 図領域フック（layout_provider）、
+  残差インク写真ヒューリスティック
+- バッチ → 低確信ページのみレビュー（解析オーバーレイ+出力プレビュー、種別/領域編集）
+  → 判断ログ → rebuild（パラメータ純関数で無劣化再生成）
+- 判断ログからの page-kind 学習（最近傍重心、依存追加なし）→ 自動判定へ反映
 - 検索可能テキスト層
 
-次段: ノンブル基準マージンのページ間最適化の本格 C++ 移植、RT-DETRv2 図領域の
-content.py 配線、レビュー UI の領域編集、判断ログからの自動判定学習。
+次段: ノンブル基準マージンの綴じ方向対応（spine 整列）の本格 C++ 移植、
+RT-DETRv2 アダプタの実機検証、レビュー UI の領域ドラッグ描画。
