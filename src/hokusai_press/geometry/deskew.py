@@ -10,8 +10,12 @@ Writing-direction agnostic: the score is the better of the horizontal
 (yokogaki rows) and vertical (tategaki columns) projection sharpness, so the
 same routine deskews both. Coarse-to-fine search keeps it fast.
 
-Confidence = (best_score / median_score) - 1, normalized; below
-GOOD_CONFIDENCE the page is flagged for review instead of trusted.
+Confidence is how far the best angle's sharpness stands above the spread of
+scores: (best - median) / (median - min). This is invariant to an additive
+baseline, so a large illustration/halftone (which adds a roughly
+angle-independent offset to every projection) no longer deflates the score of a
+page whose text lines still peak sharply — fixing false "low confidence" flags
+on figure+text pages. Below GOOD_CONFIDENCE the page is flagged for review.
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ from ..model import Deskew
 MAX_ANGLE = 7.0          # degrees; OCR tolerates only a few degrees of skew
 COARSE_STEP = 0.5
 FINE_STEP = 0.05
-GOOD_CONFIDENCE = 2.0    # score must beat the median by 200% to be trusted
+GOOD_CONFIDENCE = 1.5    # (best-median)/(median-min) must exceed this to trust
 WORK_MAX_SIDE = 1500     # downscale for the angle search (speed; angle is scale-free)
 
 
@@ -70,8 +74,11 @@ def find_skew(img_bgr: np.ndarray) -> Deskew:
     best_a = max(scores, key=scores.get)
 
     values = np.array(list(scores.values()))
-    median = float(np.median(values)) or 1.0
-    confidence = scores[best_a] / median - 1.0
+    median = float(np.median(values))
+    spread = median - float(values.min())
+    # baseline-invariant peakiness: how far the best angle stands above the
+    # bulk, scaled by the spread (a constant offset from a figure cancels out)
+    confidence = (scores[best_a] - median) / spread if spread > 0 else 0.0
     # ScanTailor convention: positive angle = clockwise skew to correct.
     return Deskew(angle_deg=round(float(best_a), 3), confidence=round(confidence, 3))
 

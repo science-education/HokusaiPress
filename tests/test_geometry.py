@@ -37,6 +37,28 @@ def test_blank_page_low_confidence():
     assert not is_confident(sk)
 
 
+def test_figure_plus_text_is_confident():
+    # the real-world false positive: a big solid figure on top half + text lines
+    # on the bottom. The text peaks sharply at 0 deg, so the page must be trusted
+    # even though the figure adds a flat baseline to the projection.
+    img = np.full((800, 600, 3), 255, dtype=np.uint8)
+    cv2.rectangle(img, (80, 40), (520, 380), (0, 0, 0), -1)   # figure block
+    for y in range(430, 760, 36):                              # text lines below
+        cv2.rectangle(img, (90, y), (510, y + 14), (0, 0, 0), -1)
+    sk = find_skew(img)
+    assert abs(sk.angle_deg) < 0.3
+    assert is_confident(sk)            # was flagged low-confidence before the fix
+
+
+def test_structureless_page_not_confident():
+    # random speckle has no line structure -> deskew is unreliable -> flag it
+    rng = np.random.default_rng(0)
+    noise = np.where(rng.random((1000, 800, 1)) < 0.15, 0, 255).astype(np.uint8)
+    noise = np.repeat(noise, 3, axis=2)
+    sk = find_skew(noise)
+    assert not is_confident(sk)
+
+
 def test_content_box_excludes_border_noise():
     img = np.full((800, 600, 3), 255, dtype=np.uint8)
     cv2.rectangle(img, (100, 150), (500, 650), (0, 0, 0), 3)  # body frame
