@@ -12,6 +12,7 @@ Two tables:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -62,6 +63,11 @@ class Store:
         # (analysis.png + output.png + api calls), so concurrent access to the
         # one connection is real: a lock serializes every statement+fetch so
         # interleaved cursors can't return half-populated rows.
+        # sqlite creates the db file on connect but not missing parent dirs, so
+        # make them first (skip in-memory / bare-filename paths).
+        parent = os.path.dirname(db_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()

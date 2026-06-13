@@ -20,6 +20,16 @@ def _page(flagged: bool) -> PageParams:
     )
 
 
+def test_creates_missing_parent_dir(tmp_path):
+    # sqlite won't create missing parent dirs; Store should
+    db = str(tmp_path / "new" / "sub" / "hokusai.db")
+    store = Store(db)
+    try:
+        assert __import__("os").path.exists(db)
+    finally:
+        store.close()
+
+
 def test_upsert_and_get(tmp_path):
     store = Store(str(tmp_path / "t.db"))
     store.upsert_page("doc", 0, _page(True))
