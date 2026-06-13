@@ -116,9 +116,12 @@ def create_app(db_path: str):
 
         kind_hex = {k.value: _bgr_to_hex(c) for k, c in _COLORS.items()}
 
-        def _box_div(b, color, handler, label):
+        def _box_div(b, color, handler, label, group):
+            # data-group lets setMode() enable hover/click on only the boxes
+            # matching the active button, so a big content box on top never
+            # blocks selecting a photo/nombre box underneath.
             return (
-                f'<div class="rbox" title="{label}"'
+                f'<div class="rbox" data-group="{group}" title="{label}"'
                 f' style="left:{b.x0 / ow * 100:.3f}%;top:{b.y0 / oh * 100:.3f}%;'
                 f'width:{max(0.0, b.x1 - b.x0) / ow * 100:.3f}%;'
                 f'height:{max(0.0, b.y1 - b.y0) / oh * 100:.3f}%;'
@@ -129,6 +132,7 @@ def create_app(db_path: str):
             _box_div(
                 r.box, kind_hex.get(r.kind.value, "#888"), f"delRegion({i})",
                 r.kind.value + (f"/{r.tone}" if r.tone else "") + " — ダブルクリックで削除",
+                r.kind.value,
             )
             for i, r in enumerate(row.params.regions)
         )
@@ -136,11 +140,11 @@ def create_app(db_path: str):
         if mg and mg.content:
             regions_overlay += _box_div(
                 mg.content, _bgr_to_hex(_CONTENT_COLOR), "delBox('content')",
-                "内容領域 — ダブルクリックで削除(自動検出に戻す)")
+                "内容領域 — ダブルクリックで削除(自動検出に戻す)", "content")
         if mg and mg.nombre_box:
             regions_overlay += _box_div(
                 mg.nombre_box, _bgr_to_hex(_NOMBRE_COLOR), "delBox('nombre')",
-                "ページ番号領域 — ダブルクリックで削除")
+                "ページ番号領域 — ダブルクリックで削除", "nombre")
         # cache-busting token so a reload after an edit refetches the previews
         # instead of showing the browser-cached image at the same URL
         import time
@@ -197,7 +201,9 @@ const ORIG_W={ow}, ORIG_H={oh};
     return {{x:Math.max(0,Math.min(e.clientX-r.left,r.width)),
              y:Math.max(0,Math.min(e.clientY-r.top,r.height))}};
   }}
-  img.addEventListener('mousedown',e=>{{
+  // listen on the wrapper so a drag still starts when the cursor is over an
+  // active overlay box (which sits above the image)
+  wrap.addEventListener('mousedown',e=>{{
     e.preventDefault(); drag=true; const p=pos(e); sx=p.x; sy=p.y;
     rb.style.left=sx+'px'; rb.style.top=sy+'px';
     rb.style.width='0px'; rb.style.height='0px'; rb.style.display='block';
@@ -236,6 +242,12 @@ function setMode(m){{
     b.style.outline = m===mm ? '2px solid #06c' : 'none';
     b.style.fontWeight = m===mm ? 'bold' : 'normal';
   }}
+  // only same-kind boxes are hoverable/deletable for the active mode; others
+  // become click-through so an overlapping box can't block them
+  const grp = (m==='content'||m==='nombre') ? m : 'photo';
+  document.querySelectorAll('.rbox').forEach(el=>{{
+    el.style.pointerEvents = (el.dataset.group===grp) ? 'auto' : 'none';
+  }});
 }}
 async function addPhoto(x0,y0,x1,y1){{
   await fetch('/api/page/{doc_id}/{page_index}/region',{{method:'POST',

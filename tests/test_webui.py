@@ -176,6 +176,23 @@ def test_page_view_has_content_nombre_modes(tmp_path):
     assert "backToQueue()" in html           # back-to-queue recomputes
 
 
+def test_overlays_are_grouped_for_mode_scoped_hover(tmp_path):
+    db = _seed(tmp_path)
+    client = TestClient(create_app(db))
+    client.post("/api/page/scan.png/0/region",
+                json={"kind": "photo", "x0": 10, "y0": 10, "x1": 90, "y1": 90})
+    client.post("/api/page/scan.png/0/nombre",
+                json={"x0": 120, "y0": 360, "x1": 180, "y1": 380})
+    html = client.get("/page/scan.png/0").text
+    # each overlay tags its kind so setMode can scope hover/click to one group
+    assert 'data-group="photo"' in html
+    assert 'data-group="content"' in html      # seed page has a content box
+    assert 'data-group="nombre"' in html
+    # only the active group is interactive; others are click-through
+    assert "el.dataset.group===grp" in html
+    assert "el.style.pointerEvents" in html
+
+
 def test_region_delete_out_of_range_404(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))
