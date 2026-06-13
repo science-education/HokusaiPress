@@ -168,3 +168,22 @@ def rebuild(doc_id: str, source_path: str, out_pdf: str,
         originals.append(original)
     build_pdf(doc, originals, out_pdf)
     return {"doc_id": doc_id, "pages": len(rows), "out_pdf": out_pdf}
+
+
+def recompute_margins(store: Store, doc_id: str,
+                      output_margin_mm: float = 5.0) -> int:
+    """Re-run nombre-anchored margin normalization across a document's stored
+    pages and persist the new crops. Returns the number of pages.
+
+    Normalize-ONLY: detection (find_content_box / nombre) is never re-run, so
+    manual content/nombre overrides are preserved. Because the output crop SIZE
+    is the largest content extent in each parity group, editing one page's
+    content/nombre changes the crop of its whole group — so the recompute spans
+    every page. This is cheap (pure geometry over stored boxes; no image/OCR).
+    """
+    rows = store.list_pages(doc_id)
+    pages = [r.params for r in rows]
+    margin_mod.normalize_margins(pages, output_margin_mm)
+    for p in pages:
+        store.upsert_page(doc_id, p.source.page_index, p)
+    return len(pages)

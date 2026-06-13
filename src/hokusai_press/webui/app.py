@@ -40,6 +40,14 @@ class RegionEdit(BaseModel):
     decided_by: str = "human"
 
 
+class BoxEdit(BaseModel):       # for content / nombre overrides
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    decided_by: str = "human"
+
+
 def create_app(db_path: str):
     from fastapi import FastAPI, HTTPException
     from fastapi.responses import HTMLResponse, Response
@@ -102,21 +110,37 @@ def create_app(db_path: str):
         # clickable hit areas over each region (positioned in % so they track
         # the image at any display scale); double/right-click deletes. The solid
         # colored boxes themselves come from the analysis PNG underneath.
-        from ..preview import _COLORS, _bgr_to_hex
+        from ..preview import (
+            _COLORS, _CONTENT_COLOR, _NOMBRE_COLOR, _bgr_to_hex,
+        )
 
         kind_hex = {k.value: _bgr_to_hex(c) for k, c in _COLORS.items()}
+
+        def _box_div(b, color, handler, label):
+            return (
+                f'<div class="rbox" title="{label}"'
+                f' style="left:{b.x0 / ow * 100:.3f}%;top:{b.y0 / oh * 100:.3f}%;'
+                f'width:{max(0.0, b.x1 - b.x0) / ow * 100:.3f}%;'
+                f'height:{max(0.0, b.y1 - b.y0) / oh * 100:.3f}%;'
+                f'--c:{color}" ondblclick="{handler}"></div>'
+            )
+
         regions_overlay = "".join(
-            f'<div class="rbox" title="{r.kind.value}'
-            + (f"/{r.tone}" if r.tone else "")
-            + ' — ダブルクリックで削除"'
-            f' style="left:{r.box.x0 / ow * 100:.3f}%;top:{r.box.y0 / oh * 100:.3f}%;'
-            f'width:{max(0.0, r.box.x1 - r.box.x0) / ow * 100:.3f}%;'
-            f'height:{max(0.0, r.box.y1 - r.box.y0) / oh * 100:.3f}%;'
-            f'--c:{kind_hex.get(r.kind.value, "#888")}"'
-            f' ondblclick="delRegion({i})">'
-            f'</div>'
+            _box_div(
+                r.box, kind_hex.get(r.kind.value, "#888"), f"delRegion({i})",
+                r.kind.value + (f"/{r.tone}" if r.tone else "") + " — ダブルクリックで削除",
+            )
             for i, r in enumerate(row.params.regions)
         )
+        mg = row.params.margin
+        if mg and mg.content:
+            regions_overlay += _box_div(
+                mg.content, _bgr_to_hex(_CONTENT_COLOR), "delBox('content')",
+                "内容領域 — ダブルクリックで削除(自動検出に戻す)")
+        if mg and mg.nombre_box:
+            regions_overlay += _box_div(
+                mg.nombre_box, _bgr_to_hex(_NOMBRE_COLOR), "delBox('nombre')",
+                "ページ番号領域 — ダブルクリックで削除")
         # cache-busting token so a reload after an edit refetches the previews
         # instead of showing the browser-cached image at the same URL
         import time
@@ -134,7 +158,7 @@ button{{padding:3px 8px}}
   <button onclick="decide('gray')">グレースケール</button>
   <button onclick="decide('color')">カラー</button>
   &nbsp;&nbsp;
-  <button onclick="location.href='/'">キューに戻る</button>
+  <button onclick="backToQueue()">キューに戻る</button>
 </p>
 <div style="display:flex;gap:16px;flex-wrap:wrap">
   <div>
@@ -143,6 +167,9 @@ button{{padding:3px 8px}}
     <div style="margin:6px 0">
       <button id="mColor" onclick="setMode('color')" style="background:#fde8e8">写真（カラー）</button>
       <button id="mGray" onclick="setMode('gray')" style="background:#eeeeee">写真（グレー）</button>
+      &nbsp;
+      <button id="mContent" onclick="setMode('content')" style="background:#e7f0fb">内容領域</button>
+      <button id="mNombre" onclick="setMode('nombre')" style="background:#f7e7f7">ページ番号領域</button>
     </div>
     <div id="awrap" style="position:relative;display:inline-block;border:1px solid #ccc">
       <img id="aimg" src="{base}/analysis.png?v={v}" style="max-width:520px;display:block">
@@ -185,16 +212,26 @@ const ORIG_W={ow}, ORIG_H={oh};
     const p=pos(e);
     if(Math.abs(p.x-sx)<4 || Math.abs(p.y-sy)<4) return;   // ignore tiny drags
     const kx=ORIG_W/img.clientWidth, ky=ORIG_H/img.clientHeight;
-    // drag completes the spec: add a photo region in the current mode at once
-    addPhoto(Math.round(Math.min(sx,p.x)*kx), Math.round(Math.min(sy,p.y)*ky),
-             Math.round(Math.max(sx,p.x)*kx), Math.round(Math.max(sy,p.y)*ky));
+    const x0=Math.round(Math.min(sx,p.x)*kx), y0=Math.round(Math.min(sy,p.y)*ky),
+          x1=Math.round(Math.max(sx,p.x)*kx), y1=Math.round(Math.max(sy,p.y)*ky);
+    // drag completes the spec; dispatch by current mode
+    if(MODE==='content'){{
+      if(confirm('内容領域を設定し、全ページを再計算しますか？'))
+        setBox('content',x0,y0,x1,y1);
+    }} else if(MODE==='nombre'){{
+      if(confirm('ページ番号領域を設定し、全ページを再計算しますか？'))
+        setBox('nombre',x0,y0,x1,y1);
+    }} else {{
+      addPhoto(x0,y0,x1,y1);   // photo: no confirm (cheap, dblclick to undo)
+    }}
   }});
 }})();
 let MODE='gray';
 function setMode(m){{
   MODE=m;
   localStorage.setItem('hp_mode', m);   // remember across reloads/pages
-  for(const [id,mm] of [['mGray','gray'],['mColor','color']]){{
+  for(const [id,mm] of [['mGray','gray'],['mColor','color'],
+                        ['mContent','content'],['mNombre','nombre']]){{
     const b=document.getElementById(id);
     b.style.outline = m===mm ? '2px solid #06c' : 'none';
     b.style.fontWeight = m===mm ? 'bold' : 'normal';
@@ -205,6 +242,24 @@ async function addPhoto(x0,y0,x1,y1){{
     headers:{{'Content-Type':'application/json'}},
     body:JSON.stringify({{kind:'photo',tone:MODE,x0:x0,y0:y0,x1:x1,y1:y1}})}});
   location.reload();   // box appears on overlay; stays in queue until done
+}}
+async function setBox(kind,x0,y0,x1,y1){{
+  // kind = content | nombre. The endpoint recomputes all pages' crops.
+  await fetch('/api/page/{doc_id}/{page_index}/'+kind,{{method:'POST',
+    headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{x0:x0,y0:y0,x1:x1,y1:y1}})}});
+  location.reload();
+}}
+async function delBox(kind){{
+  const label = kind==='content' ? '内容領域（削除すると自動検出に戻す）' : 'ページ番号領域';
+  if(!confirm(label+'を削除し、全ページを再計算しますか？')) return;
+  await fetch('/api/page/{doc_id}/{page_index}/'+kind+'/delete',{{method:'POST'}});
+  location.reload();
+}}
+async function backToQueue(){{
+  // recompute every page so the book keeps a uniform page size, then return
+  await fetch('/api/doc/{doc_id}/recompute',{{method:'POST'}});
+  location.href='/';
 }}
 async function decide(kind){{
   await fetch('/api/page/{doc_id}/{page_index}/decide',{{method:'POST',
@@ -339,6 +394,101 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
         store.upsert_page(doc_id, page_index, params)
         return {"status": params.review_status.value,
                 "regions": len(params.regions)}
+
+    def _recompute(doc_id: str) -> int:
+        from ..pipeline import recompute_margins
+        return recompute_margins(store, doc_id)
+
+    def _ensure_margin(params):
+        from ..model import Box, Margin
+        if params.margin is None:
+            params.margin = Margin(content=Box(0, 0, 1, 1), confidence=1.0)
+        return params.margin
+
+    @app.post("/api/page/{doc_id}/{page_index}/content")
+    def set_content(doc_id: str, page_index: int, edit: BoxEdit):
+        from ..learn import page_features
+        from ..model import Box
+
+        row = store.get_page(doc_id, page_index)
+        if row is None:
+            raise HTTPException(404, "page not found")
+        params = row.params
+        m = _ensure_margin(params)
+        old = ([m.content.x0, m.content.y0, m.content.x1, m.content.y1]
+               if m.content else None)
+        m.content = Box(edit.x0, edit.y0, edit.x1, edit.y1)
+        m.confidence = 1.0                 # manual = trusted
+        store.log_decision(doc_id, page_index, edit.decided_by, "content",
+                           old, [edit.x0, edit.y0, edit.x1, edit.y1],
+                           page_features(params))
+        store.upsert_page(doc_id, page_index, params)
+        # crop size depends on the whole parity group -> recompute all pages
+        n = _recompute(doc_id)
+        return {"status": params.review_status.value, "recomputed": n}
+
+    @app.post("/api/page/{doc_id}/{page_index}/content/delete")
+    def delete_content(doc_id: str, page_index: int):
+        from ..geometry.margin import find_content_box
+        from ..learn import page_features
+
+        row = store.get_page(doc_id, page_index)
+        if row is None:
+            raise HTTPException(404, "page not found")
+        params = row.params
+        # delete = revert content to auto-detection (keeps an existing nombre)
+        detected = find_content_box(_load_original(params), params.deskew)
+        if params.margin is None:
+            params.margin = detected
+        else:
+            params.margin.content = detected.content
+            params.margin.confidence = detected.confidence
+        store.log_decision(doc_id, page_index, "human", "content_delete",
+                           None, "re-detected", page_features(params))
+        store.upsert_page(doc_id, page_index, params)
+        n = _recompute(doc_id)
+        return {"status": params.review_status.value, "recomputed": n}
+
+    @app.post("/api/page/{doc_id}/{page_index}/nombre")
+    def set_nombre(doc_id: str, page_index: int, edit: BoxEdit):
+        from ..learn import page_features
+        from ..model import Box
+
+        row = store.get_page(doc_id, page_index)
+        if row is None:
+            raise HTTPException(404, "page not found")
+        params = row.params
+        m = _ensure_margin(params)
+        old = ([m.nombre_box.x0, m.nombre_box.y0, m.nombre_box.x1, m.nombre_box.y1]
+               if m.nombre_box else None)
+        m.nombre_box = Box(edit.x0, edit.y0, edit.x1, edit.y1)
+        store.log_decision(doc_id, page_index, edit.decided_by, "nombre",
+                           old, [edit.x0, edit.y0, edit.x1, edit.y1],
+                           page_features(params))
+        store.upsert_page(doc_id, page_index, params)
+        n = _recompute(doc_id)
+        return {"status": params.review_status.value, "recomputed": n}
+
+    @app.post("/api/page/{doc_id}/{page_index}/nombre/delete")
+    def delete_nombre(doc_id: str, page_index: int):
+        from ..learn import page_features
+
+        row = store.get_page(doc_id, page_index)
+        if row is None:
+            raise HTTPException(404, "page not found")
+        params = row.params
+        if params.margin is None or params.margin.nombre_box is None:
+            raise HTTPException(404, "no nombre to delete")
+        params.margin.nombre_box = None    # normalize falls back to centering
+        store.log_decision(doc_id, page_index, "human", "nombre_delete",
+                           None, None, page_features(params))
+        store.upsert_page(doc_id, page_index, params)
+        n = _recompute(doc_id)
+        return {"status": params.review_status.value, "recomputed": n}
+
+    @app.post("/api/doc/{doc_id}/recompute")
+    def recompute(doc_id: str):
+        return {"recomputed": _recompute(doc_id)}
 
     return app
 

@@ -103,6 +103,79 @@ def test_region_delete_removes_and_logs(tmp_path):
         store.close()
 
 
+def test_set_content_updates_box_and_recomputes(tmp_path):
+    db = _seed(tmp_path)
+    client = TestClient(create_app(db))
+    r = client.post("/api/page/scan.png/0/content",
+                    json={"x0": 20, "y0": 20, "x1": 280, "y1": 360})
+    assert r.json()["recomputed"] >= 1
+    store = Store(db)
+    try:
+        m = store.get_page("scan.png", 0).params.margin
+        assert (m.content.x0, m.content.y1) == (20, 360)
+        assert m.crop is not None                       # normalization ran
+        assert len(store.decisions_for_training("content")) == 1
+    finally:
+        store.close()
+
+
+def test_set_and_delete_nombre(tmp_path):
+    db = _seed(tmp_path)
+    client = TestClient(create_app(db))
+    client.post("/api/page/scan.png/0/nombre",
+                json={"x0": 120, "y0": 360, "x1": 180, "y1": 380})
+    store = Store(db)
+    try:
+        assert store.get_page("scan.png", 0).params.margin.nombre_box is not None
+    finally:
+        store.close()
+    r = client.post("/api/page/scan.png/0/nombre/delete")
+    assert r.json()["recomputed"] >= 1
+    store = Store(db)
+    try:
+        assert store.get_page("scan.png", 0).params.margin.nombre_box is None
+    finally:
+        store.close()
+    # deleting again => nothing to delete
+    assert client.post("/api/page/scan.png/0/nombre/delete").status_code == 404
+
+
+def test_delete_content_redetects(tmp_path):
+    db = _seed(tmp_path)
+    client = TestClient(create_app(db))
+    # first override content, then delete -> reverts to auto-detection
+    client.post("/api/page/scan.png/0/content",
+                json={"x0": 0, "y0": 0, "x1": 5, "y1": 5})
+    r = client.post("/api/page/scan.png/0/content/delete")
+    assert r.json()["recomputed"] >= 1
+    store = Store(db)
+    try:
+        m = store.get_page("scan.png", 0).params.margin
+        assert m.content.width > 5    # re-detected the real content bar
+        assert len(store.decisions_for_training("content_delete")) == 1
+    finally:
+        store.close()
+
+
+def test_doc_recompute_endpoint(tmp_path):
+    db = _seed(tmp_path)
+    client = TestClient(create_app(db))
+    assert client.post("/api/doc/scan.png/recompute").json()["recomputed"] == 1
+
+
+def test_page_view_has_content_nombre_modes(tmp_path):
+    db = _seed(tmp_path)
+    client = TestClient(create_app(db))
+    client.post("/api/page/scan.png/0/nombre",
+                json={"x0": 120, "y0": 360, "x1": 180, "y1": 380})
+    html = client.get("/page/scan.png/0").text
+    assert "setMode('content')" in html and "setMode('nombre')" in html
+    assert "内容領域" in html and "ページ番号領域" in html
+    assert "delBox('content')" in html       # content box deletable overlay
+    assert "delBox('nombre')" in html        # nombre box deletable overlay
+    assert "backToQueue()" in html           # back-to-queue recomputes
+
+
 def test_region_delete_out_of_range_404(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))
