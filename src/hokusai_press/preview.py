@@ -23,6 +23,31 @@ _COLORS = {  # BGR
     RegionKind.FIGURE: (40, 140, 230),
     RegionKind.PHOTO: (60, 60, 220),
 }
+# overlay boxes that are not region classes (BGR)
+_CONTENT_COLOR = (200, 120, 0)
+_CROP_COLOR = (0, 200, 200)
+_NOMBRE_COLOR = (200, 0, 200)
+
+
+def _bgr_to_hex(bgr) -> str:
+    b, g, r = (int(c) for c in bgr)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def legend() -> list[tuple[str, str]]:
+    """(label, #rrggbb) for every box color the analysis overlay draws.
+
+    Derived from the same constants the overlay uses, so the UI legend can
+    never drift from the actual rendered colors.
+    """
+    return [
+        ("text 文字（二値）", _bgr_to_hex(_COLORS[RegionKind.TEXT])),
+        ("figure 線画（二値）", _bgr_to_hex(_COLORS[RegionKind.FIGURE])),
+        ("photo 写真（トーン維持）", _bgr_to_hex(_COLORS[RegionKind.PHOTO])),
+        ("content 内容枠", _bgr_to_hex(_CONTENT_COLOR)),
+        ("crop 出力枠", _bgr_to_hex(_CROP_COLOR)),
+        ("nombre ノンブル", _bgr_to_hex(_NOMBRE_COLOR)),
+    ]
 
 
 def _downscale(img: np.ndarray) -> np.ndarray:
@@ -53,11 +78,11 @@ def analysis_overlay(original_bgr: np.ndarray, params: PageParams) -> bytes:
         rect(r.box, _COLORS.get(r.kind, (128, 128, 128)), 2)
     if params.margin:
         if params.margin.content:
-            rect(params.margin.content, (200, 120, 0), 3)   # content: blue
+            rect(params.margin.content, _CONTENT_COLOR, 3)   # blue
         if params.margin.crop:
-            rect(params.margin.crop, (0, 200, 200), 2)      # crop: yellow
+            rect(params.margin.crop, _CROP_COLOR, 2)         # yellow
         if params.margin.nombre_box:
-            rect(params.margin.nombre_box, (200, 0, 200), 3)  # nombre: magenta
+            rect(params.margin.nombre_box, _NOMBRE_COLOR, 3)  # magenta
 
     ok, buf = cv2.imencode(".png", _downscale(canvas))
     return buf.tobytes()

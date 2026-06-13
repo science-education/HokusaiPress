@@ -68,16 +68,33 @@ def create_app(db_path: str):
 
     @app.get("/page/{doc_id}/{page_index}", response_class=HTMLResponse)
     def page_view(doc_id: str, page_index: int):
+        from ..preview import legend
+
         row = store.get_page(doc_id, page_index)
         if row is None:
             raise HTTPException(404, "page not found")
         flags = ", ".join(row.flags) or "(none)"
         base = f"/img/{doc_id}/{page_index}"
+        # deskewed-original dimensions (= original; deskew keeps the canvas
+        # size), so the browser can map a drag back to region pixels.
+        oh, ow = _load_original(row.params).shape[:2]
+        legend_html = "".join(
+            f'<span style="display:inline-flex;align-items:center;margin-right:14px">'
+            f'<span style="width:14px;height:14px;background:{hexc};'
+            f'border:1px solid #888;margin-right:4px"></span>{label}</span>'
+            for label, hexc in legend()
+        )
         return f"""
 <h2>{doc_id} &mdash; page {page_index}</h2>
 <p>flags: {flags} &middot; status: {row.review_status}</p>
+<p style="font-size:90%"><b>analysis 凡例:</b> {legend_html}</p>
 <div style="display:flex;gap:16px;flex-wrap:wrap">
-  <div><h3>analysis</h3><img src="{base}/analysis.png" style="max-width:520px;border:1px solid #ccc"></div>
+  <div><h3>analysis <span style="font-weight:normal;font-size:80%">(ドラッグで領域指定)</span></h3>
+    <div id="awrap" style="position:relative;display:inline-block;border:1px solid #ccc">
+      <img id="aimg" src="{base}/analysis.png" style="max-width:520px;display:block">
+      <div id="rb" style="position:absolute;border:2px dashed #d00;background:rgba(221,0,0,.12);display:none;pointer-events:none"></div>
+    </div>
+  </div>
   <div><h3>output</h3><img src="{base}/output.png" style="max-width:520px;border:1px solid #ccc"></div>
 </div>
 <p>set page kind:
@@ -124,11 +141,39 @@ gray/color は自動判定（領域の彩度）ですが、下の <i>tone</i> �
   x1<input id="x1" size="5"> y1<input id="y1" size="5">
   <button onclick="addRegion()">add</button>
 </p>
-<p style="color:#666;font-size:90%">※ 座標は数値入力（ドラッグ描画は次段）。
-解析画像の枠を目安に原画像ピクセルで指定してください。</p>
+<p style="color:#666;font-size:90%">※ 上の analysis 画像をドラッグすると座標が自動入力されます
+（数値で微調整も可）。</p>
 
 <p><a href="/">&larr; back to queue</a></p>
 <script>
+const ORIG_W={ow}, ORIG_H={oh};
+(function(){{
+  const img=document.getElementById('aimg'),
+        wrap=document.getElementById('awrap'), rb=document.getElementById('rb');
+  let sx=0, sy=0, drag=false;
+  function pos(e){{
+    const r=img.getBoundingClientRect();
+    return {{x:Math.max(0,Math.min(e.clientX-r.left,r.width)),
+             y:Math.max(0,Math.min(e.clientY-r.top,r.height))}};
+  }}
+  img.addEventListener('mousedown',e=>{{
+    e.preventDefault(); drag=true; const p=pos(e); sx=p.x; sy=p.y;
+    rb.style.left=sx+'px'; rb.style.top=sy+'px';
+    rb.style.width='0px'; rb.style.height='0px'; rb.style.display='block';
+  }});
+  window.addEventListener('mousemove',e=>{{
+    if(!drag) return; const p=pos(e);
+    rb.style.left=Math.min(sx,p.x)+'px'; rb.style.top=Math.min(sy,p.y)+'px';
+    rb.style.width=Math.abs(p.x-sx)+'px'; rb.style.height=Math.abs(p.y-sy)+'px';
+  }});
+  window.addEventListener('mouseup',e=>{{
+    if(!drag) return; drag=false; const p=pos(e);
+    const kx=ORIG_W/img.clientWidth, ky=ORIG_H/img.clientHeight;
+    const set=(id,v)=>document.getElementById(id).value=Math.round(v);
+    set('x0',Math.min(sx,p.x)*kx); set('y0',Math.min(sy,p.y)*ky);
+    set('x1',Math.max(sx,p.x)*kx); set('y1',Math.max(sy,p.y)*ky);
+  }});
+}})();
 function tonevis(){{
   document.getElementById('tonewrap').style.display =
     document.getElementById('rk').value==='photo' ? 'inline' : 'none';

@@ -111,3 +111,26 @@ def test_analysis_preview_png(tmp_path):
     assert r.status_code == 200
     assert r.headers["content-type"] == "image/png"
     assert r.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_legend_colors_match_overlay():
+    from hokusai_press.preview import _COLORS, _bgr_to_hex, legend
+    from hokusai_press.model import RegionKind
+
+    entries = dict(legend())
+    # every region color appears in the legend with its exact hex
+    for kind in (RegionKind.TEXT, RegionKind.FIGURE, RegionKind.PHOTO):
+        assert _bgr_to_hex(_COLORS[kind]) in entries.values()
+    # photo is red (R dominant), text is green (G dominant)
+    photo_hex = _bgr_to_hex(_COLORS[RegionKind.PHOTO])
+    assert photo_hex == "#dc3c3c"
+
+
+def test_page_view_has_legend_and_drag(tmp_path):
+    db = _seed(tmp_path)
+    client = TestClient(create_app(db))
+    html = client.get("/page/scan.png/0").text
+    assert "analysis 凡例" in html
+    assert "ドラッグで領域指定" in html
+    # drag mapping needs the deskewed-original dims (seed image is 300x400)
+    assert "ORIG_W=300" in html and "ORIG_H=400" in html
