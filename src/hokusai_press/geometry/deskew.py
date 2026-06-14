@@ -39,7 +39,8 @@ def _binary(img_bgr: np.ndarray) -> np.ndarray:
         s = WORK_MAX_SIDE / max(h, w)
         gray = cv2.resize(gray, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    return (binary > 0).astype(np.float32)
+    from .margin import strip_edge_shadows  # binding/ADF shadows skew the profile
+    return (strip_edge_shadows(binary) > 0).astype(np.float32)
 
 
 def _profile_sharpness(rotated: np.ndarray) -> float:

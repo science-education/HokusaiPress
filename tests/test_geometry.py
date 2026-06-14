@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 
 from hokusai_press.geometry.deskew import GOOD_CONFIDENCE, find_skew, is_confident
-from hokusai_press.geometry.margin import find_content_box
+from hokusai_press.geometry.margin import find_content_box, strip_edge_shadows
 from hokusai_press.model import Deskew
 
 
@@ -68,3 +68,24 @@ def test_content_box_excludes_border_noise():
     assert mg.content.x1 <= 510
     assert mg.content.y0 >= 140
     assert mg.confidence > 0
+
+
+def test_content_box_excludes_inset_binding_shadow():
+    # a near-solid dark bar a few px INSIDE the right edge (binding/ADF shadow,
+    # not touching the border) must not blow the content box out to full width.
+    img = np.full((800, 600, 3), 255, dtype=np.uint8)
+    cv2.rectangle(img, (100, 150), (480, 650), (0, 0, 0), 3)   # real body frame
+    img[0:800, 585:590] = 0   # inset vertical shadow bar near the right edge
+    mg = find_content_box(img, Deskew())
+    assert mg.content.x1 <= 500          # shadow bar excluded, not at ~589
+    assert mg.content.width < 600 * 0.85  # not full-bleed
+
+
+def test_strip_edge_shadows_keeps_text_columns():
+    # a dense (but <50%) text column near the edge must survive
+    binary = np.zeros((400, 300), dtype=np.uint8)
+    binary[::3, 20:40] = 255          # ~33% ink text-like column in edge band
+    binary[:, 290:294] = 255          # ~100% ink shadow bar in edge band
+    out = strip_edge_shadows(binary)
+    assert out[::3, 20:40].any()      # text kept
+    assert not out[:, 290:294].any()  # shadow removed

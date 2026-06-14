@@ -11,7 +11,9 @@ def _page(idx, content, dpi=600, nombre=None):
     )
 
 
-def test_uniform_size_within_parity_and_no_clip():
+def test_uniform_size_whole_document_and_no_clip():
+    # left (even) and right (odd) pages must end up the SAME size -- an ADF book
+    # has one uniform page size, not different sizes per parity.
     pages = [
         _page(0, Box(100, 120, 480, 700)),   # even
         _page(1, Box(140, 110, 520, 690)),   # odd
@@ -20,14 +22,11 @@ def test_uniform_size_within_parity_and_no_clip():
     ]
     normalize_margins(pages, output_margin_mm=5.0)
 
-    evens = [pages[0], pages[2]]
-    odds = [pages[1], pages[3]]
-    for group in (evens, odds):
-        w0 = group[0].margin.crop.width
-        h0 = group[0].margin.crop.height
-        for p in group:
-            assert abs(p.margin.crop.width - w0) < 1e-6
-            assert abs(p.margin.crop.height - h0) < 1e-6
+    w0 = pages[0].margin.crop.width
+    h0 = pages[0].margin.crop.height
+    for p in pages:                          # every page identical size
+        assert abs(p.margin.crop.width - w0) < 1e-6
+        assert abs(p.margin.crop.height - h0) < 1e-6
 
     # no page's content is clipped by its crop
     for p in pages:
