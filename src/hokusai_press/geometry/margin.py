@@ -129,9 +129,14 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     known, so mixed-dpi sources still yield equal pages) plus the output margin.
     The max guarantees no page's body is ever clipped.
 
-    Positioning keeps recto/verso parity: the head (top) margin is constant and,
-    when a nombre was found, its vertical center is driven to that parity's
-    common position; pages without a nombre fall back to horizontal centering.
+    Positioning fuses two strategies under a hard ">= output margin on all four
+    sides" guarantee (the crop never touches the content):
+    - when a page's nombre is CONFIDENT (a page number was assigned by the OCR
+      sequence resolver), its vertical position is nombre-anchored to that
+      parity's common offset so the body sits consistently across the book;
+    - otherwise (low-confidence / no OCR), it falls back to the deterministic
+      placement: horizontally centered with a constant head (top) margin.
+    Either way the offset is clamped so every side keeps >= the output margin.
     """
     have = [p for p in pages if p.margin and p.margin.content]
     if not have:
@@ -141,22 +146,21 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     def extent(p, px):  # content size in inches (if dpi) else pixels
         return px / p.dpi if use_dpi else px
 
+    def confident(p):   # the OCR resolver only assigns a number it trusts
+        return p.page_number is not None and p.margin.nombre_box is not None
+
     # ONE size for the whole document (uniform judgment size)
     max_w = max(extent(p, p.margin.content.width) for p in have)
     max_h = max(extent(p, p.margin.content.height) for p in have)
 
-    # common nombre vertical position per parity (recto/verso), if any
+    # common nombre vertical offset per parity, from CONFIDENT pages only
     common_noff: dict[int, float] = {}
     by_parity: dict[int, list] = {0: [], 1: []}
     for p in have:
         by_parity[p.source.page_index % 2].append(p)
     for parity, group in by_parity.items():
-        offs = []
-        for p in group:
-            if p.margin.nombre_box:
-                m_px = output_margin_mm / 25.4 * (p.dpi if use_dpi else 96)
-                top = p.margin.content.y0 - m_px
-                offs.append(extent(p, p.margin.nombre_box.y0 - top))
+        offs = [extent(p, p.margin.nombre_box.y0 - p.margin.content.y0)
+                for p in group if confident(p)]
         if offs:
             common_noff[parity] = float(np.median(offs))
 
@@ -166,19 +170,17 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
         crop_w = (max_w + 2 * (output_margin_mm / 25.4)) * (dpi if use_dpi else 1)
         crop_h = (max_h + 2 * (output_margin_mm / 25.4)) * (dpi if use_dpi else 1)
         c = p.margin.content
-        x0 = c.x0 + c.width / 2 - crop_w / 2          # horizontal: center
+        x0 = c.x0 + c.width / 2 - crop_w / 2          # horizontal: centered
         noff = common_noff.get(p.source.page_index % 2)
-        if noff is not None and p.margin.nombre_box:
-            y0 = p.margin.nombre_box.y0 - noff * (dpi if use_dpi else 1)
+        if confident(p) and noff is not None:
+            # place the body so this page's nombre sits at the common offset
+            y0 = p.margin.nombre_box.y0 - noff * (dpi if use_dpi else 1) - margin_px
         else:
-            y0 = c.y0 - margin_px
-        # HARD no-clip guarantee: the crop must fully contain the content box.
-        # The uniform crop is always >= this page's content, so clamping the
-        # offset into [c.x1-crop_w, c.x0] can never fail. This protects against
-        # a bad nombre anchor shifting the crop off the content (which otherwise
-        # cut pages down to a sliver).
-        x0 = max(min(x0, c.x0), c.x1 - crop_w)
-        y0 = max(min(y0, c.y0), c.y1 - crop_h)
+            y0 = c.y0 - margin_px                      # fallback: constant head
+        # clamp so EVERY side keeps >= the output margin (never touches content);
+        # always feasible since the uniform crop >= content + 2*margin
+        x0 = max(min(x0, c.x0 - margin_px), c.x1 + margin_px - crop_w)
+        y0 = max(min(y0, c.y0 - margin_px), c.y1 + margin_px - crop_h)
         p.margin.crop = Box(x0, y0, x0 + crop_w, y0 + crop_h)
 
 

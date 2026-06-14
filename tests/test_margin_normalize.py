@@ -49,17 +49,55 @@ def test_bad_nombre_does_not_clip_content():
         assert crop.y0 <= c.y0 + 1e-6 and crop.y1 >= c.y1 - 1e-6
 
 
-def test_nombre_anchors_vertical_position():
-    # two pages, same content height, nombre at different absolute y; after
-    # normalization the nombre should sit at the same offset from the crop top
+def test_confident_nombre_anchored_else_fallback_all_keep_margin():
+    margin_px = 5.0 / 25.4 * 600
+
+    def conf(idx, content, nombre):
+        p = _page(idx, content, dpi=600, nombre=nombre)
+        p.page_number = 10 + idx           # mark as confidently numbered
+        return p
+
+    # two confident recto pages: nombre sits the same distance below content top
     pages = [
-        _page(0, Box(100, 200, 480, 800), nombre=Box(280, 860, 300, 880)),
-        _page(2, Box(100, 240, 480, 840), nombre=Box(280, 900, 300, 920)),
+        conf(0, Box(200, 300, 600, 900), Box(380, 930, 420, 960)),
+        conf(2, Box(200, 350, 600, 950), Box(380, 980, 420, 1010)),
+        _page(4, Box(150, 200, 650, 1150)),   # tallest, low-confidence (no number)
     ]
     normalize_margins(pages, output_margin_mm=5.0)
-    off0 = pages[0].margin.nombre_box.y0 - pages[0].margin.crop.y0
-    off1 = pages[1].margin.nombre_box.y0 - pages[1].margin.crop.y0
-    assert abs(off0 - off1) < 1e-6
+
+    for p in pages:                           # >= margin on every side, always
+        crop, c = p.margin.crop, p.margin.content
+        assert c.x0 - crop.x0 >= margin_px - 1e-6
+        assert crop.x1 - c.x1 >= margin_px - 1e-6
+        assert c.y0 - crop.y0 >= margin_px - 1e-6
+        assert crop.y1 - c.y1 >= margin_px - 1e-6
+
+    # confident pages: the nombre lands at a consistent offset from the crop top
+    o0 = pages[0].margin.nombre_box.y0 - pages[0].margin.crop.y0
+    o1 = pages[1].margin.nombre_box.y0 - pages[1].margin.crop.y0
+    assert abs(o0 - o1) < 1.0
+
+
+def test_margin_at_least_output_margin_on_all_sides():
+    # the crop must sit >= output margin outside the content on every side
+    # (never touching it) -- deterministic centered + head-margin placement.
+    dpi = 600
+    margin_px = 5.0 / 25.4 * dpi
+    pages = [
+        _page(0, Box(200, 200, 600, 1000), dpi=dpi),
+        _page(1, Box(180, 220, 560, 980), dpi=dpi),   # smaller content
+    ]
+    normalize_margins(pages, output_margin_mm=5.0)
+    for p in pages:
+        crop, c = p.margin.crop, p.margin.content
+        assert c.x0 - crop.x0 >= margin_px - 1e-6      # left
+        assert crop.x1 - c.x1 >= margin_px - 1e-6      # right
+        assert c.y0 - crop.y0 >= margin_px - 1e-6      # top (head)
+        assert crop.y1 - c.y1 >= margin_px - 1e-6      # bottom
+    # constant head margin across pages
+    head0 = pages[0].margin.content.y0 - pages[0].margin.crop.y0
+    head1 = pages[1].margin.content.y0 - pages[1].margin.crop.y0
+    assert abs(head0 - head1) < 1e-6
 
 
 def test_mixed_dpi_yields_equal_physical_size():

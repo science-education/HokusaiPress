@@ -113,35 +113,38 @@ def render_page_image(
     return out, lines, mode, photo_boxes
 
 
-SHADOW_EDGE_FRAC = 0.15   # only the outer 15% of each side is checked for shadow
-SHADOW_LINE_FRAC = 0.6    # an edge row/col >60% ink over its length = a shadow
+SHADOW_EDGE_FRAC = 0.15   # a shadow lives within the outer 15% of a side
+SHADOW_SIDE_FRAC = 0.5    # ... and runs >= half that side's length
+SHADOW_THIN_FRAC = 0.15   # ... while staying thin (not a big figure)
 
 
 def remove_edge_shadows(bgr: np.ndarray) -> np.ndarray:
     """Whiten the dark binding/ADF shadow bands along the page edges.
 
-    Implements the reviewed rule (edge black band, at least half the side long,
-    don't cut content): within the outer 15% of each side, any column/row that is
-    mostly ink (>60%) over its length is a shadow bar -> set it white. The shadow
-    sits a few pixels INSIDE the edge (so a touch-the-border test misses it),
-    hence the band scan. Darkness is measured with an adaptive Otsu threshold so
-    soft/gray shadows are caught too; a real text column is never >60% ink
-    (characters leave gaps), so content is preserved.
+    Connected-component rule (deterministic, no ML): a single dark component that
+    lives in the outer 15% of a side, runs for >= half that side, and stays thin
+    is a scan shadow -> whiten its pixels. Component-based (not whole-column) so a
+    slanted/curved shadow is removed in full instead of leaving a triangular
+    remnant. A vertical text line is NOT one long component (characters are
+    separate, short blobs), so content is never cut into. Otsu makes it catch
+    soft gray shadows too.
     """
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
     h, w = gray.shape
     _, binv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    dark = binv > 0
-    col = dark.mean(axis=0)
-    row = dark.mean(axis=1)
-    ew, eh = int(w * SHADOW_EDGE_FRAC), int(h * SHADOW_EDGE_FRAC)
+    n, lbl, stats, _ = cv2.connectedComponentsWithStats(binv, connectivity=8)
+    ew, eh = w * SHADOW_EDGE_FRAC, h * SHADOW_EDGE_FRAC
     out = bgr.copy()
-    for x in list(range(ew)) + list(range(w - ew, w)):
-        if col[x] > SHADOW_LINE_FRAC:
-            out[:, x] = 255
-    for y in list(range(eh)) + list(range(h - eh, h)):
-        if row[y] > SHADOW_LINE_FRAC:
-            out[y, :] = 255
+    for i in range(1, n):
+        x, y, cw, ch, _ = stats[i]
+        # vertical shadow: tall, thin, hugging the left or right edge band
+        v = (ch >= SHADOW_SIDE_FRAC * h and cw <= SHADOW_THIN_FRAC * w
+             and (x <= ew or x + cw >= w - ew))
+        # horizontal shadow: wide, short, hugging the top or bottom edge band
+        hsh = (cw >= SHADOW_SIDE_FRAC * w and ch <= SHADOW_THIN_FRAC * h
+               and (y <= eh or y + ch >= h - eh))
+        if v or hsh:
+            out[lbl == i] = 255
     return out
 
 
