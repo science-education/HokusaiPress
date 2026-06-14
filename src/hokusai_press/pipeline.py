@@ -50,6 +50,7 @@ def analyze_document(
     learned_model: Optional[dict] = None,
     layout_provider=None,
     openvino_cache_dir: Optional[str] = None,
+    pages: "set[int] | None" = None,
 ) -> AnalyzeResult:
     from .source import load_page
 
@@ -58,7 +59,7 @@ def analyze_document(
     margins = []
     prof: dict = defaultdict(float)
 
-    page_iter = load_page(path)
+    page_iter = load_page(path, pages)
     while True:
         t = perf_counter()
         try:
@@ -164,6 +165,7 @@ def run(
     use_ocr: bool = True,
     learned_model_path: Optional[str] = None,
     openvino_cache_dir: Optional[str] = None,
+    pages: "set[int] | None" = None,
 ) -> dict:
     """Full batch run: analyze, persist params, render the PDF."""
     from . import learn
@@ -172,13 +174,15 @@ def run(
     learned = learn.load(learned_model_path) if learned_model_path else None
     result = analyze_document(path, model_dir=model_dir, device=device,
                               use_ocr=use_ocr, learned_model=learned,
-                              openvino_cache_dir=openvino_cache_dir)
+                              openvino_cache_dir=openvino_cache_dir, pages=pages)
     doc_id = os.path.basename(path)
     t = perf_counter()
     store = Store(db_path)
     try:
-        for i, params in enumerate(result.document.pages):
-            store.upsert_page(doc_id, i, params)
+        # key by the TRUE pdf page index (not enumeration) so a --pages subset
+        # keeps real page numbers in the queue / UI / rebuild
+        for params in result.document.pages:
+            store.upsert_page(doc_id, params.source.page_index, params)
     finally:
         store.close()
     result.profile["db"] = perf_counter() - t

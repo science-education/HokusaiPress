@@ -59,10 +59,20 @@ def _downscale_for_ocr(img: np.ndarray, src_dpi: float | None) -> tuple[np.ndarr
     return ocr, scale
 
 
-def load_page(path: str) -> Iterator[tuple[SourceRef, np.ndarray, np.ndarray, float | None]]:
-    """Yield (SourceRef, original_bgr, ocr_bgr, dpi) for each page."""
+def load_page(
+    path: str, pages: "set[int] | None" = None
+) -> Iterator[tuple[SourceRef, np.ndarray, np.ndarray, float | None]]:
+    """Yield (SourceRef, original_bgr, ocr_bgr, dpi) for each page.
+
+    If `pages` is given (a set of 0-based page indices), only those pages are
+    rasterized and yielded -- so debugging a few pages is fast. The yielded
+    SourceRef.page_index keeps the TRUE pdf index, so re-extraction and the
+    review UI still line up.
+    """
     ext = os.path.splitext(path)[1].lower()
     if ext != ".pdf":
+        if pages is not None and 0 not in pages:
+            return
         img = _imread_unicode(path)
         ocr, scale = _downscale_for_ocr(img, None)
         yield SourceRef(path=path, ocr_scale=scale), img, ocr, None
@@ -75,6 +85,8 @@ def load_page(path: str) -> Iterator[tuple[SourceRef, np.ndarray, np.ndarray, fl
         n = len(doc)
     try:
         for i in range(n):
+            if pages is not None and i not in pages:
+                continue
             # extract under the lock; downscale (pure numpy) outside it
             with _PDFIUM_LOCK:
                 original, dpi, img_id = _extract_original(doc[i], doc, i)

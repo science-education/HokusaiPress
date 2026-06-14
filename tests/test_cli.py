@@ -1,6 +1,20 @@
 import os
 
-from hokusai_press.cli import _expand_sources, _is_folder_out, _resolve_out
+from hokusai_press.cli import (
+    _expand_sources,
+    _is_folder_out,
+    _parse_pages,
+    _resolve_out,
+)
+
+
+def test_parse_pages():
+    assert _parse_pages(None) is None
+    assert _parse_pages("") is None
+    assert _parse_pages("9") == {9}
+    assert _parse_pages("52,236-237") == {52, 236, 237}
+    assert _parse_pages("0-4") == {0, 1, 2, 3, 4}
+    assert _parse_pages(" 3 , 5 ") == {3, 5}
 
 
 def test_out_file_path_is_used_verbatim(tmp_path):

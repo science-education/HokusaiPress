@@ -50,6 +50,24 @@ def _expand_sources(paths: list[str]) -> list[str]:
     return uniq
 
 
+def _parse_pages(spec: "str | None") -> "set[int] | None":
+    """Parse a 0-based page selection like '9', '52,236-237', '0-4' to a set.
+    Returns None for the whole document."""
+    if not spec:
+        return None
+    out: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            out.update(range(int(a), int(b) + 1))
+        else:
+            out.add(int(part))
+    return out or None
+
+
 def _run_one(payload: dict) -> dict:
     """Process a single source to its own db (picklable; used by workers and the
     serial path). Returns the run summary plus timing and the db it wrote."""
@@ -60,7 +78,7 @@ def _run_one(payload: dict) -> dict:
         payload["src"], payload["out"], db_path=payload["db"],
         model_dir=payload["model_dir"], device=payload["device"],
         use_ocr=payload["use_ocr"], learned_model_path=payload["learned_model"],
-        openvino_cache_dir=payload["cache"],
+        openvino_cache_dir=payload["cache"], pages=payload["pages"],
     )
     summary["tpb"] = time.perf_counter() - t0
     return summary
@@ -138,6 +156,9 @@ def main(argv=None) -> int:
     p_run.add_argument("--workers", type=int, default=1,
                        help="process this many files in parallel (overlaps one "
                             "file's CPU work with another's NPU OCR; ~2 is best)")
+    p_run.add_argument("--pages", default=None,
+                       help="process only these 0-based pages, e.g. '9,52,236-237'"
+                            " (fast for debugging)")
 
     p_queue = sub.add_parser("queue", help="list pages awaiting review")
     p_queue.add_argument("--db", default="hokusai.db")
@@ -172,12 +193,14 @@ def main(argv=None) -> int:
             print("error: --out must be a folder when processing multiple inputs")
             return 1
 
+        pages_sel = _parse_pages(args.pages)
+
         def _payload(src, db):
             return {
                 "src": src, "out": _resolve_out(args.out, src), "db": db,
                 "model_dir": args.model_dir, "device": args.device,
                 "use_ocr": not args.no_ocr, "learned_model": args.learned_model,
-                "cache": args.openvino_cache_dir,
+                "cache": args.openvino_cache_dir, "pages": pages_sel,
             }
 
         flagged_docs = 0
