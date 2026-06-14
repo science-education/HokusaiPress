@@ -35,7 +35,10 @@ from .model import Box, Flag, Region, RegionKind, SourceRef
 PHOTO_AREA_FRAC = 0.01      # dense residual blob larger than this = photo
 PHOTO_FILL = 0.2           # connected-component fill ratio separating photo from line art
 TEXT_DILATE_PX = 6
-LOW_COVERAGE_FRAC = 0.5    # text covers < 50% of ink -> flag for review
+LOW_COVERAGE_FRAC = 0.3    # text+figure covers < 30% of ink -> flag for review.
+# Calibrated on real books: detected-line polygons cover only ~40% of text ink
+# even on clean dense pages (boxes are tight), so 0.5 flagged the median page.
+# At 0.3 only genuine outliers (OCR truly missed most text) reach the queue.
 
 _ocr_engine = None
 
@@ -139,12 +142,10 @@ def analyze(
     residual = ink.copy()
     for (x0, y0, x1, y1) in layout_boxes_px:  # don't double-count layout figures
         residual[max(0, y0):y1, max(0, x0):x1] = 0
+    has_text = text_mask is not None and bool(regions)
     if text_mask is not None:
         dil = cv2.dilate(text_mask, np.ones((TEXT_DILATE_PX * 2 + 1,) * 2, np.uint8))
         residual[dil > 0] = 0
-        covered = total_ink - int(residual.sum())
-        if total_ink > 0 and covered / total_ink < LOW_COVERAGE_FRAC and regions:
-            flags.append(Flag.OCR_LOW_COVERAGE)
 
     h, w = ink.shape
     n, _, stats, _ = cv2.connectedComponentsWithStats(residual, connectivity=8)
@@ -163,6 +164,15 @@ def analyze(
                     source="residual",
                 )
             )
+            residual[y:y + ch, x:x + cw] = 0   # this ink is a figure, not lost text
+
+    # low-coverage flag AFTER figure/photo removal: only ink that is neither text
+    # nor figure/photo counts as "missing text". An illustration-heavy page (lots
+    # of figure ink) no longer false-flags -- it's not lost OCR.
+    if has_text and total_ink > 0:
+        covered = total_ink - int(residual.sum())
+        if covered / total_ink < LOW_COVERAGE_FRAC:
+            flags.append(Flag.OCR_LOW_COVERAGE)
     return regions, flags
 
 
