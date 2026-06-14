@@ -163,6 +163,8 @@ def resolve(pages: list[PageParams], page_heights: list[float]) -> list[str]:
                 choice, best_sup = (kind, v, r), votes[key]
         if choice is None:
             p.page_number, p.nombre_text = None, None
+            if p.margin:           # drop the unreliable geometric box (often in
+                p.margin.nombre_box = None   # the wrong band) for unread pages
             continue
         kind, v, r = choice
         p.page_number, p.nombre_text = v, r.ocr_text

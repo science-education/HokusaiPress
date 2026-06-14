@@ -118,6 +118,17 @@ def test_resolve_warns_on_real_missing_pages():
     assert any(Flag.PAGE_NUMBER_GAP in p.flags for p in pages) or warnings
 
 
+def test_resolve_clears_stale_nombre_on_unread_pages():
+    # body run 1..10, but one page's number is unread; its (wrong) geometric
+    # nombre box must be cleared, not left pointing at a stray spot.
+    pages = [_page(i, text=str(i + 1)) for i in range(10)]
+    pages[4].regions = [r for r in pages[4].regions if r.ocr_text != "5"]  # unread
+    pages[4].margin.nombre_box = Box(900, 50, 950, 80)   # stale geometric guess
+    nombre.resolve(pages, [1000] * 10)
+    assert pages[4].page_number is None
+    assert pages[4].margin.nombre_box is None            # stale box cleared
+
+
 def test_resolve_no_numbers_leaves_pages_untouched():
     pages = [_page(i, text=None) for i in range(4)]
     assert nombre.resolve(pages, [1000] * 4) == []
