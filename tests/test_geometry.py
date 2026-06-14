@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 
 from hokusai_press.geometry.deskew import GOOD_CONFIDENCE, find_skew, is_confident
-from hokusai_press.geometry.margin import find_content_box, strip_edge_shadows
+from hokusai_press.geometry.margin import find_content_box, remove_edge_shadows
 from hokusai_press.model import Deskew
 
 
@@ -81,11 +81,12 @@ def test_content_box_excludes_inset_binding_shadow():
     assert mg.content.width < 600 * 0.85  # not full-bleed
 
 
-def test_strip_edge_shadows_keeps_text_columns():
-    # a dense (but <50%) text column near the edge must survive
-    binary = np.zeros((400, 300), dtype=np.uint8)
-    binary[::3, 20:40] = 255          # ~33% ink text-like column in edge band
-    binary[:, 290:294] = 255          # ~100% ink shadow bar in edge band
-    out = strip_edge_shadows(binary)
-    assert out[::3, 20:40].any()      # text kept
-    assert not out[:, 290:294].any()  # shadow removed
+def test_remove_edge_shadows_keeps_text_dots():
+    # sparse text near the edge = many small components (kept); a solid bar = one
+    # tall component (whitened). Gray image: 0 = ink, 255 = background.
+    img = np.full((400, 300), 255, dtype=np.uint8)
+    img[::3, 20:40] = 0           # sparse text dots near the left edge
+    img[:, 290:294] = 0           # solid shadow bar at the right edge
+    out = remove_edge_shadows(img)
+    assert (out[::3, 20:40] == 0).any()     # text kept
+    assert (out[:, 290:294] == 255).all()   # shadow removed

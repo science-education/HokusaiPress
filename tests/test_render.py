@@ -11,9 +11,9 @@ from hokusai_press.model import (
     RenderSettings,
     SourceRef,
 )
+from hokusai_press.geometry.margin import remove_edge_shadows
 from hokusai_press.render import (
     compose_transform,
-    remove_edge_shadows,
     render_output_preview,
     render_page_image,
     _map_box,

@@ -72,9 +72,14 @@ def analyze(
     layout_provider=None,
     openvino_cache_dir=None,
 ) -> tuple[list[Region], list[Flag]]:
+    from .geometry.margin import remove_edge_shadows
+
     regions: list[Region] = []
     flags: list[Flag] = []
     inv_scale = 1.0 / max(source.ocr_scale, 1e-6)
+    # drop binding/ADF shadows up front so OCR can't read a bar as a text line
+    # and the residual-photo pass can't mistake one for a figure
+    ocr_bgr = remove_edge_shadows(ocr_bgr)
 
     text_mask = None
     engine = None

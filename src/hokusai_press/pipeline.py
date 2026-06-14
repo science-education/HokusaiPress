@@ -82,9 +82,20 @@ def analyze_document(
         )
         prof["ocr"] += perf_counter() - t
 
-        # 4. margin / nombre on the deskewed original
+        # 4. margin / nombre on the deskewed original; expand the content box to
+        # include detected regions so a figure/photo is never cropped out (the
+        # ink box alone can be smaller than a photo). Shadows are not regions and
+        # were already dropped from the ink box, so they stay excluded.
         t = perf_counter()
         mg = margin_mod.find_content_box(original, sk)
+        if regions and mg.content:
+            from .model import Box
+            c = mg.content
+            xs0 = [c.x0] + [r.box.x0 for r in regions]
+            ys0 = [c.y0] + [r.box.y0 for r in regions]
+            xs1 = [c.x1] + [r.box.x1 for r in regions]
+            ys1 = [c.y1] + [r.box.y1 for r in regions]
+            mg.content = Box(min(xs0), min(ys0), max(xs1), max(ys1))
         prof["margin"] += perf_counter() - t
 
         params = PageParams(

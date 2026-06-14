@@ -85,10 +85,15 @@ def render_page_image(
     (auto gray/color), "gray", or "color" — the per-region override that lets a
     grayscale picture live inside an otherwise bilevel page.
     """
+    from .geometry.margin import remove_edge_shadows
+
+    # whiten binding/ADF edge shadows on the FULL original first (robust, the
+    # validated location) -- then warp the clean image, so no shadow survives
+    # into the output and a wrong crop can't reintroduce one.
+    clean = remove_edge_shadows(original_bgr)
     M, out_size, _ = compose_transform(original_bgr.shape, params, settings)
-    out = cv2.warpAffine(original_bgr, M, out_size, flags=cv2.INTER_AREA,
+    out = cv2.warpAffine(clean, M, out_size, flags=cv2.INTER_AREA,
                          borderValue=(255, 255, 255))
-    out = remove_edge_shadows(out)          # whiten binding/ADF edge shadows
 
     lines = []
     photo_boxes: list[tuple] = []
@@ -111,41 +116,6 @@ def render_page_image(
         # AUTO / BW / MRC -> bilevel base, photo regions become overlays
         mode = "bw"
     return out, lines, mode, photo_boxes
-
-
-SHADOW_EDGE_FRAC = 0.15   # a shadow lives within the outer 15% of a side
-SHADOW_SIDE_FRAC = 0.5    # ... and runs >= half that side's length
-SHADOW_THIN_FRAC = 0.15   # ... while staying thin (not a big figure)
-
-
-def remove_edge_shadows(bgr: np.ndarray) -> np.ndarray:
-    """Whiten the dark binding/ADF shadow bands along the page edges.
-
-    Connected-component rule (deterministic, no ML): a single dark component that
-    lives in the outer 15% of a side, runs for >= half that side, and stays thin
-    is a scan shadow -> whiten its pixels. Component-based (not whole-column) so a
-    slanted/curved shadow is removed in full instead of leaving a triangular
-    remnant. A vertical text line is NOT one long component (characters are
-    separate, short blobs), so content is never cut into. Otsu makes it catch
-    soft gray shadows too.
-    """
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
-    h, w = gray.shape
-    _, binv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    n, lbl, stats, _ = cv2.connectedComponentsWithStats(binv, connectivity=8)
-    ew, eh = w * SHADOW_EDGE_FRAC, h * SHADOW_EDGE_FRAC
-    out = bgr.copy()
-    for i in range(1, n):
-        x, y, cw, ch, _ = stats[i]
-        # vertical shadow: tall, thin, hugging the left or right edge band
-        v = (ch >= SHADOW_SIDE_FRAC * h and cw <= SHADOW_THIN_FRAC * w
-             and (x <= ew or x + cw >= w - ew))
-        # horizontal shadow: wide, short, hugging the top or bottom edge band
-        hsh = (cw >= SHADOW_SIDE_FRAC * w and ch <= SHADOW_THIN_FRAC * h
-               and (y <= eh or y + ch >= h - eh))
-        if v or hsh:
-            out[lbl == i] = 255
-    return out
 
 
 def _binarize_for_preview(bgr: np.ndarray) -> np.ndarray:

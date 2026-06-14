@@ -32,42 +32,52 @@ NOMBRE_MAX_HEIGHT_FRAC = 0.04
 MARGIN_CONSISTENCY_TOL = 0.04  # neighbor content boxes within 4% of page size
 
 
-EDGE_BAND_FRAC = 0.12        # outer 12% of each side is where scan shadows live
-SHADOW_LINE_FRAC = 0.5       # an edge row/col >50% ink is a binding/ADF shadow
+SHADOW_EDGE_FRAC = 0.15      # a shadow lives within the outer 15% of a side
+SHADOW_SIDE_FRAC = 0.5       # ... and runs >= half that side's length
+SHADOW_THIN_FRAC = 0.15      # ... while staying thin (not a big figure)
 
 
-def strip_edge_shadows(binary: np.ndarray) -> np.ndarray:
-    """Zero out near-edge rows/columns that are mostly ink.
+def remove_edge_shadows(img: np.ndarray) -> np.ndarray:
+    """Whiten dark binding/ADF shadow bands along the page edges (gray or BGR).
 
-    Book-binding / ADF scans leave a dark bar or band a few pixels inside an
-    edge (not touching it, so the border-touching filter misses it). Such a bar
-    is ~solid ink spanning the page, which otherwise blows the content box out to
-    full-bleed and skews the deskew projection. A genuine text column is never
-    >50% ink, so this only removes shadows.
+    Connected-component rule (deterministic, no ML): a single dark component that
+    lives in the outer 15% of a side, runs for >= half that side, and stays thin
+    is a scan shadow -> set its pixels white. Component-based (not whole-column)
+    so a slanted/curved shadow is removed in full, not left as a triangular
+    remnant. A real text line is many short components, never one long bar, so
+    content is preserved. Otsu makes it catch soft gray shadows too.
+
+    Used once on the original before everything (content detection, deskew,
+    render) so a shadow can neither be mistaken for content nor survive into the
+    output.
     """
-    out = binary.copy()
-    h, w = out.shape
-    col = (out > 0).mean(axis=0)
-    row = (out > 0).mean(axis=1)
-    ew, eh = int(w * EDGE_BAND_FRAC), int(h * EDGE_BAND_FRAC)
-    for x in list(range(ew)) + list(range(w - ew, w)):
-        if col[x] > SHADOW_LINE_FRAC:
-            out[:, x] = 0
-    for y in list(range(eh)) + list(range(h - eh, h)):
-        if row[y] > SHADOW_LINE_FRAC:
-            out[y, :] = 0
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    h, w = gray.shape
+    _, binv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    n, lbl, stats, _ = cv2.connectedComponentsWithStats(binv, connectivity=8)
+    ew, eh = w * SHADOW_EDGE_FRAC, h * SHADOW_EDGE_FRAC
+    out = img.copy()
+    for i in range(1, n):
+        x, y, cw, ch, _ = stats[i]
+        v = (ch >= SHADOW_SIDE_FRAC * h and cw <= SHADOW_THIN_FRAC * w
+             and (x <= ew or x + cw >= w - ew))
+        hsh = (cw >= SHADOW_SIDE_FRAC * w and ch <= SHADOW_THIN_FRAC * h
+               and (y <= eh or y + ch >= h - eh))
+        if v or hsh:
+            out[lbl == i] = 255
     return out
 
 
 def _deskewed_binary(img_bgr: np.ndarray, deskew: Deskew) -> np.ndarray:
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) if img_bgr.ndim == 3 else img_bgr
+    gray = remove_edge_shadows(gray)         # drop shadows before measuring content
     if abs(deskew.angle_deg) > 1e-3:
         h, w = gray.shape
         m = cv2.getRotationMatrix2D((w / 2, h / 2), deskew.angle_deg, 1.0)
         gray = cv2.warpAffine(gray, m, (w, h), flags=cv2.INTER_LINEAR,
                               borderValue=255)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    return strip_edge_shadows(binary)
+    return binary
 
 
 def find_content_box(img_bgr: np.ndarray, deskew: Deskew) -> Margin:
