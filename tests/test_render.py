@@ -20,6 +20,23 @@ from hokusai_press.render import (
 )
 
 
+def test_margin_fill_whitens_outside_content_keeps_content():
+    # a uniform-size crop is larger than this page's content, pulling in an edge
+    # line that sits OUTSIDE the content box. margin fill must whiten it while
+    # keeping the content.
+    settings = RenderSettings(target_dpi=600, output_margin_mm=0.0)
+    img = np.full((800, 600, 3), 255, dtype=np.uint8)
+    img[200:550, 220:380] = 0      # body content (inside content box)
+    img[200:550, 130:140] = 0      # dark edge line, left of content
+    params = _params(Box(200, 150, 400, 560), dpi=600)
+    params.margin.crop = Box(100, 100, 500, 650)   # crop wider than content
+    out, _, _, _ = render_page_image(img, params, settings)
+    # crop x0=100, scale 1 -> output x = source_x - 100. content body at out
+    # x120-280; the edge line at out x30-40 is in the left margin -> whitened.
+    assert (out == 0).any()                    # content kept
+    assert (out[:, 0:110] == 0).sum() == 0     # left margin (edge line) whitened
+
+
 def test_remove_edge_shadows_whitens_band_keeps_content():
     img = np.full((400, 300, 3), 255, dtype=np.uint8)
     img[:, 294:300] = 0          # full-height dark bar at the right edge = shadow

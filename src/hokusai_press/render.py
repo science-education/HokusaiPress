@@ -95,6 +95,24 @@ def render_page_image(
     out = cv2.warpAffine(clean, M, out_size, flags=cv2.INTER_AREA,
                          borderValue=(255, 255, 255))
 
+    # Fill the margin (everything outside the content box) with white. The
+    # content box already excludes edge lines/shadows, so this deterministically
+    # removes any hard border the uniform-size crop pulled in (ADF scans: white
+    # paper, a thin dark edge line outside the content). Text/figures/photos are
+    # inside the content box, so nothing real is touched. ScanTailor's "fill
+    # margins", and the right tool for uniform-illumination ADF scans.
+    if params.margin and params.margin.content:
+        ow, oh = out_size
+        b = _map_box(params.margin.content, M)
+        x0 = max(0, min(ow, int(round(b.x0))))
+        y0 = max(0, min(oh, int(round(b.y0))))
+        x1 = max(0, min(ow, int(round(b.x1))))
+        y1 = max(0, min(oh, int(round(b.y1))))
+        out[:y0, :] = 255
+        out[y1:, :] = 255
+        out[:, :x0] = 255
+        out[:, x1:] = 255
+
     lines = []
     photo_boxes: list[tuple] = []
     for r in params.regions:
