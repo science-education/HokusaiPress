@@ -193,6 +193,19 @@ def test_overlays_are_grouped_for_mode_scoped_hover(tmp_path):
     assert "el.style.pointerEvents" in html
 
 
+def test_region_list_shows_classes_and_delete_buttons(tmp_path):
+    db = _seed(tmp_path)
+    client = TestClient(create_app(db))
+    client.post("/api/page/scan.png/0/region",
+                json={"kind": "text", "x0": 0, "y0": 0, "x1": 30, "y1": 30})
+    client.post("/api/page/scan.png/0/region",
+                json={"kind": "photo", "x0": 40, "y0": 40, "x1": 90, "y1": 90})
+    html = client.get("/page/scan.png/0").text
+    assert "検出領域" in html and "text:1" in html and "photo:1" in html
+    assert "delRegion(0)" in html and "delRegion(1)" in html   # per-row delete
+    assert "削除" in html
+
+
 def test_region_delete_out_of_range_404(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))

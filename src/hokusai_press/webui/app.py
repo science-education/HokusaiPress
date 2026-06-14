@@ -104,9 +104,15 @@ def create_app(db_path: str):
             f"<li>#{i} <b>{r.kind.value}</b>"
             + (f"/{r.tone}" if r.tone else "")
             + f" [{int(r.box.x0)},{int(r.box.y0)},{int(r.box.x1)},{int(r.box.y1)}]"
-            + f" <i>({r.source})</i></li>"
+            + f" <i>({r.source})</i>"
+            + f' <button onclick="delRegion({i})">削除</button></li>'
             for i, r in enumerate(row.params.regions)
         )
+        # counts by class (text / figure / photo / table ...) for an at-a-glance
+        # summary above the list
+        import collections as _c
+        _kc = _c.Counter(r.kind.value for r in row.params.regions)
+        kinds_html = " ".join(f"{k}:{v}" for k, v in sorted(_kc.items())) or "(none)"
         # clickable hit areas over each region (positioned in % so they track
         # the image at any display scale); double/right-click deletes. The solid
         # colored boxes themselves come from the analysis PNG underneath.
@@ -213,7 +219,9 @@ button{{padding:3px 8px}}
       {regions_overlay}
       <div id="rb" style="position:absolute;border:2px dashed #d00;background:rgba(221,0,0,.12);display:none;pointer-events:none"></div>
     </div>
-    <ul style="font-size:85%;max-height:130px;overflow:auto;max-width:520px">
+    <p style="font-size:85%;margin:4px 0"><b>検出領域</b>（クラス: {kinds_html}）
+      — 各行の「削除」で除去できます（text/figure/photo/table）</p>
+    <ul style="font-size:85%;max-height:160px;overflow:auto;max-width:520px">
       {regions_html or '<li>(none)</li>'}</ul>
   </div>
   <div><h3>output <span style="font-weight:normal;font-size:80%">(最終PDF相当)</span></h3>
