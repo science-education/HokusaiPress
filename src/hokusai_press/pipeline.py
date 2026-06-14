@@ -10,7 +10,9 @@ params, so a corrected page is just re-rendered.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Optional
 
 import numpy as np
@@ -33,6 +35,7 @@ class AnalyzeResult:
     document: Document
     originals: list[np.ndarray]
     warnings: list[str] = None  # type: ignore[assignment]
+    profile: dict = field(default_factory=dict)  # stage -> seconds
 
     def __post_init__(self):
         if self.warnings is None:
@@ -53,20 +56,36 @@ def analyze_document(
     doc = Document(source_path=path)
     originals: list[np.ndarray] = []
     margins = []
+    prof: dict = defaultdict(float)
 
-    for source, original, ocr_img, dpi in load_page(path):
-        # 1. deskew on the work raster (angle is scale-free)
+    page_iter = load_page(path)
+    while True:
+        t = perf_counter()
+        try:
+            source, original, ocr_img, dpi = next(page_iter)
+        except StopIteration:
+            break
+        prof["raster"] += perf_counter() - t
+
+        # 1-2. deskew on the work raster (angle is scale-free), then upright it
+        t = perf_counter()
         sk = deskew_mod.find_skew(ocr_img)
-        # 2. deskew the work raster so OCR/margin see upright text
         ocr_up = _apply_deskew(ocr_img, sk.angle_deg)
+        prof["deskew"] += perf_counter() - t
+
         # 3. content separation (text/figure/photo) + OCR text
+        t = perf_counter()
         regions, cflags = content_mod.analyze(
             original, ocr_up, source, model_dir=model_dir,
             device=device, use_ocr=use_ocr, layout_provider=layout_provider,
             openvino_cache_dir=openvino_cache_dir,
         )
+        prof["ocr"] += perf_counter() - t
+
         # 4. margin / nombre on the deskewed original
+        t = perf_counter()
         mg = margin_mod.find_content_box(original, sk)
+        prof["margin"] += perf_counter() - t
 
         params = PageParams(
             source=source, dpi=dpi, deskew=sk, margin=mg, regions=regions,
@@ -83,6 +102,7 @@ def analyze_document(
     # can be detected. Runs before align/normalize so the better nombre feeds them.
     from . import nombre as nombre_mod
 
+    t = perf_counter()
     heights = [o.shape[0] for o in originals]
     warnings = nombre_mod.resolve(doc.pages, heights)
 
@@ -91,6 +111,7 @@ def analyze_document(
         if flag is not None:
             params.flags.append(flag)
     margin_mod.normalize_margins(doc.pages, doc.render.output_margin_mm)
+    prof["nombre+normalize"] += perf_counter() - t
 
     # 6. learned page-kind override (from accumulated review decisions)
     if learned_model:
@@ -108,7 +129,8 @@ def analyze_document(
         params.review_status = (
             ReviewStatus.NEEDS_REVIEW if params.flags else ReviewStatus.AUTO
         )
-    return AnalyzeResult(document=doc, originals=originals, warnings=warnings)
+    return AnalyzeResult(document=doc, originals=originals, warnings=warnings,
+                         profile=dict(prof))
 
 
 def _apply_deskew(img: np.ndarray, angle: float) -> np.ndarray:
@@ -141,14 +163,18 @@ def run(
                               use_ocr=use_ocr, learned_model=learned,
                               openvino_cache_dir=openvino_cache_dir)
     doc_id = os.path.basename(path)
+    t = perf_counter()
     store = Store(db_path)
     try:
         for i, params in enumerate(result.document.pages):
             store.upsert_page(doc_id, i, params)
     finally:
         store.close()
+    result.profile["db"] = perf_counter() - t
 
+    t = perf_counter()
     build_pdf(result.document, result.originals, out_pdf)
+    result.profile["render+pdf"] = perf_counter() - t
     flagged = [i for i, p in enumerate(result.document.pages) if p.needs_review()]
     return {
         "doc_id": doc_id,
@@ -156,6 +182,7 @@ def run(
         "needs_review": flagged,
         "out_pdf": out_pdf,
         "warnings": result.warnings,
+        "profile": result.profile,
     }
 
 

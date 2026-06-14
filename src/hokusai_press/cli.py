@@ -72,6 +72,8 @@ def main(argv=None) -> int:
                        help="JSON page-kind model from `learn` to guide auto decisions")
     p_run.add_argument("--openvino-cache-dir", default=None,
                        help="OpenVINO compiled-model cache dir (speeds up NPU reuse)")
+    p_run.add_argument("--profile", action="store_true",
+                       help="print per-stage timing (raster/deskew/ocr/.../render)")
 
     p_queue = sub.add_parser("queue", help="list pages awaiting review")
     p_queue.add_argument("--db", default="hokusai.db")
@@ -129,6 +131,12 @@ def main(argv=None) -> int:
             print(line)
             for w in summary.get("warnings", []):
                 print(f"  [warn] {w}")
+            if args.profile:
+                prof = summary.get("profile", {})
+                total = sum(prof.values()) or 1.0
+                for stage, sec in sorted(prof.items(), key=lambda kv: -kv[1]):
+                    print(f"  [prof] {stage:<16} {sec:7.1f}s "
+                          f"{sec / pages:6.3f}s/page  {sec / total * 100:4.0f}%")
         if len(sources) > 1:
             print(f"[done] {len(sources)} files, {flagged_docs} need review")
         if flagged_docs:
