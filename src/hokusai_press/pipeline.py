@@ -29,6 +29,9 @@ from .model import (
 )
 from .store import Store
 
+MIN_CONTENT_AREA_FRAC = 0.12   # content smaller than this share of the page =
+#                                detection failed -> use the whole page + flag
+
 
 @dataclass
 class AnalyzeResult:
@@ -89,14 +92,23 @@ def analyze_document(
         # were already dropped from the ink box, so they stay excluded.
         t = perf_counter()
         mg = margin_mod.find_content_box(original, sk)
+        from .model import Box
         if regions and mg.content:
-            from .model import Box
             c = mg.content
             xs0 = [c.x0] + [r.box.x0 for r in regions]
             ys0 = [c.y0] + [r.box.y0 for r in regions]
             xs1 = [c.x1] + [r.box.x1 for r in regions]
             ys1 = [c.y1] + [r.box.y1 for r in regions]
             mg.content = Box(min(xs0), min(ys0), max(xs1), max(ys1))
+        # detection-failed safety: if the content covers too little of the page
+        # (near-blank page, or detection missed an undetected figure), a sliver
+        # crop would drop real content. Fall back to the whole (shadow-removed)
+        # page and flag it, so nothing is cut and a human can check.
+        ph, pw = original.shape[:2]
+        c = mg.content
+        if not c or c.width * c.height < MIN_CONTENT_AREA_FRAC * pw * ph:
+            mg.content = Box(0.0, 0.0, float(pw), float(ph))
+            mg.confidence = 0.0           # -> MARGIN_NOT_FOUND via align_margins
         prof["margin"] += perf_counter() - t
 
         params = PageParams(
