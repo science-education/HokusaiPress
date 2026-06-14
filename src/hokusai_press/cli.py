@@ -182,6 +182,14 @@ def main(argv=None) -> int:
 
         flagged_docs = 0
         parallel = args.workers > 1 and len(sources) > 1
+        if parallel and args.device in ("npu", "qnn"):
+            # a single NPU can't be opened reliably by concurrent processes -- a
+            # worker tends to crash on device init and hang the pool. Parallelism
+            # must use the CPU; NPU runs one file at a time.
+            print(f"[warn] --device {args.device} can't be shared across "
+                  f"processes; forcing --workers 1 (use --device cpu for "
+                  f"parallel throughput)")
+            parallel = False
         if parallel:
             # each file -> its own temp db (avoids cross-process sqlite locking),
             # merged into --db at the end. Workers overlap CPU work with NPU OCR.
