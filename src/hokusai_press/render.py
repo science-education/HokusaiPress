@@ -88,6 +88,7 @@ def render_page_image(
     M, out_size, _ = compose_transform(original_bgr.shape, params, settings)
     out = cv2.warpAffine(original_bgr, M, out_size, flags=cv2.INTER_AREA,
                          borderValue=(255, 255, 255))
+    out = remove_edge_shadows(out)          # whiten binding/ADF edge shadows
 
     lines = []
     photo_boxes: list[tuple] = []
@@ -110,6 +111,38 @@ def render_page_image(
         # AUTO / BW / MRC -> bilevel base, photo regions become overlays
         mode = "bw"
     return out, lines, mode, photo_boxes
+
+
+SHADOW_EDGE_FRAC = 0.15   # only the outer 15% of each side is checked for shadow
+SHADOW_LINE_FRAC = 0.6    # an edge row/col >60% ink over its length = a shadow
+
+
+def remove_edge_shadows(bgr: np.ndarray) -> np.ndarray:
+    """Whiten the dark binding/ADF shadow bands along the page edges.
+
+    Implements the reviewed rule (edge black band, at least half the side long,
+    don't cut content): within the outer 15% of each side, any column/row that is
+    mostly ink (>60%) over its length is a shadow bar -> set it white. The shadow
+    sits a few pixels INSIDE the edge (so a touch-the-border test misses it),
+    hence the band scan. Darkness is measured with an adaptive Otsu threshold so
+    soft/gray shadows are caught too; a real text column is never >60% ink
+    (characters leave gaps), so content is preserved.
+    """
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
+    h, w = gray.shape
+    _, binv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    dark = binv > 0
+    col = dark.mean(axis=0)
+    row = dark.mean(axis=1)
+    ew, eh = int(w * SHADOW_EDGE_FRAC), int(h * SHADOW_EDGE_FRAC)
+    out = bgr.copy()
+    for x in list(range(ew)) + list(range(w - ew, w)):
+        if col[x] > SHADOW_LINE_FRAC:
+            out[:, x] = 255
+    for y in list(range(eh)) + list(range(h - eh, h)):
+        if row[y] > SHADOW_LINE_FRAC:
+            out[y, :] = 255
+    return out
 
 
 def _binarize_for_preview(bgr: np.ndarray) -> np.ndarray:

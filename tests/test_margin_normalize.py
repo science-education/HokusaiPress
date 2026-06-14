@@ -35,6 +35,20 @@ def test_uniform_size_whole_document_and_no_clip():
         assert crop.y0 <= c.y0 + 1e-6 and crop.y1 >= c.y1 - 1e-6
 
 
+def test_bad_nombre_does_not_clip_content():
+    # a wildly wrong nombre (far below the content) must NOT shift the crop off
+    # the content -- the no-clip clamp keeps the whole body inside the crop.
+    pages = [
+        _page(0, Box(100, 100, 500, 900), nombre=Box(280, 60, 300, 80)),
+        _page(2, Box(100, 100, 500, 900), nombre=Box(280, 1500, 300, 1520)),
+    ]
+    normalize_margins(pages, output_margin_mm=5.0)
+    for p in pages:
+        crop, c = p.margin.crop, p.margin.content
+        assert crop.x0 <= c.x0 + 1e-6 and crop.x1 >= c.x1 - 1e-6
+        assert crop.y0 <= c.y0 + 1e-6 and crop.y1 >= c.y1 - 1e-6
+
+
 def test_nombre_anchors_vertical_position():
     # two pages, same content height, nombre at different absolute y; after
     # normalization the nombre should sit at the same offset from the crop top

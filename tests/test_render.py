@@ -13,10 +13,27 @@ from hokusai_press.model import (
 )
 from hokusai_press.render import (
     compose_transform,
+    remove_edge_shadows,
     render_output_preview,
     render_page_image,
     _map_box,
 )
+
+
+def test_remove_edge_shadows_whitens_band_keeps_content():
+    img = np.full((400, 300, 3), 255, dtype=np.uint8)
+    img[:, 294:300] = 0          # full-height dark bar at the right edge = shadow
+    img[120:300, 90:200] = 0     # interior content block (touches no edge)
+    out = remove_edge_shadows(img)
+    assert (out[:, 294:300] == 255).all()      # shadow removed
+    assert (out[150:250, 110:180] == 0).all()  # interior content preserved
+
+
+def test_remove_edge_shadows_keeps_short_edge_mark():
+    img = np.full((400, 300, 3), 255, dtype=np.uint8)
+    img[10:40, 295:300] = 0      # short edge mark (< half the side) = not a shadow
+    out = remove_edge_shadows(img)
+    assert (out[10:40, 295:300] == 0).all()    # kept (too short to be a shadow)
 
 
 def _params(margin_box, dpi=600, kind=PageKind.AUTO, regions=None):

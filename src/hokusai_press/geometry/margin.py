@@ -172,6 +172,13 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
             y0 = p.margin.nombre_box.y0 - noff * (dpi if use_dpi else 1)
         else:
             y0 = c.y0 - margin_px
+        # HARD no-clip guarantee: the crop must fully contain the content box.
+        # The uniform crop is always >= this page's content, so clamping the
+        # offset into [c.x1-crop_w, c.x0] can never fail. This protects against
+        # a bad nombre anchor shifting the crop off the content (which otherwise
+        # cut pages down to a sliver).
+        x0 = max(min(x0, c.x0), c.x1 - crop_w)
+        y0 = max(min(y0, c.y0), c.y1 - crop_h)
         p.margin.crop = Box(x0, y0, x0 + crop_w, y0 + crop_h)
 
 
