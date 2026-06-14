@@ -6,6 +6,7 @@ import argparse
 import glob
 import os
 import sys
+import tempfile
 import time
 
 
@@ -49,6 +50,66 @@ def _expand_sources(paths: list[str]) -> list[str]:
     return uniq
 
 
+def _run_one(payload: dict) -> dict:
+    """Process a single source to its own db (picklable; used by workers and the
+    serial path). Returns the run summary plus timing and the db it wrote."""
+    from .pipeline import run
+
+    t0 = time.perf_counter()
+    summary = run(
+        payload["src"], payload["out"], db_path=payload["db"],
+        model_dir=payload["model_dir"], device=payload["device"],
+        use_ocr=payload["use_ocr"], learned_model_path=payload["learned_model"],
+        openvino_cache_dir=payload["cache"],
+    )
+    summary["tpb"] = time.perf_counter() - t0
+    return summary
+
+
+def _print_summary(summary: dict, profile: bool) -> bool:
+    """Print the [OK]/warn/prof lines for one file; return True if it has review."""
+    pages = summary["pages"] or 1
+    tpb = summary["tpb"]
+    line = f"[OK] {summary['doc_id']}: {summary['pages']} pages -> {summary['out_pdf']}"
+    flagged = bool(summary["needs_review"])
+    if flagged:
+        line += f"  (needs review: {len(summary['needs_review'])} pages)"
+    line += f"  TPB={tpb:.1f}s TPP={tpb / pages:.2f}s/page"
+    print(line)
+    for w in summary.get("warnings", []):
+        print(f"  [warn] {w}")
+    if profile:
+        prof = summary.get("profile", {})
+        total = sum(prof.values()) or 1.0
+        for stage, sec in sorted(prof.items(), key=lambda kv: -kv[1]):
+            print(f"  [prof] {stage:<16} {sec:7.1f}s "
+                  f"{sec / pages:6.3f}s/page  {sec / total * 100:4.0f}%")
+    return flagged
+
+
+def _merge_dbs(target_db: str, worker_dbs: list[str]) -> None:
+    """Fold each worker's pages into the target db, then remove the temp dbs."""
+    from .store import Store
+
+    tgt = Store(target_db)
+    try:
+        for wdb in worker_dbs:
+            ws = Store(wdb)
+            try:
+                for doc in ws.doc_ids():
+                    for row in ws.list_pages(doc):
+                        tgt.upsert_page(doc, row.page_index, row.params)
+            finally:
+                ws.close()
+    finally:
+        tgt.close()
+    for wdb in worker_dbs:
+        try:
+            os.remove(wdb)
+        except OSError:
+            pass
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="hokusai-press",
@@ -74,6 +135,9 @@ def main(argv=None) -> int:
                        help="OpenVINO compiled-model cache dir (speeds up NPU reuse)")
     p_run.add_argument("--profile", action="store_true",
                        help="print per-stage timing (raster/deskew/ocr/.../render)")
+    p_run.add_argument("--workers", type=int, default=1,
+                       help="process this many files in parallel (overlaps one "
+                            "file's CPU work with another's NPU OCR; ~2 is best)")
 
     p_queue = sub.add_parser("queue", help="list pages awaiting review")
     p_queue.add_argument("--db", default="hokusai.db")
@@ -100,8 +164,6 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "run":
-        from .pipeline import run
-
         sources = _expand_sources(args.source)
         if not sources:
             print("no input files matched")
@@ -110,33 +172,42 @@ def main(argv=None) -> int:
             print("error: --out must be a folder when processing multiple inputs")
             return 1
 
+        def _payload(src, db):
+            return {
+                "src": src, "out": _resolve_out(args.out, src), "db": db,
+                "model_dir": args.model_dir, "device": args.device,
+                "use_ocr": not args.no_ocr, "learned_model": args.learned_model,
+                "cache": args.openvino_cache_dir,
+            }
+
         flagged_docs = 0
-        for src in sources:
-            out = _resolve_out(args.out, src)
-            t0 = time.perf_counter()
-            summary = run(
-                src, out, db_path=args.db, model_dir=args.model_dir,
-                device=args.device, use_ocr=not args.no_ocr,
-                learned_model_path=args.learned_model,
-                openvino_cache_dir=args.openvino_cache_dir,
-            )
-            tpb = time.perf_counter() - t0
-            pages = summary["pages"] or 1
-            line = (f"[OK] {summary['doc_id']}: {summary['pages']} pages "
-                    f"-> {summary['out_pdf']}")
-            if summary["needs_review"]:
-                flagged_docs += 1
-                line += f"  (needs review: {len(summary['needs_review'])} pages)"
-            line += f"  TPB={tpb:.1f}s TPP={tpb / pages:.2f}s/page"
-            print(line)
-            for w in summary.get("warnings", []):
-                print(f"  [warn] {w}")
-            if args.profile:
-                prof = summary.get("profile", {})
-                total = sum(prof.values()) or 1.0
-                for stage, sec in sorted(prof.items(), key=lambda kv: -kv[1]):
-                    print(f"  [prof] {stage:<16} {sec:7.1f}s "
-                          f"{sec / pages:6.3f}s/page  {sec / total * 100:4.0f}%")
+        parallel = args.workers > 1 and len(sources) > 1
+        if parallel:
+            # each file -> its own temp db (avoids cross-process sqlite locking),
+            # merged into --db at the end. Workers overlap CPU work with NPU OCR.
+            import multiprocessing as mp
+
+            tmpdir = tempfile.mkdtemp(prefix="hokusai-")
+            payloads, worker_dbs = [], []
+            for k, src in enumerate(sources):
+                wdb = os.path.join(tmpdir, f"w{k}.db")
+                worker_dbs.append(wdb)
+                payloads.append(_payload(src, wdb))
+            with mp.Pool(processes=min(args.workers, len(sources))) as pool:
+                for summary in pool.imap_unordered(_run_one, payloads):
+                    if _print_summary(summary, args.profile):
+                        flagged_docs += 1
+            _merge_dbs(args.db, worker_dbs)
+            try:
+                os.rmdir(tmpdir)
+            except OSError:
+                pass
+        else:
+            for src in sources:
+                summary = _run_one(_payload(src, args.db))
+                if _print_summary(summary, args.profile):
+                    flagged_docs += 1
+
         if len(sources) > 1:
             print(f"[done] {len(sources)} files, {flagged_docs} need review")
         if flagged_docs:
