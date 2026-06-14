@@ -46,6 +46,7 @@ def analyze_document(
     use_ocr: bool = True,
     learned_model: Optional[dict] = None,
     layout_provider=None,
+    openvino_cache_dir: Optional[str] = None,
 ) -> AnalyzeResult:
     from .source import load_page
 
@@ -62,6 +63,7 @@ def analyze_document(
         regions, cflags = content_mod.analyze(
             original, ocr_up, source, model_dir=model_dir,
             device=device, use_ocr=use_ocr, layout_provider=layout_provider,
+            openvino_cache_dir=openvino_cache_dir,
         )
         # 4. margin / nombre on the deskewed original
         mg = margin_mod.find_content_box(original, sk)
@@ -128,6 +130,7 @@ def run(
     device: str = "auto",
     use_ocr: bool = True,
     learned_model_path: Optional[str] = None,
+    openvino_cache_dir: Optional[str] = None,
 ) -> dict:
     """Full batch run: analyze, persist params, render the PDF."""
     from . import learn
@@ -135,7 +138,8 @@ def run(
 
     learned = learn.load(learned_model_path) if learned_model_path else None
     result = analyze_document(path, model_dir=model_dir, device=device,
-                              use_ocr=use_ocr, learned_model=learned)
+                              use_ocr=use_ocr, learned_model=learned,
+                              openvino_cache_dir=openvino_cache_dir)
     doc_id = os.path.basename(path)
     store = Store(db_path)
     try:

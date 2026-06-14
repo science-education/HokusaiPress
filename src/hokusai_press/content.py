@@ -40,7 +40,7 @@ LOW_COVERAGE_FRAC = 0.5    # text covers < 50% of ink -> flag for review
 _ocr_engine = None
 
 
-def _get_ocr_engine(model_dir: str, device: str):
+def _get_ocr_engine(model_dir: str, device: str, openvino_cache_dir=None):
     global _ocr_engine
     if _ocr_engine is None:
         from hybrid_ocr.pipeline import HybridOCR  # lazy, optional dependency
@@ -54,7 +54,8 @@ def _get_ocr_engine(model_dir: str, device: str):
                 model_dir = resolve_model_dir(None)
             except Exception:
                 pass
-        _ocr_engine = HybridOCR(model_dir=model_dir, device=device)
+        _ocr_engine = HybridOCR(model_dir=model_dir, device=device,
+                                openvino_cache_dir=openvino_cache_dir)
     return _ocr_engine
 
 
@@ -66,6 +67,7 @@ def analyze(
     device: str = "auto",
     use_ocr: bool = True,
     layout_provider=None,
+    openvino_cache_dir=None,
 ) -> tuple[list[Region], list[Flag]]:
     regions: list[Region] = []
     flags: list[Flag] = []
@@ -75,7 +77,7 @@ def analyze(
     engine = None
     if use_ocr:
         try:
-            engine = _get_ocr_engine(model_dir, device)
+            engine = _get_ocr_engine(model_dir, device, openvino_cache_dir)
         except ImportError:
             # hybrid-ocr not installed: geometry-only is a supported mode
             use_ocr = False

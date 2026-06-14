@@ -69,6 +69,8 @@ def main(argv=None) -> int:
                        help="skip OCR (geometry + heuristic separation only)")
     p_run.add_argument("--learned-model", default=None,
                        help="JSON page-kind model from `learn` to guide auto decisions")
+    p_run.add_argument("--openvino-cache-dir", default=None,
+                       help="OpenVINO compiled-model cache dir (speeds up NPU reuse)")
 
     p_queue = sub.add_parser("queue", help="list pages awaiting review")
     p_queue.add_argument("--db", default="hokusai.db")
@@ -112,6 +114,7 @@ def main(argv=None) -> int:
                 src, out, db_path=args.db, model_dir=args.model_dir,
                 device=args.device, use_ocr=not args.no_ocr,
                 learned_model_path=args.learned_model,
+                openvino_cache_dir=args.openvino_cache_dir,
             )
             line = (f"[OK] {summary['doc_id']}: {summary['pages']} pages "
                     f"-> {summary['out_pdf']}")
