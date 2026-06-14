@@ -26,6 +26,7 @@ SourceRef.ocr_scale).
 from __future__ import annotations
 
 import os
+import threading
 
 import cv2
 import numpy as np
@@ -41,24 +42,31 @@ LOW_COVERAGE_FRAC = 0.3    # text+figure covers < 30% of ink -> flag for review.
 # At 0.3 only genuine outliers (OCR truly missed most text) reach the queue.
 
 _ocr_engine = None
+_engine_lock = threading.Lock()   # one NPU/OCR engine shared across worker threads
 
 
 def _get_ocr_engine(model_dir: str, device: str, openvino_cache_dir=None):
     global _ocr_engine
-    if _ocr_engine is None:
-        from hybrid_ocr.pipeline import HybridOCR  # lazy, optional dependency
+    if _ocr_engine is not None:
+        return _ocr_engine
+    # double-checked under a lock so concurrent worker threads build (and NPU-
+    # compile) the engine exactly once and then share that single context;
+    # HybridOCR.__call__ only reads shared state + ORT run(), so concurrent calls
+    # are safe and the device serializes the actual inference.
+    with _engine_lock:
+        if _ocr_engine is None:
+            from hybrid_ocr.pipeline import HybridOCR  # lazy, optional dependency
 
-        # auto-resolve the model dir (the default "models" is relative and
-        # usually absent from the cwd): fall back to hybrid-ocr's own resolver,
-        # which finds the models bundled next to that package.
-        if not os.path.isdir(model_dir):
-            try:
-                from hybrid_ocr.cli import resolve_model_dir
-                model_dir = resolve_model_dir(None)
-            except Exception:
-                pass
-        _ocr_engine = HybridOCR(model_dir=model_dir, device=device,
-                                openvino_cache_dir=openvino_cache_dir)
+            # auto-resolve the model dir (the default "models" is relative and
+            # usually absent from the cwd): fall back to hybrid-ocr's resolver.
+            if not os.path.isdir(model_dir):
+                try:
+                    from hybrid_ocr.cli import resolve_model_dir
+                    model_dir = resolve_model_dir(None)
+                except Exception:
+                    pass
+            _ocr_engine = HybridOCR(model_dir=model_dir, device=device,
+                                    openvino_cache_dir=openvino_cache_dir)
     return _ocr_engine
 
 

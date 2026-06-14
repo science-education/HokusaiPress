@@ -154,8 +154,9 @@ def main(argv=None) -> int:
     p_run.add_argument("--profile", action="store_true",
                        help="print per-stage timing (raster/deskew/ocr/.../render)")
     p_run.add_argument("--workers", type=int, default=1,
-                       help="process this many files in parallel (overlaps one "
-                            "file's CPU work with another's NPU OCR; ~2 is best)")
+                       help="process this many files in parallel threads sharing "
+                            "one OCR engine (overlaps CPU work with NPU inference; "
+                            "works with --device npu; ~2 is the sweet spot)")
     p_run.add_argument("--pages", default=None,
                        help="process only these 0-based pages, e.g. '9,52,236-237'"
                             " (fast for debugging)")
@@ -205,18 +206,16 @@ def main(argv=None) -> int:
 
         flagged_docs = 0
         parallel = args.workers > 1 and len(sources) > 1
-        if parallel and args.device in ("npu", "qnn"):
-            # a single NPU can't be opened reliably by concurrent processes -- a
-            # worker tends to crash on device init and hang the pool. Parallelism
-            # must use the CPU; NPU runs one file at a time.
-            print(f"[warn] --device {args.device} can't be shared across "
-                  f"processes; forcing --workers 1 (use --device cpu for "
-                  f"parallel throughput)")
-            parallel = False
         if parallel:
-            # each file -> its own temp db (avoids cross-process sqlite locking),
-            # merged into --db at the end. Workers overlap CPU work with NPU OCR.
-            import multiprocessing as mp
+            # THREAD pool in ONE process (not multiprocessing): a single NPU/OCR
+            # engine context is shared across threads, while each thread's CPU
+            # work (raster/deskew/margin/MRC/render/recognition) overlaps another
+            # thread's NPU inference (session.run + cv2/numpy release the GIL).
+            # This makes --device npu safe in parallel -- unlike multiprocessing,
+            # which opened one NPU context per process and hung the device.
+            # Each thread writes its own temp db (no sqlite lock contention),
+            # merged into --db at the end.
+            from concurrent.futures import ThreadPoolExecutor
 
             tmpdir = tempfile.mkdtemp(prefix="hokusai-")
             payloads, worker_dbs = [], []
@@ -224,8 +223,9 @@ def main(argv=None) -> int:
                 wdb = os.path.join(tmpdir, f"w{k}.db")
                 worker_dbs.append(wdb)
                 payloads.append(_payload(src, wdb))
-            with mp.Pool(processes=min(args.workers, len(sources))) as pool:
-                for summary in pool.imap_unordered(_run_one, payloads):
+            with ThreadPoolExecutor(
+                    max_workers=min(args.workers, len(sources))) as ex:
+                for summary in ex.map(_run_one, payloads):
                     if _print_summary(summary, args.profile):
                         flagged_docs += 1
             _merge_dbs(args.db, worker_dbs)
