@@ -6,6 +6,7 @@ import argparse
 import glob
 import os
 import sys
+import time
 
 
 def _is_folder_out(out: str) -> bool:
@@ -110,17 +111,21 @@ def main(argv=None) -> int:
         flagged_docs = 0
         for src in sources:
             out = _resolve_out(args.out, src)
+            t0 = time.perf_counter()
             summary = run(
                 src, out, db_path=args.db, model_dir=args.model_dir,
                 device=args.device, use_ocr=not args.no_ocr,
                 learned_model_path=args.learned_model,
                 openvino_cache_dir=args.openvino_cache_dir,
             )
+            tpb = time.perf_counter() - t0
+            pages = summary["pages"] or 1
             line = (f"[OK] {summary['doc_id']}: {summary['pages']} pages "
                     f"-> {summary['out_pdf']}")
             if summary["needs_review"]:
                 flagged_docs += 1
                 line += f"  (needs review: {len(summary['needs_review'])} pages)"
+            line += f"  TPB={tpb:.1f}s TPP={tpb / pages:.2f}s/page"
             print(line)
             for w in summary.get("warnings", []):
                 print(f"  [warn] {w}")
