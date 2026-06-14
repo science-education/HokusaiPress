@@ -29,7 +29,6 @@ from ..model import Box, Deskew, Flag, Margin
 SPECKLE_AREA_FRAC = 1e-5     # components smaller than this fraction are noise
 NOMBRE_BAND_FRAC = 0.08      # top/bottom 8% of the page is the nombre band
 NOMBRE_MAX_HEIGHT_FRAC = 0.04
-MARGIN_CONSISTENCY_TOL = 0.04  # neighbor content boxes within 4% of page size
 
 
 SHADOW_EDGE_FRAC = 0.15      # a shadow lives within the outer 15% of a side
@@ -194,12 +193,19 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
         p.margin.crop = Box(x0, y0, x0 + crop_w, y0 + crop_h)
 
 
+MARGIN_OUTLIER_RATIO = 1.30   # content >30% larger than the median = an outlier
+
+
 def align_margins(margins: list[Margin]) -> list[Flag | None]:
     """Cross-page consistency check. Returns a per-page flag (or None).
 
-    Full nombre-anchored re-alignment is the pending C++ port; for now this
-    flags pages whose content box departs from the running median so they
-    reach the review queue, which is the safety-first behavior.
+    Uniform-size rendering + the >= margin clamp + margin fill make the output
+    robust to ordinary content-box variation (a photo page is simply bigger), so
+    we no longer flag every small departure -- that produced a flood of false
+    reviews. The one residual risk is an OUTLIER-LARGE content box (a bad
+    detection that bloats the whole document's uniform crop), so we flag only
+    pages whose content is much larger than the median. (Tiny / failed boxes are
+    caught earlier as MARGIN_NOT_FOUND via confidence.)
     """
     if not margins:
         return []
@@ -211,10 +217,8 @@ def align_margins(margins: list[Margin]) -> list[Flag | None]:
         if m.content is None or m.confidence < 0.2:
             flags.append(Flag.MARGIN_NOT_FOUND)
             continue
-        dw = abs(m.content.width - med_w) / max(med_w, 1)
-        dh = abs(m.content.height - med_h) / max(med_h, 1)
-        if m.nombre_box is None and (dw > MARGIN_CONSISTENCY_TOL
-                                     or dh > MARGIN_CONSISTENCY_TOL):
+        if (m.content.width > MARGIN_OUTLIER_RATIO * med_w
+                or m.content.height > MARGIN_OUTLIER_RATIO * med_h):
             flags.append(Flag.MARGIN_INCONSISTENT)
         else:
             flags.append(None)
