@@ -90,8 +90,14 @@ def render_page_image(
     # whiten binding/ADF edge shadows on the FULL original first (robust, the
     # validated location) -- then warp the clean image, so no shadow survives
     # into the output and a wrong crop can't reintroduce one.
-    clean = remove_edge_shadows(original_bgr)
     M, out_size, _ = compose_transform(original_bgr.shape, params, settings)
+    # OCR-confident blank page: emit pure white (no warp needed), so neither
+    # show-through nor any residual speck reaches the output.
+    if getattr(params, "blank", False):
+        white = np.full((out_size[1], out_size[0], 3), 255, dtype=np.uint8)
+        return white, [], "bw", []
+
+    clean = remove_edge_shadows(original_bgr)
     out = cv2.warpAffine(clean, M, out_size, flags=cv2.INTER_AREA,
                          borderValue=(255, 255, 255))
 

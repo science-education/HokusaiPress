@@ -20,6 +20,27 @@ from hokusai_press.render import (
 )
 
 
+def test_blank_page_renders_white():
+    # a page marked blank (OCR found no content + no ink) renders pure white,
+    # even if the source still has faint show-through marks
+    settings = RenderSettings(target_dpi=600, output_margin_mm=0.0)
+    img = np.full((800, 600, 3), 250, dtype=np.uint8)
+    img[300:340, 200:400] = 205          # faint show-through (never real ink)
+    params = _params(Box(0, 0, 600, 800), dpi=600)
+    params.blank = True
+    out, lines, mode, photos = render_page_image(img, params, settings)
+    assert (out == 255).all() and lines == [] and photos == []
+
+
+def test_non_blank_page_is_not_whitened():
+    settings = RenderSettings(target_dpi=600, output_margin_mm=0.0)
+    img = np.full((800, 600, 3), 255, dtype=np.uint8)
+    img[100:500, 120:240] = 0
+    params = _params(Box(100, 100, 250, 500), dpi=600)   # blank defaults False
+    out, _, _, _ = render_page_image(img, params, settings)
+    assert (out == 0).any()              # content kept
+
+
 def test_margin_fill_whitens_outside_content_keeps_content():
     # a uniform-size crop is larger than this page's content, pulling in an edge
     # line that sits OUTSIDE the content box. margin fill must whiten it while

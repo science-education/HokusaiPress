@@ -146,10 +146,12 @@ def analyze(
         except Exception:
             pass
 
-    # residual / photo detection on the OCR-resolution binary
+    # residual / photo detection on a clamp-thresholded ink mask (not raw Otsu):
+    # Otsu turns faint show-through into "ink" and so invents a spurious photo on
+    # a blank page; the absolute-floored threshold rejects it.
+    from .geometry.margin import ink_threshold
     gray = cv2.cvtColor(ocr_bgr, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    ink = (binary > 0).astype(np.uint8)
+    ink = (gray <= ink_threshold(gray)).astype(np.uint8)
     total_ink = int(ink.sum())
 
     residual = ink.copy()

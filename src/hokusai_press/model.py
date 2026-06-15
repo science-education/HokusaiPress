@@ -143,6 +143,9 @@ class PageParams:
     # page number read from the nombre region (OCR), and its parsed integer
     nombre_text: Optional[str] = None
     page_number: Optional[int] = None
+    # OCR found no content and the page has no real ink -> render as blank white
+    # (rejects show-through). Only set when OCR ran, so it never erases text.
+    blank: bool = False
 
     def needs_review(self) -> bool:
         return self.review_status == ReviewStatus.NEEDS_REVIEW
@@ -223,6 +226,7 @@ def _decode_page(d) -> PageParams:
         decided_by=None if d.get("decided_by") is None else DecidedBy(d["decided_by"]),
         nombre_text=d.get("nombre_text"),
         page_number=d.get("page_number"),
+        blank=d.get("blank", False),
     )
 
 

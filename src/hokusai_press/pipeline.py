@@ -31,6 +31,8 @@ from .store import Store
 
 MIN_CONTENT_AREA_FRAC = 0.12   # content smaller than this share of the page =
 #                                detection failed -> use the whole page + flag
+BLANK_INK_FRAC = 0.001         # below this ink fraction (with no OCR content) =
+#                                a blank / show-through page -> render white
 
 
 @dataclass
@@ -109,11 +111,23 @@ def analyze_document(
         if not c or c.width * c.height < MIN_CONTENT_AREA_FRAC * pw * ph:
             mg.content = Box(0.0, 0.0, float(pw), float(ph))
             mg.confidence = 0.0           # -> MARGIN_NOT_FOUND via align_margins
+
+        # OCR-confident blank: OCR ran, found NO content region (text/figure/
+        # photo), and the (shadow-removed, clamp-thresholded) page has no real
+        # ink -> it is genuinely empty (a blank leaf, or pure show-through), so
+        # render it white. Gated by use_ocr so it can never erase real text, and
+        # cross-checked against ink so an OCR-missed text page is NOT blanked.
+        blank = False
+        if use_ocr and not regions:
+            import cv2
+            from .geometry.margin import ink_threshold, remove_edge_shadows
+            gg = cv2.cvtColor(remove_edge_shadows(ocr_img), cv2.COLOR_BGR2GRAY)
+            blank = float((gg <= ink_threshold(gg)).mean()) < BLANK_INK_FRAC
         prof["margin"] += perf_counter() - t
 
         params = PageParams(
             source=source, dpi=dpi, deskew=sk, margin=mg, regions=regions,
-            page_kind=PageKind.AUTO, flags=list(cflags),
+            page_kind=PageKind.AUTO, flags=list(cflags), blank=blank,
         )
         if not deskew_mod.is_confident(sk):
             params.flags.append(Flag.DESKEW_LOW_CONF)
