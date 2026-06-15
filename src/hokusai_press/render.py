@@ -136,18 +136,20 @@ def render_page_image(
     return out, lines, mode, photo_boxes
 
 
+def binarize_bw(bgr: np.ndarray) -> np.ndarray:
+    """{0,255} single-channel bw layer. Threshold is clamped to an absolute ceil
+    (min(Otsu, INK_CEIL)) so faint show-through and soft shadow penumbra stay
+    white while text cores stay black -- Otsu alone turns them black on near-blank
+    ADF pages. HokusaiPress owns its output binarization (the OCR side keeps its
+    own global-Otsu binarize for recognition)."""
+    from .geometry.margin import ink_threshold
+
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
+    return np.where(gray <= ink_threshold(gray), 0, 255).astype(np.uint8)
+
+
 def _binarize_for_preview(bgr: np.ndarray) -> np.ndarray:
-    """{0,255} single-channel. Use the same binarizer the PDF uses when it is
-    available, so the preview matches the real output; otherwise fall back to a
-    self-contained adaptive threshold (preview must work without the OCR extra).
-    """
-    try:
-        from hybrid_ocr.pdf_export import binarize
-        return binarize(bgr)
-    except Exception:
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        return cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15)
+    return binarize_bw(bgr)
 
 
 def render_output_preview(

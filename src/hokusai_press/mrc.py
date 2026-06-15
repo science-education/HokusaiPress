@@ -38,14 +38,16 @@ class MrcPageBuilder:
 
     def add_page(self, out_bgr: np.ndarray, lines: list,
                  photo_boxes_px: list, mode: str) -> None:
-        from hybrid_ocr.pdf_export import binarize, encode_page_pdf
+        from hybrid_ocr.pdf_export import encode_page_pdf
+
+        from .render import binarize_bw
 
         h, w = out_bgr.shape[:2]
         if mode in ("gray", "color"):
             base_pdf = encode_page_pdf(out_bgr, mode, self.compress)
             overlays = []
         else:
-            binary = binarize(out_bgr)            # {0,255}
+            binary = binarize_bw(out_bgr)         # {0,255}, clamped threshold
             overlays = []
             for box in photo_boxes_px:
                 x0, y0, x1, y1 = box[:4]

@@ -35,6 +35,20 @@ SHADOW_EDGE_FRAC = 0.15      # a shadow lives within the outer 15% of a side
 SHADOW_SIDE_FRAC = 0.5       # ... and runs >= half that side's length
 SHADOW_THIN_FRAC = 0.15      # ... while staying thin (not a big figure)
 
+INK_CEIL = 130              # a pixel counts as ink only if darker than this.
+# Otsu alone fails on near-blank ADF pages: with no real dark ink it picks a
+# high threshold (~250) and turns faint show-through (裏移り) and soft shadow
+# penumbra into black. Real print is far darker (< ~100), so clamping the
+# threshold to min(Otsu, INK_CEIL) rejects show-through / penumbra while keeping
+# text cores, and gives remove_edge_shadows a clean binary so the edge line is a
+# distinct component again. Measured: bleed-through pages have ~0% of pixels
+# below 90; real text pages have clearly more.
+
+
+def ink_threshold(gray: np.ndarray) -> int:
+    otsu, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return min(int(otsu), INK_CEIL)
+
 
 def remove_edge_shadows(img: np.ndarray) -> np.ndarray:
     """Whiten dark binding/ADF shadow bands along the page edges (gray or BGR).
@@ -52,7 +66,10 @@ def remove_edge_shadows(img: np.ndarray) -> np.ndarray:
     """
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
     h, w = gray.shape
-    _, binv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # absolute-floored "ink" mask (not raw Otsu): on a near-blank page this keeps
+    # only the genuinely dark edge line as a component, so it is whitened cleanly
+    # instead of drowning in show-through noise.
+    binv = (gray <= ink_threshold(gray)).astype(np.uint8)
     n, lbl, stats, _ = cv2.connectedComponentsWithStats(binv, connectivity=8)
     ew, eh = w * SHADOW_EDGE_FRAC, h * SHADOW_EDGE_FRAC
     out = img.copy()
