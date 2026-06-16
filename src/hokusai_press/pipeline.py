@@ -142,7 +142,8 @@ def analyze_document(
 
     t = perf_counter()
     heights = [o.shape[0] for o in originals]
-    warnings = nombre_mod.resolve(doc.pages, heights)
+    widths = [o.shape[1] for o in originals]
+    warnings = nombre_mod.resolve(doc.pages, heights, widths)
 
     # 6. cross-page margin consistency + nombre-anchored normalization
     for params, flag in zip(doc.pages, margin_mod.align_margins(margins)):

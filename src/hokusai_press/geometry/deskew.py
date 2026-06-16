@@ -29,6 +29,7 @@ MAX_ANGLE = 7.0          # degrees; OCR tolerates only a few degrees of skew
 COARSE_STEP = 0.5
 FINE_STEP = 0.05
 GOOD_CONFIDENCE = 1.5    # (best-median)/(median-min) must exceed this to trust
+NEGLIGIBLE_ANGLE = 0.2   # deg; below this the page is effectively upright already
 WORK_MAX_SIDE = 1500     # downscale for the angle search (speed; angle is scale-free)
 
 
@@ -86,4 +87,10 @@ def find_skew(img_bgr: np.ndarray) -> Deskew:
 
 
 def is_confident(deskew: Deskew) -> bool:
+    # A page left effectively upright needs no review even when its projection
+    # peak is dull: dense yokogaki text legitimately scores low confidence while
+    # being perfectly straight, so flagging it is a false positive. Only a
+    # non-negligible applied rotation with low confidence is worth a human look.
+    if abs(deskew.angle_deg) < NEGLIGIBLE_ANGLE:
+        return True
     return deskew.confidence >= GOOD_CONFIDENCE

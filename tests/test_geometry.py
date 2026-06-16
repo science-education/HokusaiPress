@@ -30,11 +30,15 @@ def test_deskew_straight_page_is_near_zero():
     assert abs(sk.angle_deg) < 0.3
 
 
-def test_blank_page_low_confidence():
+def test_blank_page_not_deskew_flagged():
+    # A blank page has no skew to correct (angle 0); its dull projection yields
+    # zero confidence, but since nothing is rotated it needs no deskew review --
+    # blank leaves are handled by the blank / no-text mechanism, not here.
     blank = np.full((400, 300, 3), 255, dtype=np.uint8)
     sk = find_skew(blank)
     assert sk.confidence == 0.0
-    assert not is_confident(sk)
+    assert sk.angle_deg == 0.0
+    assert is_confident(sk)  # upright -> not flagged for deskew review
 
 
 def test_figure_plus_text_is_confident():

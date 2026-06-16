@@ -25,6 +25,8 @@ Runs only when OCR produced text; with --no-ocr the geometric box stands.
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
+from statistics import median
 from typing import Optional
 
 from .model import Box, Flag, PageParams, Region  # noqa: F401
@@ -33,6 +35,18 @@ BAND_FRAC = 0.14          # top/bottom 14% of the page is the nombre band
 MAX_NOMBRE_LEN = 6        # a page-number token is short
 MIN_SUPPORT = 3           # a numbering run must span >= this many pages to trust
 GAP_TOLERANCE = 1         # skipped numbers beyond this (with no blank pages) warn
+POS_K = 4.0               # robust spread multiplier for the position model
+POS_FLOOR_X = 0.03        # minimum horizontal acceptance window (page fraction)
+POS_FLOOR_Y = 0.02        # minimum vertical acceptance window (page fraction)
+POS_SEP_THRESH = 0.25     # parity x separation: alternating corners vs pooled
+POS_MIN_ANCHORS = 8       # below this, keep the historical vote-only behavior
+POS_MAX_SPREAD = 0.15     # too broad means the document has no stable nombre pos
+POS_ALIGN_Y_THRESH = 0.005
+POS_DOM_FRAC = 0.3        # a cluster is "primary" only if it reaches this fraction
+                         # of its own numbering system's strongest offset (so a
+                         # minority misread offset within a kind is rejected, while
+                         # a legitimate secondary system like roman front matter,
+                         # which is dominant within its own kind, is kept)
 
 _KANJI_DIGIT = {"〇": 0, "零": 0, "一": 1, "二": 2, "三": 3, "四": 4,
                 "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
@@ -123,7 +137,29 @@ def _candidates(params: PageParams, page_h: float):
     return out
 
 
-def resolve(pages: list[PageParams], page_heights: list[float]) -> list[str]:
+@dataclass
+class _PosStats:
+    mx: float
+    my: float
+    sx: float
+    sy: float
+    n: int
+
+
+@dataclass
+class _PositionModel:
+    x_mode: str
+    x_stats: dict[int, _PosStats] | _PosStats
+    y_stats: dict[int, _PosStats]
+    common_my: float
+    align_y: bool
+
+
+def resolve(
+    pages: list[PageParams],
+    page_heights: list[float],
+    page_widths: list[float],
+) -> list[str]:
     """Assign page_number/nombre_text robustly and return gap warnings.
 
     Mutates each page's margin.nombre_box / page_number / nombre_text / flags.
@@ -151,6 +187,30 @@ def resolve(pages: list[PageParams], page_heights: list[float]) -> list[str]:
     if not supported:
         return []
 
+    dominant = max(supported, key=lambda k: votes[k])
+
+    # Assign once by the historical vote-only method. If the position model is
+    # under-supported or unstable, these assignments are the fallback behavior.
+    fallback_warnings = _assign_supported(
+        pages, cands, band, votes, supported, max_v)
+
+    anchors = []
+    for i, cl in enumerate(cands):
+        for b, kind, v, r in cl:
+            if b != band or v > max_v or (kind, v - i) != dominant:
+                continue
+            fx, fy = _box_center_frac(r.box, page_widths[i], page_heights[i])
+            anchors.append((pages[i].source.page_index, fx, fy))
+            break
+    model = _build_position_model(anchors)
+    if model is None:
+        return fallback_warnings
+
+    return _assign_with_position_model(
+        pages, cands, page_heights, page_widths, band, votes, max_v, model)
+
+
+def _assign_supported(pages, cands, band, votes, supported, max_v) -> list[str]:
     # assign each page the candidate matching the strongest supported cluster
     assigns = []  # (page_index, kind, value)
     for i, (p, cl) in enumerate(zip(pages, cands)):
@@ -171,7 +231,232 @@ def resolve(pages: list[PageParams], page_heights: list[float]) -> list[str]:
         if p.margin:
             p.margin.nombre_box = r.box
         assigns.append((p.source.page_index, kind, v))
+    _clear_gap_flags(pages)
     return _gap_warnings(assigns, {p.source.page_index: p for p in pages})
+
+
+def _box_center_frac(box: Box, page_w: float, page_h: float) -> tuple[float, float]:
+    return ((box.x0 + box.x1) / 2.0 / page_w,
+            (box.y0 + box.y1) / 2.0 / page_h)
+
+
+def _robust_stats(points: list[tuple[float, float]]) -> Optional[_PosStats]:
+    if not points:
+        return None
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    mx = median(xs)
+    my = median(ys)
+    sx = 1.4826 * median([abs(x - mx) for x in xs])
+    sy = 1.4826 * median([abs(y - my) for y in ys])
+    return _PosStats(mx, my, sx, sy, len(points))
+
+
+def _inside_stats(fx: float, fy: float, st: _PosStats) -> bool:
+    return (abs(fx - st.mx) <= max(POS_K * st.sx, POS_FLOOR_X)
+            and abs(fy - st.my) <= max(POS_K * st.sy, POS_FLOOR_Y))
+
+
+def _stats_after_rejection(points: list[tuple[float, float]]) -> Optional[_PosStats]:
+    st = _robust_stats(points)
+    if st is None:
+        return None
+    kept = [p for p in points if _inside_stats(p[0], p[1], st)]
+    return _robust_stats(kept)
+
+
+def _too_broad(stats) -> bool:
+    if isinstance(stats, dict):
+        return any(_too_broad(v) for v in stats.values())
+    return stats.sx > POS_MAX_SPREAD or stats.sy > POS_MAX_SPREAD
+
+
+def _build_position_model(
+    anchors: list[tuple[int, float, float]],
+) -> Optional[_PositionModel]:
+    if len(anchors) < POS_MIN_ANCHORS:
+        return None
+
+    by_parity = {
+        0: [(fx, fy) for idx, fx, fy in anchors if idx % 2 == 0],
+        1: [(fx, fy) for idx, fx, fy in anchors if idx % 2 == 1],
+    }
+    use_merged = any(len(points) < POS_MIN_ANCHORS
+                     for points in by_parity.values())
+
+    if use_merged:
+        all_points = [(fx, fy) for _, fx, fy in anchors]
+        st = _stats_after_rejection(all_points)
+        if st is None or st.n < POS_MIN_ANCHORS or _too_broad(st):
+            return None
+        return _PositionModel(
+            x_mode="pooled",
+            x_stats=st,
+            y_stats={0: st, 1: st},
+            common_my=st.my,
+            align_y=False,
+        )
+
+    y_stats = {}
+    filtered_by_parity = {}
+    for parity, points in by_parity.items():
+        st = _stats_after_rejection(points)
+        if st is None or st.n < POS_MIN_ANCHORS:
+            return None
+        y_stats[parity] = st
+        filtered_by_parity[parity] = [
+            p for p in points if _inside_stats(p[0], p[1], st)
+        ]
+    if _too_broad(y_stats):
+        return None
+
+    sep = abs(y_stats[0].mx - y_stats[1].mx)
+    if sep > POS_SEP_THRESH:
+        x_mode = "parity"
+        x_stats: dict[int, _PosStats] | _PosStats = y_stats
+    else:
+        x_mode = "pooled"
+        pooled = [p for points in filtered_by_parity.values() for p in points]
+        pooled_stats = _stats_after_rejection(pooled)
+        if (pooled_stats is None or pooled_stats.n < POS_MIN_ANCHORS
+                or _too_broad(pooled_stats)):
+            return None
+        x_stats = pooled_stats
+
+    common_my = median([fy for _, _, fy in anchors])
+    align_y = abs(y_stats[0].my - y_stats[1].my) > POS_ALIGN_Y_THRESH
+    return _PositionModel(x_mode, x_stats, y_stats, common_my, align_y)
+
+
+def _inside_position_model(
+    idx: int, box: Box, page_h: float, page_w: float, model: _PositionModel,
+) -> bool:
+    fx, fy = _box_center_frac(box, page_w, page_h)
+    parity = idx % 2
+    if model.x_mode == "parity":
+        x_stats = model.x_stats[parity]  # type: ignore[index]
+    else:
+        x_stats = model.x_stats          # type: ignore[assignment]
+    y_stats = model.y_stats[parity]
+    return (abs(fx - x_stats.mx) <= max(POS_K * x_stats.sx, POS_FLOOR_X)
+            and abs(fy - y_stats.my) <= max(POS_K * y_stats.sy, POS_FLOOR_Y))
+
+
+def _aligned_box(box: Box, page_h: float, model: _PositionModel) -> Box:
+    if not model.align_y:
+        return box
+    cy = model.common_my * page_h
+    half_h = box.height / 2.0
+    return Box(box.x0, cy - half_h, box.x1, cy + half_h)
+
+
+def _primary_clusters(votes: Counter) -> set:
+    """(kind, offset) clusters that are dominant *within their own numbering
+    system*. A kind's strongest offset sets the bar; an offset reaching
+    POS_DOM_FRAC of it is primary. This keeps a legitimate secondary system
+    (roman front matter is the only roman cluster, so it qualifies) while
+    rejecting a minority misread offset inside the body's kind (e.g. a few
+    single digits mis-OCR'd into a +N cluster)."""
+    kind_top: dict = {}
+    for (kind, _off), c in votes.items():
+        kind_top[kind] = max(kind_top.get(kind, 0), c)
+    return {
+        (kind, off) for (kind, off), c in votes.items()
+        if c >= max(MIN_SUPPORT, POS_DOM_FRAC * kind_top[kind])
+    }
+
+
+def _in_position_candidate(p, cl, i, band, max_v, page_heights, page_widths,
+                           model, predicate):
+    """Best in-position candidate satisfying predicate(kind, offset, votes-key),
+    as (kind, v, r), or None."""
+    best = None
+    for b, kind, v, r in cl:
+        if b != band or v > max_v:
+            continue
+        if not predicate(kind, v - i):
+            continue
+        if _inside_position_model(
+                p.source.page_index, r.box, page_heights[i], page_widths[i],
+                model):
+            if best is None:
+                best = (kind, v, r)
+    return best
+
+
+def _assign_with_position_model(
+    pages, cands, page_heights, page_widths, band, votes, max_v, model,
+) -> list[str]:
+    # Position is the gate (kind-agnostic). Pass 1: among in-position candidates
+    # keep only those whose (kind, offset) is primary, and trust their own value
+    # -- no snapping, so a real missing-page gap (its own primary cluster) is
+    # never hidden. Pass 2: a page with no primary candidate but an in-position
+    # candidate of the dominant kind, bracketed on both sides by the dominant
+    # run, is an OCR misread -> recover it as index+dominant_offset.
+    primary = _primary_clusters(votes)
+    dom_kind, dom_offset = max(votes, key=lambda k: votes[k])
+    chosen: list = [None] * len(pages)
+    dom_idx: list[int] = []
+
+    for i, (p, cl) in enumerate(zip(pages, cands)):
+        in_model = []
+        for b, kind, v, r in cl:
+            if b != band or v > max_v or (kind, v - i) not in primary:
+                continue
+            if _inside_position_model(
+                    p.source.page_index, r.box, page_heights[i],
+                    page_widths[i], model):
+                in_model.append((votes[(kind, v - i)], kind, v, r))
+        if in_model:
+            _, kind, v, r = max(in_model, key=lambda item: item[0])
+            chosen[i] = (kind, v, r)
+            if kind == dom_kind and v - i == dom_offset:
+                dom_idx.append(i)
+
+    has_before = [False] * len(pages)
+    seen = False
+    for i in range(len(pages)):
+        has_before[i] = seen
+        if i in set(dom_idx):
+            seen = True
+    dom_set = set(dom_idx)
+    seen = False
+    has_after = [False] * len(pages)
+    for i in range(len(pages) - 1, -1, -1):
+        has_after[i] = seen
+        if i in dom_set:
+            seen = True
+
+    for i, (p, cl) in enumerate(zip(pages, cands)):
+        if chosen[i] is not None or not (has_before[i] and has_after[i]):
+            continue
+        cand = _in_position_candidate(
+            p, cl, i, band, max_v, page_heights, page_widths, model,
+            lambda kind, off: kind == dom_kind)
+        if cand is not None:
+            chosen[i] = (dom_kind, i + dom_offset, cand[2])  # misread -> expected
+
+    assigns = []
+    for i, p in enumerate(pages):
+        c = chosen[i]
+        if c is None:
+            p.page_number, p.nombre_text = None, None
+            if p.margin:
+                p.margin.nombre_box = None
+            continue
+        kind, v, r = c
+        p.page_number, p.nombre_text = v, r.ocr_text
+        if p.margin:
+            p.margin.nombre_box = _aligned_box(r.box, page_heights[i], model)
+        assigns.append((p.source.page_index, kind, v))
+
+    _clear_gap_flags(pages)
+    return _gap_warnings(assigns, {p.source.page_index: p for p in pages})
+
+
+def _clear_gap_flags(pages: list[PageParams]) -> None:
+    for p in pages:
+        p.flags = [f for f in p.flags if f != Flag.PAGE_NUMBER_GAP]
 
 
 def _gap_warnings(assigns, idx2page) -> list[str]:
