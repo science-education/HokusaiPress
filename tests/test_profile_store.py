@@ -40,6 +40,32 @@ def test_store_roundtrip_features():
     s.close()
 
 
+def test_run_populates_profile(tmp_path):
+    import cv2
+    import numpy as np
+
+    from hokusai_press import pipeline
+
+    img = np.full((1000, 700, 3), 255, np.uint8)
+    cv2.rectangle(img, (100, 120), (600, 880), (0, 0, 0), 2)
+    for y in range(160, 840, 40):
+        cv2.rectangle(img, (120, y), (580, y + 16), (0, 0, 0), -1)
+    src = str(tmp_path / "pg.png")
+    cv2.imwrite(src, img)
+
+    db = str(tmp_path / "j.db")
+    pipeline.run(src, str(tmp_path / "o.pdf"), db_path=db, use_ocr=False)
+
+    s = Store(db)
+    try:
+        feats = s.page_features("pg.png")
+        assert len(feats) == 1
+        assert feats[0]["is_ocr"] == 0          # no OCR -> OCR tier empty
+        assert feats[0]["deskew_angle"] is not None  # geometry tier present
+    finally:
+        s.close()
+
+
 def test_store_bucket_backoff():
     s = Store(":memory:")
     s.upsert_bucket_param("ADF1", "A5", "", "size_h", 1400.0, 2.0, 50)

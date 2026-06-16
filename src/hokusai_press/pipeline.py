@@ -210,6 +210,11 @@ def run(
         # keeps real page numbers in the queue / UI / rebuild
         for params in result.document.pages:
             store.upsert_page(doc_id, params.source.page_index, params)
+        # parameter-profile features (docs/PARAM_PROFILE_PLAN.md): geometry /
+        # structure / statistics only, never OCR text. Only on a full run -- a
+        # --pages subset must not overwrite the whole-book profile.
+        if pages is None:
+            _save_profile(store, doc_id, result)
     finally:
         store.close()
     result.profile["db"] = perf_counter() - t
@@ -226,6 +231,32 @@ def run(
         "warnings": result.warnings,
         "profile": result.profile,
     }
+
+
+def _save_profile(store, doc_id: str, result) -> None:
+    """Persist copyright-safe per-book features + a posterior snapshot. page
+    features for every page (cheap geometry tier); region features only for a
+    representative subset (flagged + sampled) per the (b) granularity."""
+    import dataclasses
+    import json as _json
+
+    from . import profile as profile_mod
+
+    pages = result.document.pages
+    widths = [o.shape[1] for o in result.originals]
+    heights = [o.shape[0] for o in result.originals]
+    pfeats, rfeats = profile_mod.extract_features(pages, widths, heights)
+    bp = profile_mod.aggregate(pfeats, rfeats, widths, heights)
+
+    rep = {i for i, p in enumerate(pages) if p.needs_review()}
+    rep |= set(range(0, len(pages), 25))
+    rep_pidx = {pages[i].source.page_index for i in rep}
+    rep_rfeats = [rf for rf in rfeats if rf.page_index in rep_pidx]
+
+    store.save_page_features(doc_id, pfeats)
+    store.save_region_features(doc_id, rep_rfeats)
+    store.save_scan_profile(doc_id, None, None, None, bp.page_count,
+                            bp.ocr_pages, _json.dumps(dataclasses.asdict(bp)))
 
 
 def rebuild(doc_id: str, source_path: str, out_pdf: str,
