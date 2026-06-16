@@ -68,17 +68,24 @@ def test_run_populates_profile(tmp_path):
 
 def test_store_bucket_backoff():
     s = Store(":memory:")
-    s.upsert_bucket_param("ADF1", "A5", "", "size_h", 1400.0, 2.0, 50)
-    s.upsert_bucket_param("", "", "", "size_h", 1390.0, 9.0, 999)
+    # same regime (horizontal/left); soft dims back off
+    s.upsert_bucket_param("ADF1", "A5", "", "horizontal", "left",
+                          "size_h", 1400.0, 2.0, 50)
+    s.upsert_bucket_param("", "", "", "horizontal", "left",
+                          "size_h", 1390.0, 9.0, 999)
 
     def lookup(k):
-        r = s.get_bucket_param(k.scanner, k.fmt, k.genre, "size_h")
+        r = s.get_bucket_param(k.scanner, k.fmt, k.genre, k.writing,
+                               k.binding, "size_h")
         return (r, r[2]) if r else None
 
+    key = ScopeKey("ADF1", "A5", "novel", "horizontal", "left")
     # genre 'novel' bucket absent -> back off to scanner x fmt (n=50 >= 10)
-    prof, used = profile.resolve_profile(ScopeKey("ADF1", "A5", "novel"), lookup, 10)
-    assert used == ScopeKey("ADF1", "A5") and prof[0] == 1400.0
-    # demand more support than any specific bucket -> global fallback
-    prof2, used2 = profile.resolve_profile(ScopeKey("ADF1", "A5", "novel"), lookup, 100)
-    assert used2 == ScopeKey() and prof2[0] == 1390.0
+    prof, used = profile.resolve_profile(key, lookup, 10)
+    assert used == ScopeKey("ADF1", "A5", None, "horizontal", "left")
+    assert prof[0] == 1400.0
+    # demand more support than any specific bucket -> regime-coarsest fallback
+    prof2, used2 = profile.resolve_profile(key, lookup, 100)
+    assert used2 == ScopeKey(None, None, None, "horizontal", "left")
+    assert prof2[0] == 1390.0
     s.close()

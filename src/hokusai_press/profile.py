@@ -187,32 +187,45 @@ def aggregate(
 
 @dataclasses.dataclass(frozen=True)
 class ScopeKey:
+    # writing/binding are a HARD regime partition -- never pooled across, so a
+    # vertical/right-bound book's stats never contaminate a horizontal/left one
+    # (and within a bucket the binding is fixed, so page-number left/right is
+    # already consistent: no outer/inner remapping needed). scanner/fmt/genre are
+    # the soft dimensions that back off when a bucket is under-supported.
     scanner: Optional[str] = None
     fmt: Optional[str] = None
     genre: Optional[str] = None
+    writing: Optional[str] = None
+    binding: Optional[str] = None
+
+
+# soft dimensions, most-specific to coarsest; writing+binding always kept
+_SOFT_CONFIGS = [
+    ("scanner", "fmt", "genre"),
+    ("scanner", "fmt"),
+    ("scanner", "genre"),
+    ("fmt", "genre"),
+    ("scanner",),
+    ("fmt",),
+    ("genre",),
+    (),
+]
 
 
 def backoff_keys(key: ScopeKey) -> list[ScopeKey]:
-    """Most-specific to global. A key is emitted only when every dimension it
-    keeps is present; the empty (global) key is always last."""
-    configs = [
-        ("scanner", "fmt", "genre"),
-        ("scanner", "fmt"),
-        ("scanner", "genre"),
-        ("fmt", "genre"),
-        ("scanner",),
-        ("fmt",),
-        ("genre",),
-        (),
-    ]
+    """Finest to coarsest within the (writing, binding) regime. Soft dimensions
+    are dropped progressively; the regime is fixed in every key. The coarsest is
+    the regime itself (soft dims all None)."""
     res: list[ScopeKey] = []
     seen: set = set()
-    for config in configs:
+    for config in _SOFT_CONFIGS:
         if all(getattr(key, dim) is not None for dim in config):
             k = ScopeKey(
                 scanner=key.scanner if "scanner" in config else None,
                 fmt=key.fmt if "fmt" in config else None,
                 genre=key.genre if "genre" in config else None,
+                writing=key.writing,
+                binding=key.binding,
             )
             if k not in seen:
                 res.append(k)
@@ -226,19 +239,20 @@ def resolve_profile(
     min_n: int,
 ) -> Optional[tuple]:
     """Walk the backoff chain; return (profile, used_key) for the finest bucket
-    with n >= min_n. Fall back to the global bucket regardless of n; None if
-    nothing exists at all."""
-    global_key = ScopeKey()
-    global_found = None
-    for k in backoff_keys(key):
+    with n >= min_n. Fall back to the coarsest (regime) bucket regardless of n;
+    None if nothing exists in the regime at all (cold start -> code defaults)."""
+    chain = backoff_keys(key)
+    coarsest = chain[-1] if chain else key
+    coarsest_found = None
+    for k in chain:
         found = lookup(k)
         if not found:
             continue
         profile, n = found
-        if k == global_key:
-            global_found = profile
+        if k == coarsest:
+            coarsest_found = profile
         if n >= min_n:
             return profile, k
-    if global_found is not None:
-        return global_found, global_key
+    if coarsest_found is not None:
+        return coarsest_found, coarsest
     return None

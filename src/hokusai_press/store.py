@@ -106,12 +106,14 @@ CREATE TABLE IF NOT EXISTS bucket_profile (
     scanner    TEXT NOT NULL DEFAULT '',
     fmt        TEXT NOT NULL DEFAULT '',
     genre      TEXT NOT NULL DEFAULT '',
+    writing    TEXT NOT NULL DEFAULT '',
+    binding    TEXT NOT NULL DEFAULT '',
     param_name TEXT NOT NULL,
     median     REAL,
     mad        REAL,
     n          INTEGER,
     updated_at REAL NOT NULL,
-    PRIMARY KEY (scanner, fmt, genre, param_name)
+    PRIMARY KEY (scanner, fmt, genre, writing, binding, param_name)
 );
 """
 
@@ -314,26 +316,28 @@ class Store:
                 (book_id,)).fetchall()
         return [dict(r) for r in rows]
 
-    def upsert_bucket_param(self, scanner, fmt, genre, param_name: str,
-                            median, mad, n) -> None:
+    def upsert_bucket_param(self, scanner, fmt, genre, writing, binding,
+                            param_name: str, median, mad, n) -> None:
         with self._lock:
             self.conn.execute(
-                "INSERT INTO bucket_profile(scanner,fmt,genre,param_name,median,"
-                "mad,n,updated_at) VALUES(?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(scanner,fmt,genre,param_name) DO UPDATE SET "
-                "median=excluded.median,mad=excluded.mad,n=excluded.n,"
+                "INSERT INTO bucket_profile(scanner,fmt,genre,writing,binding,"
+                "param_name,median,mad,n,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(scanner,fmt,genre,writing,binding,param_name) DO "
+                "UPDATE SET median=excluded.median,mad=excluded.mad,n=excluded.n,"
                 "updated_at=excluded.updated_at",
-                (scanner or "", fmt or "", genre or "", param_name,
-                 median, mad, n, time.time()),
+                (scanner or "", fmt or "", genre or "", writing or "",
+                 binding or "", param_name, median, mad, n, time.time()),
             )
             self.conn.commit()
 
-    def get_bucket_param(self, scanner, fmt, genre, param_name: str):
+    def get_bucket_param(self, scanner, fmt, genre, writing, binding,
+                         param_name: str):
         with self._lock:
             row = self.conn.execute(
                 "SELECT median,mad,n FROM bucket_profile WHERE scanner=? AND "
-                "fmt=? AND genre=? AND param_name=?",
-                (scanner or "", fmt or "", genre or "", param_name)).fetchone()
+                "fmt=? AND genre=? AND writing=? AND binding=? AND param_name=?",
+                (scanner or "", fmt or "", genre or "", writing or "",
+                 binding or "", param_name)).fetchone()
         return (row["median"], row["mad"], row["n"]) if row else None
 
 
