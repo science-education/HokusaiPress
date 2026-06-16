@@ -44,6 +44,73 @@ CREATE TABLE IF NOT EXISTS decisions (
     features    TEXT NOT NULL,
     created_at  REAL NOT NULL
 );
+
+-- Parameter-profile tables (docs/PARAM_PROFILE_PLAN.md). Copyright-safe:
+-- geometry/structure/statistics only, never OCR text content.
+CREATE TABLE IF NOT EXISTS book (
+    book_id     TEXT PRIMARY KEY,
+    isbn        TEXT,
+    title       TEXT,
+    author      TEXT,
+    publisher   TEXT,
+    year        INTEGER,
+    ndc         TEXT,
+    fmt         TEXT,
+    source      TEXT,
+    confidence  REAL,
+    resolved_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS scan_profile (
+    book_id      TEXT PRIMARY KEY,
+    scanner_sig  TEXT,
+    front_end    INTEGER,
+    body_end     INTEGER,
+    page_count   INTEGER,
+    ocr_pages    INTEGER,
+    profile_json TEXT,
+    created_at   REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS page_feature (
+    book_id      TEXT NOT NULL,
+    page_index   INTEGER NOT NULL,
+    is_ocr       INTEGER,
+    region_count INTEGER,
+    deskew_angle REAL,
+    deskew_conf  REAL,
+    content_w    REAL,
+    content_h    REAL,
+    nombre_value INTEGER,
+    nombre_cx    REAL,
+    nombre_cy    REAL,
+    blank        INTEGER,
+    PRIMARY KEY (book_id, page_index)
+);
+
+CREATE TABLE IF NOT EXISTS region_feature (
+    book_id    TEXT NOT NULL,
+    page_index INTEGER NOT NULL,
+    cls        TEXT,
+    x0 REAL, y0 REAL, x1 REAL, y1 REAL,
+    conf REAL,
+    source TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_region_book ON region_feature(book_id);
+
+-- A bucket key uses '' for an absent scope dimension so the primary key is
+-- well-defined (SQLite treats NULLs as distinct in a PK).
+CREATE TABLE IF NOT EXISTS bucket_profile (
+    scanner    TEXT NOT NULL DEFAULT '',
+    fmt        TEXT NOT NULL DEFAULT '',
+    genre      TEXT NOT NULL DEFAULT '',
+    param_name TEXT NOT NULL,
+    median     REAL,
+    mad        REAL,
+    n          INTEGER,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (scanner, fmt, genre, param_name)
+);
 """
 
 
@@ -174,6 +241,95 @@ class Store:
                     "SELECT field, features, new_value FROM decisions"
                 ).fetchall()
         return [dict(r) for r in rows]
+
+    # --- parameter profile (docs/PARAM_PROFILE_PLAN.md) ---
+
+    def save_book(self, book_id: str, *, isbn=None, title=None, author=None,
+                  publisher=None, year=None, ndc=None, fmt=None,
+                  source=None, confidence=None) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO book(book_id,isbn,title,author,publisher,year,ndc,"
+                "fmt,source,confidence,resolved_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(book_id) DO UPDATE SET isbn=excluded.isbn,"
+                "title=excluded.title,author=excluded.author,"
+                "publisher=excluded.publisher,year=excluded.year,ndc=excluded.ndc,"
+                "fmt=excluded.fmt,source=excluded.source,"
+                "confidence=excluded.confidence,resolved_at=excluded.resolved_at",
+                (book_id, isbn, title, author, publisher, year, ndc, fmt,
+                 source, confidence, time.time()),
+            )
+            self.conn.commit()
+
+    def save_scan_profile(self, book_id: str, scanner_sig, front_end, body_end,
+                          page_count, ocr_pages, profile_json: str) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO scan_profile(book_id,scanner_sig,front_end,body_end,"
+                "page_count,ocr_pages,profile_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(book_id) DO UPDATE SET scanner_sig=excluded.scanner_sig,"
+                "front_end=excluded.front_end,body_end=excluded.body_end,"
+                "page_count=excluded.page_count,ocr_pages=excluded.ocr_pages,"
+                "profile_json=excluded.profile_json,created_at=excluded.created_at",
+                (book_id, scanner_sig, front_end, body_end, page_count,
+                 ocr_pages, profile_json, time.time()),
+            )
+            self.conn.commit()
+
+    def save_page_features(self, book_id: str, feats) -> None:
+        rows = [(book_id, f.page_index, int(f.is_ocr), f.region_count,
+                 f.deskew_angle, f.deskew_conf, f.content_w, f.content_h,
+                 f.nombre_value, f.nombre_cx, f.nombre_cy, int(f.blank))
+                for f in feats]
+        with self._lock:
+            self.conn.execute(
+                "DELETE FROM page_feature WHERE book_id=?", (book_id,))
+            self.conn.executemany(
+                "INSERT INTO page_feature(book_id,page_index,is_ocr,region_count,"
+                "deskew_angle,deskew_conf,content_w,content_h,nombre_value,"
+                "nombre_cx,nombre_cy,blank) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            self.conn.commit()
+
+    def save_region_features(self, book_id: str, feats) -> None:
+        rows = [(book_id, f.page_index, f.cls, f.x0, f.y0, f.x1, f.y1,
+                 f.conf, f.source) for f in feats]
+        with self._lock:
+            self.conn.execute(
+                "DELETE FROM region_feature WHERE book_id=?", (book_id,))
+            self.conn.executemany(
+                "INSERT INTO region_feature(book_id,page_index,cls,x0,y0,x1,y1,"
+                "conf,source) VALUES(?,?,?,?,?,?,?,?,?)", rows)
+            self.conn.commit()
+
+    def page_features(self, book_id: str) -> list[dict]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM page_feature WHERE book_id=? ORDER BY page_index",
+                (book_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def upsert_bucket_param(self, scanner, fmt, genre, param_name: str,
+                            median, mad, n) -> None:
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO bucket_profile(scanner,fmt,genre,param_name,median,"
+                "mad,n,updated_at) VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(scanner,fmt,genre,param_name) DO UPDATE SET "
+                "median=excluded.median,mad=excluded.mad,n=excluded.n,"
+                "updated_at=excluded.updated_at",
+                (scanner or "", fmt or "", genre or "", param_name,
+                 median, mad, n, time.time()),
+            )
+            self.conn.commit()
+
+    def get_bucket_param(self, scanner, fmt, genre, param_name: str):
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT median,mad,n FROM bucket_profile WHERE scanner=? AND "
+                "fmt=? AND genre=? AND param_name=?",
+                (scanner or "", fmt or "", genre or "", param_name)).fetchone()
+        return (row["median"], row["mad"], row["n"]) if row else None
 
 
 def _page_to_dict(params: PageParams) -> dict:
