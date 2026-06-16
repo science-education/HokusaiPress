@@ -247,6 +247,8 @@ def _save_profile(store, doc_id: str, result) -> None:
     heights = [o.shape[0] for o in result.originals]
     pfeats, rfeats = profile_mod.extract_features(pages, widths, heights)
     bp = profile_mod.aggregate(pfeats, rfeats, widths, heights)
+    front_end, body_end = profile_mod.segment_structure(
+        pfeats, bp.dominant_offset)
 
     rep = {i for i, p in enumerate(pages) if p.needs_review()}
     rep |= set(range(0, len(pages), 25))
@@ -257,7 +259,7 @@ def _save_profile(store, doc_id: str, result) -> None:
                     binding=bp.binding, source="scan")
     store.save_page_features(doc_id, pfeats)
     store.save_region_features(doc_id, rep_rfeats)
-    store.save_scan_profile(doc_id, None, None, None, bp.page_count,
+    store.save_scan_profile(doc_id, None, front_end, body_end, bp.page_count,
                             bp.ocr_pages, _json.dumps(dataclasses.asdict(bp)))
 
 

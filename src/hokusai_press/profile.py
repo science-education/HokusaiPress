@@ -18,6 +18,9 @@ from typing import Callable, Optional
 from .model import Box, PageParams, Region, RegionKind  # noqa: F401
 
 
+STRUCT_GAP = 3
+
+
 @dataclasses.dataclass(frozen=True)
 class RobustStat:
     median: float
@@ -48,6 +51,55 @@ class PageFeature:
     nombre_cx: Optional[float]   # normalized center
     nombre_cy: Optional[float]
     blank: bool
+
+
+def segment_structure(
+    page_features: list[PageFeature],
+    dominant_offset: Optional[int],
+) -> tuple[Optional[int], Optional[int]]:
+    """Return the first and last body page_index values.
+
+    The body is the longest run, in page_index order, whose numbered pages have
+    the dominant offset. Interior unnumbered pages are tolerated however many
+    (page-number OCR is often sparse mid-body) -- only a run of pages carrying a
+    DIFFERENT numbering offset (a new section / back matter) breaks the body, and
+    then only once STRUCT_GAP such pages accumulate, so a lone stray misread
+    cannot split it. Trailing unnumbered pages fall outside [front_end, body_end]
+    and are reported as back matter by the caller.
+    """
+    if dominant_offset is None:
+        return None, None
+
+    best: tuple[int, int, int] | None = None
+    current: tuple[int, int, int] | None = None
+    off_gap = 0
+
+    def finish_run() -> None:
+        nonlocal best, current, off_gap
+        if current is not None and (best is None or current[2] > best[2]):
+            best = current
+        current = None
+        off_gap = 0
+
+    for pf in sorted(page_features, key=lambda item: item.page_index):
+        if pf.nombre_value is None:
+            continue                       # undetected nombre never breaks a run
+        offset = pf.nombre_value - pf.page_index
+        if offset == dominant_offset:
+            if current is None:
+                current = (pf.page_index, pf.page_index, 1)
+            else:
+                current = (current[0], pf.page_index, current[2] + 1)
+            off_gap = 0
+        elif current is not None:
+            off_gap += 1                   # a different numbering region
+            if off_gap >= STRUCT_GAP:
+                finish_run()
+
+    finish_run()
+    if best is None:
+        return None, None
+    return best[0], best[1]
 
 
 @dataclasses.dataclass(frozen=True)

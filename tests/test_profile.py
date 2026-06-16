@@ -2,7 +2,7 @@ from hokusai_press.model import (
     Box, Deskew, Margin, PageParams, Region, RegionKind, SourceRef,
 )
 from hokusai_press import profile
-from hokusai_press.profile import ScopeKey, BookProfile
+from hokusai_press.profile import ScopeKey, BookProfile, PageFeature
 
 
 def _page(idx, *, page_number=None, content=(100, 100, 900, 900),
@@ -50,6 +50,44 @@ def test_aggregate_offset_and_class_density():
     assert bp.ocr_pages == 6 and bp.page_count == 6
     assert abs(bp.class_density["text"] - 1.0) < 1e-9
     assert bp.size_h.median == 1400.0
+
+
+def _feature(idx, nombre_value):
+    return PageFeature(
+        page_index=idx,
+        is_ocr=True,
+        region_count=1,
+        deskew_angle=0.0,
+        deskew_conf=5.0,
+        content_w=0.8,
+        content_h=0.8,
+        nombre_value=nombre_value,
+        nombre_cx=0.5,
+        nombre_cy=0.95,
+        blank=False,
+    )
+
+
+def test_segment_structure_roman_front_body_and_back_matter():
+    feats = [_feature(i, None) for i in range(5)]
+    feats += [_feature(i, i + 1) for i in range(5, 15)]
+    feats += [_feature(i, i + 20) for i in range(15, 19)]
+
+    assert profile.segment_structure(feats, 1) == (5, 14)
+
+
+def test_segment_structure_tolerates_interior_plate_gap():
+    feats = [_feature(i, i + 1) for i in range(4)]
+    feats += [_feature(i, None) for i in range(4, 7)]
+    feats += [_feature(i, i + 1) for i in range(7, 11)]
+
+    assert profile.segment_structure(feats, 1) == (0, 10)
+
+
+def test_segment_structure_none_offset_returns_none_boundaries():
+    feats = [_feature(i, i + 1) for i in range(3)]
+
+    assert profile.segment_structure(feats, None) == (None, None)
 
 
 def test_backoff_keys_full_partial_global():
