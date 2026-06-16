@@ -116,6 +116,44 @@ class BookProfile:
     content_h: Optional[RobustStat]
     dominant_offset: Optional[int]
     class_density: dict
+    writing_dir: str = "unknown"   # vertical(縦書き) | horizontal(横書き) | unknown
+    binding: str = "unknown"       # right(右綴じ) | left(左綴じ) | top(上綴じ) | unknown
+
+
+def detect_writing_direction(region_features: list[RegionFeature]) -> str:
+    """vertical(縦書き)/horizontal(横書き) from text-line shape: a tategaki line
+    is a tall narrow column (h>w), a yokogaki line is wide (w>h)."""
+    ar = [(r.y1 - r.y0) / (r.x1 - r.x0)
+          for r in region_features
+          if r.cls == "text" and r.x1 > r.x0 and r.y1 > r.y0]
+    if len(ar) < 5:
+        return "unknown"
+    med = statistics.median(ar)
+    if med > 1.2:
+        return "vertical"
+    if med < 0.8:
+        return "horizontal"
+    return "unknown"
+
+
+def detect_binding(page_features: list[PageFeature], writing_dir: str) -> str:
+    """right(右綴じ)/left(左綴じ) binding. The page-number's outer corner
+    alternates by leaf, so the even-index side reveals the turning direction:
+    even nombre on the LEFT => right binding (right-to-left, typical 縦書き).
+    Falls back to the writing-direction default when nombre data is sparse."""
+    even = [pf.nombre_cx for pf in page_features
+            if pf.nombre_cx is not None and pf.page_index % 2 == 0]
+    odd = [pf.nombre_cx for pf in page_features
+           if pf.nombre_cx is not None and pf.page_index % 2 == 1]
+    if len(even) >= 3 and len(odd) >= 3:
+        e, o = statistics.median(even), statistics.median(odd)
+        if abs(e - o) > 0.2:
+            return "right" if e < o else "left"
+    if writing_dir == "vertical":
+        return "right"
+    if writing_dir == "horizontal":
+        return "left"
+    return "unknown"
 
 
 def aggregate(
@@ -130,6 +168,7 @@ def aggregate(
     counts = Counter(rf.cls for rf in region_features)
     density = ({cls: c / page_count for cls, c in counts.items()}
                if page_count > 0 else {})
+    writing_dir = detect_writing_direction(region_features)
     return BookProfile(
         page_count=page_count,
         ocr_pages=sum(1 for pf in page_features if pf.is_ocr),
@@ -141,6 +180,8 @@ def aggregate(
         dominant_offset=(Counter(offsets).most_common(1)[0][0]
                          if offsets else None),
         class_density=density,
+        writing_dir=writing_dir,
+        binding=detect_binding(page_features, writing_dir),
     )
 
 

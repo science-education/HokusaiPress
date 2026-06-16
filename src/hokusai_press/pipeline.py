@@ -253,6 +253,8 @@ def _save_profile(store, doc_id: str, result) -> None:
     rep_pidx = {pages[i].source.page_index for i in rep}
     rep_rfeats = [rf for rf in rfeats if rf.page_index in rep_pidx]
 
+    store.save_book(doc_id, title=doc_id, writing_dir=bp.writing_dir,
+                    binding=bp.binding, source="scan")
     store.save_page_features(doc_id, pfeats)
     store.save_region_features(doc_id, rep_rfeats)
     store.save_scan_profile(doc_id, None, None, None, bp.page_count,

@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS book (
     year        INTEGER,
     ndc         TEXT,
     fmt         TEXT,
+    writing_dir TEXT,
+    binding     TEXT,
     source      TEXT,
     confidence  REAL,
     resolved_at REAL
@@ -246,18 +248,21 @@ class Store:
 
     def save_book(self, book_id: str, *, isbn=None, title=None, author=None,
                   publisher=None, year=None, ndc=None, fmt=None,
+                  writing_dir=None, binding=None,
                   source=None, confidence=None) -> None:
         with self._lock:
             self.conn.execute(
                 "INSERT INTO book(book_id,isbn,title,author,publisher,year,ndc,"
-                "fmt,source,confidence,resolved_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                "fmt,writing_dir,binding,source,confidence,resolved_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(book_id) DO UPDATE SET isbn=excluded.isbn,"
                 "title=excluded.title,author=excluded.author,"
                 "publisher=excluded.publisher,year=excluded.year,ndc=excluded.ndc,"
-                "fmt=excluded.fmt,source=excluded.source,"
+                "fmt=excluded.fmt,writing_dir=excluded.writing_dir,"
+                "binding=excluded.binding,source=excluded.source,"
                 "confidence=excluded.confidence,resolved_at=excluded.resolved_at",
                 (book_id, isbn, title, author, publisher, year, ndc, fmt,
-                 source, confidence, time.time()),
+                 writing_dir, binding, source, confidence, time.time()),
             )
             self.conn.commit()
 

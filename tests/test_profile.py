@@ -83,3 +83,28 @@ def test_resolve_profile_picks_finest_then_backs_off():
 
 def test_resolve_profile_none_when_empty():
     assert profile.resolve_profile(ScopeKey("X"), lambda k: None, 1) is None
+
+
+def test_detect_writing_direction_and_binding():
+    from hokusai_press.profile import (
+        PageFeature, RegionFeature, detect_binding, detect_writing_direction,
+    )
+    tall = [RegionFeature(0, "text", 0.1, 0.1, 0.2, 0.9, None, "dbnet")
+            for _ in range(6)]                       # h/w = 8 -> vertical
+    wide = [RegionFeature(0, "text", 0.1, 0.1, 0.9, 0.15, None, "dbnet")
+            for _ in range(6)]                       # h/w = 0.06 -> horizontal
+    assert detect_writing_direction(tall) == "vertical"
+    assert detect_writing_direction(wide) == "horizontal"
+    assert detect_writing_direction([]) == "unknown"
+
+    def pages(even_left: bool):
+        out = []
+        for i in range(8):
+            left = (i % 2 == 0) == even_left
+            cx = 0.08 if left else 0.9
+            out.append(PageFeature(i, True, 1, 0.0, 5.0, 0.8, 0.8, i + 1,
+                                   cx, 0.95, False))
+        return out
+
+    assert detect_binding(pages(even_left=True), "vertical") == "right"
+    assert detect_binding(pages(even_left=False), "horizontal") == "left"
