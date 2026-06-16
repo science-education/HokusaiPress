@@ -89,6 +89,22 @@ def test_resolve_unnumbered_front_matter_stays_none():
     assert [p.page_number for p in pages[3:]] == list(range(1, 9))
 
 
+def test_fused_header_digits_recovered():
+    from hokusai_press.model import Box, Region, RegionKind
+    from hokusai_press.nombre import _fused_digit_candidates
+
+    # page number fused with the running header into one region
+    r = Region(kind=RegionKind.TEXT, box=Box(100, 80, 700, 130),
+               ocr_text="112第3部")
+    cands = _fused_digit_candidates(r, 1000)
+    assert 112 in [v for v, _ in cands]
+    sub = next(b for v, b in cands if v == 112)
+    assert sub.x0 == 100 and sub.x1 < 700      # sub-box hugs the left edge
+    # a region with no edge digits yields nothing
+    r2 = Region(kind=RegionKind.TEXT, box=Box(0, 0, 100, 20), ocr_text="第6章")
+    assert _fused_digit_candidates(r2, 1000) == []
+
+
 def test_resolve_roman_front_matter_then_arabic_body():
     roman = ["i", "ii", "iii", "iv", "v"]
     pages = [_page(i, text=roman[i]) for i in range(5)]

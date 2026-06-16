@@ -24,6 +24,7 @@ Runs only when OCR produced text; with --no-ocr the geometric box stands.
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from dataclasses import dataclass
 from statistics import median
@@ -113,6 +114,40 @@ def _band(box: Box, page_h: float) -> Optional[str]:
     return None
 
 
+_LEAD_DIGITS = re.compile(r"^\s*([0-9０-９]{1,6})")
+_TRAIL_DIGITS = re.compile(r"([0-9０-９]{1,6})\s*$")
+
+
+def _fused_digit_candidates(r: Region, page_h: float):
+    """A page number is often OCR'd fused with the running header into one region
+    ('112第3部'). Recover a leading and/or trailing digit run as its own
+    candidate, with a sub-box at the matching end so the position model still
+    sees a corner-anchored nombre. The downstream position + primary-cluster gate
+    rejects the chapter/figure digits this also picks up, so being liberal here
+    is safe."""
+    text = r.ocr_text or ""
+    w = r.box.width
+    n = len(text)
+    if n == 0 or w <= 0:
+        return []
+    out = []
+    m = _LEAD_DIGITS.match(text)
+    if m:
+        v = parse_numeral(m.group(1))
+        if v and v > 0:
+            frac = len(m.group(0)) / n
+            sub = Box(r.box.x0, r.box.y0, r.box.x0 + w * frac, r.box.y1)
+            out.append((v, sub))
+    m = _TRAIL_DIGITS.search(text)
+    if m:
+        v = parse_numeral(m.group(1))
+        if v and v > 0:
+            frac = len(m.group(1)) / n
+            sub = Box(r.box.x1 - w * frac, r.box.y0, r.box.x1, r.box.y1)
+            out.append((v, sub))
+    return out
+
+
 def _candidates(params: PageParams, page_h: float):
     """(band, kind, value, region) for numeric tokens in a margin band.
 
@@ -134,6 +169,11 @@ def _candidates(params: PageParams, page_h: float):
         rv = parse_roman(r.ocr_text)
         if rv is not None and rv > 0:
             out.append((b, "roman", rv, r))
+            continue
+        # number fused with the running header ('112第3部'): recover the digits
+        for v, sub in _fused_digit_candidates(r, page_h):
+            out.append((b, "num", v, Region(kind=r.kind, box=sub,
+                                            ocr_text=str(v), source=r.source)))
     return out
 
 
