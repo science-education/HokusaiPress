@@ -37,12 +37,14 @@ class MrcPageBuilder:
         self._pages: list[dict] = []
 
     def add_page(self, out_bgr: np.ndarray, lines: list,
-                 photo_boxes_px: list, mode: str) -> None:
+                 photo_boxes_px: list, mode: str,
+                 vector_fills: list | None = None) -> None:
         from hybrid_ocr.pdf_export import encode_page_pdf
 
         from .render import binarize_bw
 
         h, w = out_bgr.shape[:2]
+        vector_fills = vector_fills or []
         if mode in ("gray", "color"):
             base_pdf = encode_page_pdf(out_bgr, mode, self.compress)
             overlays = []
@@ -70,10 +72,28 @@ class MrcPageBuilder:
                     "pdf": encode_page_pdf(ds, cmode, self.compress),
                     "rect": (x0i, h - y1i, x1i, h - y0i),  # PDF y-up
                 })
+            for fill in vector_fills:
+                x0, y0, x1, y1 = fill["rect"]
+                x0i, y0i = max(0, int(x0)), max(0, int(y0))
+                x1i, y1i = min(w, int(x1)), min(h, int(y1))
+                if x1i - x0i < 1 or y1i - y0i < 1:
+                    continue
+                crop = out_bgr[y0i:y1i, x0i:x1i]
+                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                ink = gray < max(0, int(round(fill["gray"] * 255)) - 50)
+                binary[y0i:y1i, x0i:x1i] = 255
+                region = binary[y0i:y1i, x0i:x1i]
+                region[ink] = 0
             base_pdf = encode_page_pdf(binary, "bw", self.compress)
 
-        self._pages.append({"base": base_pdf, "overlays": overlays,
-                            "w": w, "h": h, "lines": lines})
+        self._pages.append({
+            "base": base_pdf,
+            "overlays": overlays,
+            "vector_fills": vector_fills,
+            "w": w,
+            "h": h,
+            "lines": lines,
+        })
 
     def save(self, output_path: str) -> None:
         import pikepdf
@@ -95,14 +115,19 @@ class MrcPageBuilder:
                 sources.append(base)
                 out.pages.extend(base.pages)
                 dest = out.pages[-1]
-                for ov in page["overlays"]:
+                for j, ov in enumerate(page["overlays"]):
                     ovpdf = pikepdf.open(BytesIO(ov["pdf"]))
                     sources.append(ovpdf)
-                    pikepdf.Page(dest).add_overlay(
-                        ovpdf.pages[0], pikepdf.Rectangle(*ov["rect"])
+                    _add_overlay_named(
+                        dest,
+                        ovpdf.pages[0],
+                        pikepdf.Rectangle(*ov["rect"]),
+                        f"/HPPhoto{i}_{j}",
                     )
-                pikepdf.Page(dest).add_overlay(text_pdf.pages[i])
-            out.save(output_path)
+                if page["vector_fills"]:
+                    _add_vector_fills(out, dest, page["vector_fills"], page["h"])
+                _add_overlay_named(dest, text_pdf.pages[i], None, f"/HPText{i}")
+            out.save(output_path, deterministic_id=True)
         finally:
             for s in sources:
                 s.close()
@@ -112,3 +137,42 @@ def _is_grayish(bgr: np.ndarray) -> bool:
     lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
     chroma = lab[..., 1].astype(np.float32).std() + lab[..., 2].astype(np.float32).std()
     return chroma <= 16.0
+
+
+def _add_overlay_named(dest, overlay_page, rect, name: str) -> None:
+    import pikepdf
+
+    page = pikepdf.Page(dest)
+    form = pikepdf.Page(overlay_page).as_form_xobject()
+    placed = page.add_resource(form, pikepdf.Name.XObject, name=pikepdf.Name(name))
+    if rect is None:
+        rect = pikepdf.Rectangle(page.trimbox)
+    content = page.calc_form_xobject_placement(
+        form, placed, rect, allow_shrink=True, allow_expand=True
+    )
+    page.contents_add(b"q\n", prepend=True)
+    page.contents_add(b"Q\n", prepend=False)
+    page.contents_add(content, prepend=False)
+    page.contents_coalesce()
+
+
+def _add_vector_fills(pdf, page, vector_fills: list, page_h_px: int) -> None:
+    import pikepdf
+
+    from .vecfill import fill_rect_ops, px_to_pt
+
+    resources = page.Resources
+    if "/ExtGState" not in resources:
+        resources.ExtGState = pikepdf.Dictionary()
+    resources.ExtGState[pikepdf.Name("/HPVecFillMultiply")] = pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/ExtGState"),
+        "/BM": pikepdf.Name("/Multiply"),
+    })
+
+    scale = px_to_pt(1, 72)
+    parts = [b"q /HPVecFillMultiply gs\n"]
+    for fill in vector_fills:
+        x0, y0, x1, y1 = fill["rect"]
+        parts.append(fill_rect_ops(x0, y0, x1, y1, fill["gray"], page_h_px, scale))
+    parts.append(b"Q\n")
+    pikepdf.Page(page).contents_add(pikepdf.Stream(pdf, b"".join(parts)))

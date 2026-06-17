@@ -142,12 +142,45 @@ def render_page_image(
     return out, lines, mode, photo_boxes
 
 
+def _figure_vecfills(
+    out_bgr: np.ndarray,
+    params: PageParams,
+    settings: RenderSettings,
+    original_shape: tuple[int, int],
+) -> list[dict]:
+    """Return vector fills for solid FIGURE regions in rendered pixel space."""
+    from .region_class import classify_patch
+
+    M, _, _ = compose_transform(original_shape, params, settings)
+    h, w = out_bgr.shape[:2]
+    fills = []
+    for r in params.regions:
+        if r.kind != RegionKind.FIGURE:
+            continue
+        b = _map_box(r.box, M)
+        x0i = max(0, min(w, int(round(min(b.x0, b.x1)))))
+        y0i = max(0, min(h, int(round(min(b.y0, b.y1)))))
+        x1i = max(0, min(w, int(round(max(b.x0, b.x1)))))
+        y1i = max(0, min(h, int(round(max(b.y0, b.y1)))))
+        if x1i - x0i < 4 or y1i - y0i < 4:
+            continue
+        patch = out_bgr[y0i:y1i, x0i:x1i]
+        if classify_patch(patch) != "solid_fill":
+            continue
+        gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+        # Median is stable under small antialiasing or scan noise at the edge.
+        tone = float(np.median(gray)) / 255.0
+        fills.append({"rect": (x0i, y0i, x1i, y1i), "gray": tone})
+    return fills
+
+
 def binarize_bw(bgr: np.ndarray) -> np.ndarray:
-    """{0,255} single-channel bw layer. Threshold is clamped to an absolute ceil
-    (min(Otsu, INK_CEIL)) so faint show-through and soft shadow penumbra stay
-    white while text cores stay black -- Otsu alone turns them black on near-blank
-    ADF pages. HokusaiPress owns its output binarization (the OCR side keeps its
-    own global-Otsu binarize for recognition)."""
+    """{0,255} single-channel bw layer. Threshold is Otsu (the real ink/paper
+    valley, kept as is so light strokes survive); only on a degenerate near-blank
+    page -- high Otsu with no genuinely dark pixels -- does ink_threshold drop to a
+    floor so show-through / shadow penumbra stay white instead of turning black
+    (see geometry.margin.ink_threshold). HokusaiPress owns its output binarization
+    (the OCR side keeps its own global-Otsu binarize for recognition)."""
     from .geometry.margin import ink_threshold
 
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
@@ -212,7 +245,8 @@ def build_pdf(
         out_bgr, lines, mode, photo_boxes = render_page_image(
             original, params, document.render
         )
-        builder.add_page(out_bgr, lines, photo_boxes, mode)
+        vecfills = _figure_vecfills(out_bgr, params, document.render, original.shape)
+        builder.add_page(out_bgr, lines, photo_boxes, mode, vecfills)
     builder.save(out_path)
     _set_physical_page_size(out_path, document.render.target_dpi)
     return out_path
@@ -237,4 +271,4 @@ def _set_physical_page_size(pdf_path: str, dpi: int) -> None:
             )
             pg.contents_add(pikepdf.Stream(pdf, b"Q"), prepend=False)
             page.MediaBox = [0, 0, round(w_px * s, 3), round(h_px * s, 3)]
-        pdf.save()
+        pdf.save(deterministic_id=True)
