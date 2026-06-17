@@ -51,10 +51,12 @@ def analyze_document(
     path: str,
     model_dir: str = "models",
     device: str = "auto",
+    ocr_engine: str = "hybrid",
     use_ocr: bool = True,
     learned_model: Optional[dict] = None,
     layout_provider=None,
     openvino_cache_dir: Optional[str] = None,
+    paddle_engine: str | None = "paddle",
     pages: "set[int] | None" = None,
 ) -> AnalyzeResult:
     from .source import load_page
@@ -83,8 +85,9 @@ def analyze_document(
         t = perf_counter()
         regions, cflags = content_mod.analyze(
             original, ocr_up, source, model_dir=model_dir,
-            device=device, use_ocr=use_ocr, layout_provider=layout_provider,
-            openvino_cache_dir=openvino_cache_dir,
+            device=device, ocr_engine=ocr_engine, use_ocr=use_ocr,
+            layout_provider=layout_provider, openvino_cache_dir=openvino_cache_dir,
+            paddle_engine=paddle_engine,
         )
         prof["ocr"] += perf_counter() - t
 
@@ -189,9 +192,11 @@ def run(
     db_path: str = "hokusai.db",
     model_dir: str = "models",
     device: str = "auto",
+    ocr_engine: str = "hybrid",
     use_ocr: bool = True,
     learned_model_path: Optional[str] = None,
     openvino_cache_dir: Optional[str] = None,
+    paddle_engine: str | None = "paddle",
     pages: "set[int] | None" = None,
 ) -> dict:
     """Full batch run: analyze, persist params, render the PDF."""
@@ -200,8 +205,10 @@ def run(
 
     learned = learn.load(learned_model_path) if learned_model_path else None
     result = analyze_document(path, model_dir=model_dir, device=device,
-                              use_ocr=use_ocr, learned_model=learned,
-                              openvino_cache_dir=openvino_cache_dir, pages=pages)
+                              ocr_engine=ocr_engine, use_ocr=use_ocr,
+                              learned_model=learned,
+                              openvino_cache_dir=openvino_cache_dir,
+                              paddle_engine=paddle_engine, pages=pages)
     doc_id = os.path.basename(path)
     t = perf_counter()
     store = Store(db_path)

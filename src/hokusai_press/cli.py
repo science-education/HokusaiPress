@@ -77,8 +77,10 @@ def _run_one(payload: dict) -> dict:
     summary = run(
         payload["src"], payload["out"], db_path=payload["db"],
         model_dir=payload["model_dir"], device=payload["device"],
-        use_ocr=payload["use_ocr"], learned_model_path=payload["learned_model"],
-        openvino_cache_dir=payload["cache"], pages=payload["pages"],
+        ocr_engine=payload["ocr_engine"], use_ocr=payload["use_ocr"],
+        learned_model_path=payload["learned_model"],
+        openvino_cache_dir=payload["cache"],
+        paddle_engine=payload["paddle_engine"], pages=payload["pages"],
     )
     summary["tpb"] = time.perf_counter() - t0
     return summary
@@ -143,8 +145,19 @@ def main(argv=None) -> int:
                        help="output PDF path, or a folder (saves <source>.pdf)")
     p_run.add_argument("--db", default="hokusai.db", help="job/decision SQLite db")
     p_run.add_argument("--model-dir", default="models", help="hybrid-ocr model dir")
+    p_run.add_argument("--ocr-engine", default="hybrid",
+                       choices=["auto", "hybrid", "yomitoku", "ndlocr",
+                                "ppocr-v6", "paddleocr-v6",
+                                "paddle-vl", "paddleocr-vl"],
+                       help="OCR engine: hybrid/Yomitoku-NDLOCR, PP-OCRv6, or "
+                            "PaddleOCR-VL-1.6 document parser")
     p_run.add_argument("--device", default="auto",
-                       help="OCR device: auto|cpu|npu|cuda|dml|qnn")
+                       help="OCR device. hybrid: auto|cpu|npu|cuda|dml|qnn; "
+                            "Paddle: cpu|gpu|npu[:0]|xpu[:0]|... as supported "
+                            "by the installed Paddle runtime")
+    p_run.add_argument("--paddle-engine", default="paddle",
+                       choices=["paddle", "transformers"],
+                       help="PaddleOCR backend for ppocr-v6/paddle-vl")
     p_run.add_argument("--no-ocr", action="store_true",
                        help="skip OCR (geometry + heuristic separation only)")
     p_run.add_argument("--learned-model", default=None,
@@ -200,8 +213,10 @@ def main(argv=None) -> int:
             return {
                 "src": src, "out": _resolve_out(args.out, src), "db": db,
                 "model_dir": args.model_dir, "device": args.device,
+                "ocr_engine": args.ocr_engine,
                 "use_ocr": not args.no_ocr, "learned_model": args.learned_model,
-                "cache": args.openvino_cache_dir, "pages": pages_sel,
+                "cache": args.openvino_cache_dir,
+                "paddle_engine": args.paddle_engine, "pages": pages_sel,
             }
 
         flagged_docs = 0

@@ -25,9 +25,6 @@ SourceRef.ocr_scale).
 
 from __future__ import annotations
 
-import os
-import threading
-
 import cv2
 import numpy as np
 
@@ -41,44 +38,17 @@ LOW_COVERAGE_FRAC = 0.3    # text+figure covers < 30% of ink -> flag for review.
 # even on clean dense pages (boxes are tight), so 0.5 flagged the median page.
 # At 0.3 only genuine outliers (OCR truly missed most text) reach the queue.
 
-_ocr_engine = None
-_engine_lock = threading.Lock()   # one NPU/OCR engine shared across worker threads
-
-
-def _get_ocr_engine(model_dir: str, device: str, openvino_cache_dir=None):
-    global _ocr_engine
-    if _ocr_engine is not None:
-        return _ocr_engine
-    # double-checked under a lock so concurrent worker threads build (and NPU-
-    # compile) the engine exactly once and then share that single context;
-    # HybridOCR.__call__ only reads shared state + ORT run(), so concurrent calls
-    # are safe and the device serializes the actual inference.
-    with _engine_lock:
-        if _ocr_engine is None:
-            from hybrid_ocr.pipeline import HybridOCR  # lazy, optional dependency
-
-            # auto-resolve the model dir (the default "models" is relative and
-            # usually absent from the cwd): fall back to hybrid-ocr's resolver.
-            if not os.path.isdir(model_dir):
-                try:
-                    from hybrid_ocr.cli import resolve_model_dir
-                    model_dir = resolve_model_dir(None)
-                except Exception:
-                    pass
-            _ocr_engine = HybridOCR(model_dir=model_dir, device=device,
-                                    openvino_cache_dir=openvino_cache_dir)
-    return _ocr_engine
-
-
 def analyze(
     original_bgr: np.ndarray,
     ocr_bgr: np.ndarray,
     source: SourceRef,
     model_dir: str = "models",
     device: str = "auto",
+    ocr_engine: str = "hybrid",
     use_ocr: bool = True,
     layout_provider=None,
     openvino_cache_dir=None,
+    paddle_engine: str | None = "paddle",
 ) -> tuple[list[Region], list[Flag]]:
     from .geometry.margin import remove_edge_shadows
 
@@ -91,11 +61,20 @@ def analyze(
 
     text_mask = None
     engine = None
+    layout_boxes_px: list[tuple] = []
     if use_ocr:
         try:
-            engine = _get_ocr_engine(model_dir, device, openvino_cache_dir)
+            from .ocr import get_ocr_engine
+
+            engine = get_ocr_engine(
+                ocr_engine,
+                model_dir,
+                device,
+                openvino_cache_dir,
+                paddle_engine,
+            )
         except ImportError:
-            # hybrid-ocr not installed: geometry-only is a supported mode
+            # optional OCR engine not installed: geometry-only is a supported mode
             use_ocr = False
         # NOTE: any other construction error (e.g. the requested device's
         # onnxruntime provider is missing, or models can't be found) is NOT
@@ -109,7 +88,8 @@ def analyze(
             flags.append(Flag.OCR_FAILED)   # tolerate a single bad page
         if result is not None:
             text_mask = np.zeros(ocr_bgr.shape[:2], dtype=np.uint8)
-            for ln in result["lines"]:
+            lines = result.get("lines", [])
+            for ln in lines:
                 poly = np.array(ln["polygon"], dtype=np.int32)
                 cv2.fillPoly(text_mask, [poly], 1)
                 x0, y0, x1, y1 = ln["box"]
@@ -118,16 +98,28 @@ def analyze(
                         kind=RegionKind.TEXT,
                         box=Box(x0 * inv_scale, y0 * inv_scale,
                                 x1 * inv_scale, y1 * inv_scale),
-                        source="dbnet",
+                        source=ln.get("source", "dbnet"),
                         ocr_text=ln.get("text") or None,
                         ocr_conf=ln.get("det_score"),
                     )
                 )
-            if not result["lines"]:
+            if not lines:
                 flags.append(Flag.NO_TEXT)
+            for lb in result.get("layout_boxes", []):
+                x0, y0, x1, y1 = [int(v) for v in lb["box"]]
+                if x1 - x0 < 4 or y1 - y0 < 4:
+                    continue
+                layout_boxes_px.append((x0, y0, x1, y1))
+                crop = ocr_bgr[max(0, y0):y1, max(0, x0):x1]
+                kind = RegionKind.PHOTO if _is_continuous_tone(crop) else RegionKind.FIGURE
+                regions.append(Region(
+                    kind=kind,
+                    box=Box(x0 * inv_scale, y0 * inv_scale,
+                            x1 * inv_scale, y1 * inv_scale),
+                    source=lb.get("source", ocr_engine),
+                ))
 
     # layout-model figure/photo regions (optional, e.g. RT-DETRv2)
-    layout_boxes_px: list[tuple] = []
     if layout_provider is not None:
         try:
             for b in layout_provider.figures(ocr_bgr):

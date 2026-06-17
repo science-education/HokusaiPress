@@ -20,6 +20,9 @@ dependencies = [
 # OCR + searchable-PDF assembly engine (detector is CC BY-NC-SA 4.0 -> output
 # is non-commercial; see README).
 ocr = ["hybrid-ocr"]
+# PaddleOCR engines are optional because their runtime and accelerator wheels
+# vary by hardware. PaddleOCR-VL needs the doc-parser extra.
+paddle = ["paddleocr", "paddleocr[doc-parser]"]
 # Review web UI.
 web = ["fastapi", "uvicorn", "pydantic"]
 dev = ["pytest"]
