@@ -44,10 +44,15 @@ Start-Process -WindowStyle Hidden -FilePath $py -ArgumentList "-m","hokusai_pres
   - `remove_edge_shadows`(margin.py, 成分ベース) を元画像ワープ前に適用（検出/deskew/OCR/描画 全部影フリー）
   - **margin fill**: render で内容枠の外を白化（ADF の細い縁線を確実に除去）。背景正規化/Sauvola は
     ADF に不適なので不採用（照明むら無し・大濃部を洗い流す害がある、と実測で確認）
-- **二値化クランプ**（裏移り・影 penumbra の根本対策）: `ink_threshold = min(Otsu, INK_CEIL=130)`。
-  Otsu はブランク頁で高閾値(~250)を出し裏移り/影を黒化する → 絶対上限でクランプ。`binarize_bw`(render)
-  を mrc/preview で使用（OCR側 hybrid_ocr.binarize は触らない）。`remove_edge_shadows` と content の
-  残差写真検出も同じ ink_threshold に統一。
+- **二値化（裏移り・影 penumbra 対策, 2026-06-15 再校正）**: `ink_threshold` は **Otsu をそのまま使う**。
+  当初の `min(Otsu, INK_CEIL=130)` は誤りだった — このADFの実文字は ~130-218 のグレー帯にあり(純黒<100は
+  ごく僅か)、130 にクランプすると内容頁でインクの **38-53%** を白に落とし**全頁かすれ＋影成分を見落とす**。
+  Otsu が信用できないのは degenerate な near-blank 頁(裏移りのみで実インク無し→Otsu が ~250 へ暴走)だけ。
+  そこで **2信号で degenerate を判定**: `Otsu > INK_VALLEY_MAX(225)` かつ `<INK_FLOOR(110) の画素 < 0.1%`
+  のときだけ閾値を `INK_FLOOR=110` に落として裏移りを棄却（blank ゲートが回収）。実測970頁: 実頁は Otsu≤218
+  で純黒画素≥1%、裏移り頁(0423 p2 / 0005 p2)のみ Otsu~250・純黒0.000% という明確な2信号分離。`binarize_bw`
+  (render)を mrc/preview で使用（OCR側 hybrid_ocr.binarize は触らない）。`remove_edge_shadows` と content の
+  残差写真検出も同じ ink_threshold に統一（Otsu に戻したことで中間グレーの影も成分として拾える）。
 - **OCRゲート blank 白化**: `PageParams.blank`。`use_ocr かつ 内容領域0 かつ クランプ残インク<0.1%` で
   白紙出力。use_ocr ゲート＋残インク照合で、疎な実1行(p56)や `--no-ocr` を消さない。
 - **内容枠** = インク枠 ∪ 検出領域（写真を必ず含む）。面積<12% は検出失敗→全面+MARGIN_NOT_FOUND。
@@ -76,7 +81,7 @@ Start-Process -WindowStyle Hidden -FilePath $py -ArgumentList "-m","hokusai_pres
 |---|---|---|
 | A | **deskew 過剰フラグ**。img0423 は**横書き**で p207 以外の傾きは適正。信頼度メトリックが密頁で過剰 | 0423 の deskew_low_confidence 18件（p207 のみ実問題） |
 | B | **0010 p9 傾き補正失敗**（実際に角度がずれている）＋影 | 0010 p9 |
-| C | **検出失敗フォールバックを「全面−細縁帯」に**（content=全面だと margin fill が効かず影が残る） | margin_not_found の一部 |
+| C | **検出失敗フォールバックを「全面−細縁帯」に**（content=全面だと margin fill が効かず影が残る）。**near-blank 頁で分断された綴じ目縦線が残る**（remove_edge_shadows の単一成分≥半辺ルールが分断線を拾えない。旧クランプ@130 は本文ごと消すことで偶然隠していた→Otsu 復帰で顕在化）。要：極端外側帯の列密度フィル or margin fill の確実化 | margin_not_found の一部, 0427_0001 disp13 |
 | D | **gap 判定を同一オフセットクラスタ内に限定**。p261 は誤検知（262 は正しい、p259 の「16」は別クラスタ） | 0423 p261, 0010 p9 |
 | E | **0423 p29 網掛け**: 紙面四辺の網を「次の領域まで」背景除去＋ノンブル残存 | 0423 p29 |
 
