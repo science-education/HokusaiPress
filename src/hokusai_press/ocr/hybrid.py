@@ -25,5 +25,28 @@ class HybridOCREngine:
     def __call__(self, image_bgr):
         result = self._engine(image_bgr)
         for line in result.get("lines", []):
-            line.setdefault("source", "dbnet")
+            line.setdefault("source", "ndlocr")
         return result
+
+
+class NdlocrTextEngine(HybridOCREngine):
+    def recognize_text(self, image_bgr):
+        return self(image_bgr).get("lines", [])
+
+
+class YomitokuLayoutEngine:
+    def __init__(self, device: str = "cpu"):
+        from hokusai_press.layout import YomitokuLayoutProvider
+
+        self._provider = YomitokuLayoutProvider(device=device)
+
+    def analyze_layout(self, image_bgr):
+        boxes = []
+        for box in self._provider.figures(image_bgr):
+            boxes.append({
+                "box": (box.x0, box.y0, box.x1, box.y1),
+                "label": "figure",
+                "score": None,
+                "source": "yomitoku",
+            })
+        return boxes

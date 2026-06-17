@@ -35,8 +35,8 @@
 ```bash
 pip install -e .[ocr,web]
 hokusai-press run scan.pdf --out book.pdf --device npu      # バッチ解析+生成
-hokusai-press run scan.pdf --out book.pdf --ocr-engine ppocr-v6 --device npu
-hokusai-press run scan.pdf --out book.pdf --ocr-engine paddle-vl --device npu
+hokusai-press run scan.pdf --out book.pdf --layout-engine pp-structurev3 --text-engine ppocr-v6 --runtime onnxruntime --device npu
+hokusai-press run scan.pdf --out book.pdf --layout-engine paddle-vl --text-engine ppocr-v6 --device npu
 hokusai-press queue                                          # 要レビュー一覧
 hokusai-press review                                         # レビューWeb UI
 hokusai-press rebuild scan.pdf --doc scan.pdf --out book.pdf  # 修正後に再生成
@@ -45,9 +45,10 @@ hokusai-press run scan.pdf --out book.pdf --learned-model model.json
 ```
 
 `--no-ocr` で OCR を省略し幾何処理＋ヒューリスティック分離のみでも動作します。
-OCR は既定の `hybrid`（Yomitoku/NDL-OCR-Lite 系）に加えて、`--ocr-engine`
-で `ppocr-v6`（PP-OCRv6）または `paddle-vl`（PaddleOCR-VL-1.6、レイアウト解析
-込み）を選択できます。Paddle 系は optional dependency です。
+OCR/レイアウトは `--layout-engine` と `--text-engine` で別々に選択できます。
+既定は既存互換の `yomitoku`（レイアウト）+ `ndlocr`（文字OCR）です。Paddle 系では
+`pp-structurev3` / `paddle-vl` をレイアウトに、`ppocr-v6` を文字OCRに選択できます。
+旧 `--ocr-engine` はまとめ指定の互換オプションとして残しています。
 
 レビュー UI はフラグ付きページのみを表示し、各ページの「解析オーバーレイ
 （傾き補正後＋内容枠＋領域分類＋ノンブル）」と「出力プレビュー」を並べて表示。

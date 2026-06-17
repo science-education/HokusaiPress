@@ -1,7 +1,7 @@
 import numpy as np
 
 from hokusai_press.content import analyze
-from hokusai_press.model import RegionKind, SourceRef
+from hokusai_press.model import Flag, RegionKind, SourceRef
 from hokusai_press.ocr.paddle import (
     normalize_paddle_ocr_result,
     normalize_paddle_vl_result,
@@ -99,7 +99,7 @@ def test_content_accepts_layout_boxes_from_ocr_engine(monkeypatch):
     grad = np.tile(np.linspace(0, 255, 200, dtype=np.uint8), (150, 1))
     img[200:350, 50:250] = np.dstack([grad, grad, grad])
 
-    regions, _ = analyze(
+    regions, flags = analyze(
         img, img, SourceRef(path="x", ocr_scale=1.0),
         use_ocr=True, ocr_engine="paddle-vl",
     )
@@ -107,3 +107,4 @@ def test_content_accepts_layout_boxes_from_ocr_engine(monkeypatch):
     assert regions[0].source == "paddle-vl"
     assert regions[0].kind == RegionKind.PHOTO
     assert regions[0].box.x0 == 50
+    assert Flag.OCR_LOW_COVERAGE not in flags

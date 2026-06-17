@@ -45,10 +45,12 @@ def analyze(
     model_dir: str = "models",
     device: str = "auto",
     ocr_engine: str = "hybrid",
+    layout_engine: str | None = None,
+    text_engine: str | None = None,
     use_ocr: bool = True,
     layout_provider=None,
     openvino_cache_dir=None,
-    paddle_engine: str | None = "paddle",
+    runtime: str | None = "paddle",
 ) -> tuple[list[Region], list[Flag]]:
     from .geometry.margin import remove_edge_shadows
 
@@ -71,7 +73,9 @@ def analyze(
                 model_dir,
                 device,
                 openvino_cache_dir,
-                paddle_engine,
+                runtime,
+                layout_engine=layout_engine,
+                text_engine=text_engine,
             )
         except ImportError:
             # optional OCR engine not installed: geometry-only is a supported mode
@@ -149,7 +153,7 @@ def analyze(
     residual = ink.copy()
     for (x0, y0, x1, y1) in layout_boxes_px:  # don't double-count layout figures
         residual[max(0, y0):y1, max(0, x0):x1] = 0
-    has_text = text_mask is not None and bool(regions)
+    has_text = text_mask is not None and any(r.kind == RegionKind.TEXT for r in regions)
     if text_mask is not None:
         dil = cv2.dilate(text_mask, np.ones((TEXT_DILATE_PX * 2 + 1,) * 2, np.uint8))
         residual[dil > 0] = 0

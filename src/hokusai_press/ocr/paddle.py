@@ -128,6 +128,11 @@ def _build(cls, kwargs: dict[str, Any]):
         ("engine", "device", "layout_detection_model_dir", "vl_rec_model_dir"),
         ("engine", "device", "layout_detection_model_dir", "vl_rec_model_dir",
          "layout_shape_mode"),
+        ("engine", "device", "text_detection_model_dir", "text_recognition_model_dir",
+         "layout_detection_model_dir", "vl_rec_model_dir", "layout_shape_mode"),
+        ("engine", "device", "text_detection_model_dir", "text_recognition_model_dir",
+         "layout_detection_model_dir", "vl_rec_model_dir", "layout_shape_mode",
+         "use_layout_detection"),
     ]
     last_error = None
     for drop in keys_to_drop:
@@ -283,6 +288,41 @@ class PPOCRv6Engine:
         with self._lock:
             return normalize_paddle_ocr_result(self._ocr.predict(image_bgr))
 
+    def recognize_text(self, image_bgr) -> list[OCRLine]:
+        return self(image_bgr).get("lines", [])
+
+
+class PPStructureV3LayoutEngine:
+    def __init__(self, model_dir: str | None = None, device: str = "auto",
+                 engine: str | None = "paddle"):
+        from paddleocr import PPStructureV3  # lazy, optional dependency
+
+        kwargs: dict[str, Any] = {
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
+            "use_layout_detection": True,
+            "layout_shape_mode": "rect",
+            "engine": engine,
+        }
+        paddle_device = _device_for_paddle(device)
+        if paddle_device:
+            kwargs["device"] = paddle_device
+        if model_dir:
+            kwargs["layout_detection_model_dir"] = model_dir
+        self._pipeline = _build(
+            PPStructureV3,
+            {k: v for k, v in kwargs.items() if v is not None},
+        )
+        self._lock = threading.Lock()
+
+    def analyze_layout(self, image_bgr) -> list[LayoutBox]:
+        with self._lock:
+            result = normalize_paddle_vl_result(
+                self._pipeline.predict(input=image_bgr),
+                source="pp-structurev3",
+            )
+        return result.get("layout_boxes", [])
+
 
 class PaddleOCRVLEngine:
     def __init__(self, model_dir: str | None = None, device: str = "auto",
@@ -312,3 +352,9 @@ class PaddleOCRVLEngine:
     def __call__(self, image_bgr) -> OCRResult:
         with self._lock:
             return normalize_paddle_vl_result(self._pipeline.predict(input=image_bgr))
+
+    def recognize_text(self, image_bgr) -> list[OCRLine]:
+        return self(image_bgr).get("lines", [])
+
+    def analyze_layout(self, image_bgr) -> list[LayoutBox]:
+        return self(image_bgr).get("layout_boxes", [])
