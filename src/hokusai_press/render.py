@@ -174,6 +174,30 @@ def _figure_vecfills(
     return fills
 
 
+def _overlaps_any(rect: tuple, fills: list[dict]) -> bool:
+    """True if rect shares >50% of its area with any existing fill."""
+    x0, y0, x1, y1 = rect
+    area = max(1, (x1 - x0) * (y1 - y0))
+    for f in fills:
+        fx0, fy0, fx1, fy1 = f["rect"]
+        ix = max(0, min(x1, fx1) - max(x0, fx0))
+        iy = max(0, min(y1, fy1) - max(y0, fy0))
+        if ix * iy > area * 0.5:
+            return True
+    return False
+
+
+def _raster_tint_fills(out_bgr: np.ndarray, existing: list[dict]) -> list[dict]:
+    """Detect tint panels from the raster and return fills not already covered."""
+    from .tint_panel import detect_tint_panels
+
+    new_fills = []
+    for fill in detect_tint_panels(out_bgr):
+        if not _overlaps_any(fill["rect"], existing):
+            new_fills.append(fill)
+    return new_fills
+
+
 def binarize_bw(bgr: np.ndarray) -> np.ndarray:
     """{0,255} single-channel bw layer. Threshold is Otsu (the real ink/paper
     valley, kept as is so light strokes survive); only on a degenerate near-blank
@@ -246,6 +270,7 @@ def build_pdf(
             original, params, document.render
         )
         vecfills = _figure_vecfills(out_bgr, params, document.render, original.shape)
+        vecfills += _raster_tint_fills(out_bgr, vecfills)
         builder.add_page(out_bgr, lines, photo_boxes, mode, vecfills)
     builder.save(out_path)
     _set_physical_page_size(out_path, document.render.target_dpi)
