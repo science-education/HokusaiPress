@@ -142,6 +142,7 @@ class MrcPageBuilder:
                     ),
                     "rect": (x0i, h - y1i, x1i, h - y0i),  # PDF y-up
                     "contour": zone.page_contour,
+                    "circle_fit": zone.circle_fit,
                     "page_h_px": h,
                 })
             for fill in vector_fills:
@@ -249,7 +250,7 @@ def _add_tint_overlays(
     """
     import pikepdf
 
-    from .tint_zone import contour_to_pdf_path
+    from .tint_zone import circle_to_pdf_path, contour_to_pdf_path
 
     resources = page.Resources
     if "/ExtGState" not in resources:
@@ -272,8 +273,16 @@ def _add_tint_overlays(
         )
         # Nested q/Q: outer activates Multiply; clip path (if any) restricts
         # painting to the actual tint polygon so corners/badges don't overflow.
-        if ov.get("contour") is not None:
+        # Circles use 4-arc Bézier for mathematical precision; polygons use
+        # approxPolyDP-simplified m/l/h paths.
+        if ov.get("circle_fit") is not None:
+            cx, cy, r = ov["circle_fit"]
+            clip = circle_to_pdf_path(cx, cy, r, ov["page_h_px"])
+        elif ov.get("contour") is not None:
             clip = contour_to_pdf_path(ov["contour"], ov["page_h_px"])
+        else:
+            clip = b""
+        if clip:
             content = b"q /HPVecFillMultiply gs\n" + clip + b"W n\n" + inner + b"\nQ\n"
         else:
             content = b"q /HPVecFillMultiply gs\n" + inner + b"\nQ\n"
