@@ -124,40 +124,37 @@ in OCR. A direct full-size adapter run on the same page took about 107 seconds
 for one inference after construction. The PP-OCRv6 ONNX models were cached under
 `C:\Users\user\.paddlex\official_models`.
 
-Cruise-speed check after a power-cycle retest:
+Cruise-speed checks after a power-cycle retest, all on the same `sample.pdf`
+page 0. Warm result excludes the first timed iteration where available.
+`Yomitoku det` means the DBNet text-line detector used by the hybrid pipeline.
+`NDLOCR rec` means PARSeq recognition on the same detected crops.
 
-| Input scale | Runtime/device | Iterations | Warm result |
-| --- | --- | ---: | ---: |
-| 0.25x `(754, 514, 3)` | `onnxruntime` + OpenVINO EP `NPU` | 4 | avg 37.66s, median 37.02s |
-| 0.50x `(1509, 1028, 3)` | `onnxruntime` + OpenVINO EP `NPU` | 2 | 56.41s |
-| 1.00x `(3019, 2056, 3)` | `onnxruntime` + OpenVINO EP `NPU` | 1 | 107.04s |
-| 0.25x `(754, 514, 3)` | `onnxruntime` + CPU EP | 2 | 9.31s |
-
-Conclusion: PP-OCRv6 currently *runs* through the OpenVINO NPU provider, but it
-is slower than CPU on the tested page and should not replace the existing
-NDL-OCR/hybrid NPU path for throughput until the model shape/provider settings
-are optimized.
-
-Existing hybrid Yomitoku/NDLOCR baseline, measured with
-`tools/bench_hybrid_ocr.py` on the same `sample.pdf` page 0. `Yomitoku det`
-means the DBNet text-line detector used by the hybrid pipeline. `NDLOCR rec`
-means PARSeq recognition on the same detected crops. Warm result excludes the
-first timed iteration:
-
-| Input scale | Device | Full hybrid | Yomitoku det | NDLOCR rec |
-| --- | --- | ---: | ---: | ---: |
-| 0.25x `(754, 514, 3)` | OpenVINO EP `NPU` | avg 2.18s | avg 0.57s | avg 1.47s |
-| 0.25x `(754, 514, 3)` | CPU EP | avg 7.62s | avg 2.93s | avg 4.16s |
-| 0.50x `(1509, 1028, 3)` | OpenVINO EP `NPU` | avg 2.48s | avg 0.68s | avg 1.58s |
-| 0.50x `(1509, 1028, 3)` | CPU EP | avg 7.37s | avg 3.07s | avg 3.48s |
-| 1.00x `(3019, 2056, 3)` | OpenVINO EP `NPU` | 2.18s | 0.71s | 1.67s |
-| 1.00x `(3019, 2056, 3)` | CPU EP | 6.64s | 2.81s | 4.18s |
+| Engine/path | Input scale | Runtime/device | Full/text OCR | Yomitoku det | NDLOCR rec | Notes |
+| --- | --- | --- | ---: | ---: | ---: | --- |
+| Yomitoku + NDLOCR hybrid | 0.25x `(754, 514, 3)` | OpenVINO EP `NPU` | avg 2.18s | avg 0.57s | avg 1.47s | 39 lines/texts |
+| Yomitoku + NDLOCR hybrid | 0.25x `(754, 514, 3)` | CPU EP | avg 7.62s | avg 2.93s | avg 4.16s | 39 lines/texts |
+| Yomitoku + NDLOCR hybrid | 0.50x `(1509, 1028, 3)` | OpenVINO EP `NPU` | avg 2.48s | avg 0.68s | avg 1.58s | 39 lines/texts |
+| Yomitoku + NDLOCR hybrid | 0.50x `(1509, 1028, 3)` | CPU EP | avg 7.37s | avg 3.07s | avg 3.48s | 39 lines/texts |
+| Yomitoku + NDLOCR hybrid | 1.00x `(3019, 2056, 3)` | OpenVINO EP `NPU` | 2.18s | 0.71s | 1.67s | 39 lines/texts |
+| Yomitoku + NDLOCR hybrid | 1.00x `(3019, 2056, 3)` | CPU EP | 6.64s | 2.81s | 4.18s | 39 lines/texts |
+| PP-OCRv6 | 0.25x `(754, 514, 3)` | `onnxruntime` + OpenVINO EP `NPU` | avg 37.66s, median 37.02s | n/a | n/a | 4 iterations |
+| PP-OCRv6 | 0.25x `(754, 514, 3)` | `onnxruntime` + CPU EP | 9.31s | n/a | n/a | 2 iterations |
+| PP-OCRv6 | 0.50x `(1509, 1028, 3)` | `onnxruntime` + OpenVINO EP `NPU` | 56.41s | n/a | n/a | 2 iterations |
+| PP-OCRv6 | 1.00x `(3019, 2056, 3)` | `onnxruntime` + OpenVINO EP `NPU` | 107.04s | n/a | n/a | 1 post-construction inference |
 
 For this page, the existing hybrid path is already a strong NPU baseline:
 NPU cruise speed is roughly 2.7-3.4x faster than CPU end-to-end. It is also far
 faster than the current PP-OCRv6 ONNX/OpenVINO-NPU path under the same page
-conditions. The detector timings are mostly stable across input scales because
-the NPU path uses the fixed 1536 detector export.
+conditions. PP-OCRv6 currently *runs* through the OpenVINO NPU provider, but it
+is slower than CPU in the measured 0.25x case and should not replace the
+existing NDL-OCR/hybrid NPU path for throughput until the model shape/provider
+settings are optimized. The hybrid detector timings are mostly stable across
+input scales because the NPU path uses the fixed 1536 detector export.
+
+Paddle layout/VL paths were not added to the timing table because they did not
+reach a comparable inference loop in this environment: PP-StructureV3 currently
+falls into Paddle static layout models and fails during Paddle execution, and
+PaddleOCR-VL does not accept `engine='onnxruntime'` for the VL model.
 
 Important runtime findings:
 
