@@ -119,9 +119,24 @@ C:\tmp\hokusai-paddle-venv\Scripts\python.exe -m hokusai_press.cli run `
 ```
 
 Observed result: success, 1 page, 40 regions, 39 text regions, no review flags.
-The first cached run took about 128 seconds for the page, with about 125 seconds
-in OCR. The PP-OCRv6 ONNX models were cached under
+The cached CLI run took about 128 seconds for the page, with about 125 seconds
+in OCR. A direct full-size adapter run on the same page took about 107 seconds
+for one inference after construction. The PP-OCRv6 ONNX models were cached under
 `C:\Users\user\.paddlex\official_models`.
+
+Cruise-speed check after a power-cycle retest:
+
+| Input scale | Runtime/device | Iterations | Warm result |
+| --- | --- | ---: | ---: |
+| 0.25x `(754, 514, 3)` | `onnxruntime` + OpenVINO EP `NPU` | 4 | avg 37.66s, median 37.02s |
+| 0.50x `(1509, 1028, 3)` | `onnxruntime` + OpenVINO EP `NPU` | 2 | 56.41s |
+| 1.00x `(3019, 2056, 3)` | `onnxruntime` + OpenVINO EP `NPU` | 1 | 107.04s |
+| 0.25x `(754, 514, 3)` | `onnxruntime` + CPU EP | 2 | 9.31s |
+
+Conclusion: PP-OCRv6 currently *runs* through the OpenVINO NPU provider, but it
+is slower than CPU on the tested page and should not replace the existing
+NDL-OCR/hybrid NPU path for throughput until the model shape/provider settings
+are optimized.
 
 Important runtime findings:
 
