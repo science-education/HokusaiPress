@@ -188,7 +188,10 @@ def _overlaps_any(rect: tuple, fills: list[dict]) -> bool:
 
 
 def _raster_tint_fills(out_bgr: np.ndarray, existing: list[dict]) -> list[dict]:
-    """Detect tint panels from the raster and return fills not already covered."""
+    """Detect tint panels from the raster and return fills not already covered.
+
+    Legacy flat-fill path kept for tests.  Production code uses _raster_tint_zones.
+    """
     from .tint_panel import detect_tint_panels
 
     new_fills = []
@@ -196,6 +199,26 @@ def _raster_tint_fills(out_bgr: np.ndarray, existing: list[dict]) -> list[dict]:
         if not _overlaps_any(fill["rect"], existing):
             new_fills.append(fill)
     return new_fills
+
+
+def _raster_tint_zones(out_bgr: np.ndarray, existing_fills: list[dict]):
+    """Detect tint panels and return non-overlapping TintZone objects.
+
+    Panels that overlap with already-placed vector fills are skipped.
+    Column-projection results that overlap with row-projection results at their
+    ends are clipped inside build_tint_zones (overlap deduplication).
+    """
+    from .tint_panel import detect_tint_panels
+    from .tint_zone import build_tint_zones
+
+    import cv2
+
+    gray = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2GRAY) if out_bgr.ndim == 3 else out_bgr
+    panels = [
+        p for p in detect_tint_panels(out_bgr)
+        if not _overlaps_any(p["rect"], existing_fills)
+    ]
+    return build_tint_zones(gray, panels)
 
 
 def binarize_bw(bgr: np.ndarray) -> np.ndarray:
@@ -270,8 +293,8 @@ def build_pdf(
             original, params, document.render
         )
         vecfills = _figure_vecfills(out_bgr, params, document.render, original.shape)
-        vecfills += _raster_tint_fills(out_bgr, vecfills)
-        builder.add_page(out_bgr, lines, photo_boxes, mode, vecfills)
+        tint_zones = _raster_tint_zones(out_bgr, vecfills)
+        builder.add_page(out_bgr, lines, photo_boxes, mode, vecfills, tint_zones)
     builder.save(out_path)
     _set_physical_page_size(out_path, document.render.target_dpi)
     return out_path

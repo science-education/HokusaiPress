@@ -25,6 +25,14 @@ from io import BytesIO
 import cv2
 import numpy as np
 
+# Tint-zone local thresholding constants.
+# Text strokes on a tint background are pixels darker than the zone's tint
+# median by at least this many grey levels.  Tuned for ADF-scanned halftone
+# panels where the background peaks near 165-180 and text strokes are at 60-130.
+_TINT_LO: int = 60
+_TINT_HI: int = 220
+_TINT_TEXT_DELTA: int = 40  # zone_median(tint pix) - 40 → local ink threshold
+
 
 class MrcPageBuilder:
     """Accumulates pages and writes one searchable MRC PDF."""
@@ -38,13 +46,17 @@ class MrcPageBuilder:
 
     def add_page(self, out_bgr: np.ndarray, lines: list,
                  photo_boxes_px: list, mode: str,
-                 vector_fills: list | None = None) -> None:
+                 vector_fills: list | None = None,
+                 tint_zones: list | None = None) -> None:
         from hybrid_ocr.pdf_export import encode_page_pdf
 
         from .render import binarize_bw
 
         h, w = out_bgr.shape[:2]
         vector_fills = vector_fills or []
+        tint_zones = tint_zones or []
+        tint_overlays: list[dict] = []
+
         if mode in ("gray", "color"):
             base_pdf = encode_page_pdf(out_bgr, mode, self.compress)
             overlays = []
@@ -72,6 +84,52 @@ class MrcPageBuilder:
                     "pdf": encode_page_pdf(ds, cmode, self.compress),
                     "rect": (x0i, h - y1i, x1i, h - y0i),  # PDF y-up
                 })
+            # Tint zones: place a greyscale Multiply-blend overlay that preserves
+            # the per-pixel tint colour.  Text strokes are identified with a
+            # zone-LOCAL threshold (zone tint median - _TINT_TEXT_DELTA) rather
+            # than the global Otsu threshold.
+            #
+            # Why not global Otsu?  The page-level Otsu is driven by the large
+            # white-paper peak (mode ~240) and sets T ≈ 200-215, which binarises
+            # the entire tint background as black -- exactly wrong for a
+            # Multiply overlay.  The zone median of tint-range pixels
+            # (60-220) gives a stable background estimate; pixels more than
+            # _TINT_TEXT_DELTA below that are text strokes.
+            for zone in tint_zones:
+                x0, y0, x1, y1 = zone.rect
+                x0i, y0i = max(0, int(x0)), max(0, int(y0))
+                x1i, y1i = min(w, int(x1)), min(h, int(y1))
+                if x1i - x0i < 4 or y1i - y0i < 4:
+                    continue
+                crop_gray = cv2.cvtColor(
+                    out_bgr[y0i:y1i, x0i:x1i], cv2.COLOR_BGR2GRAY
+                )
+                tint_pix = crop_gray[
+                    (crop_gray >= _TINT_LO) & (crop_gray <= _TINT_HI)
+                ]
+                if tint_pix.size >= 100:
+                    zone_med = float(np.median(tint_pix))
+                    ink_T = max(_TINT_LO, int(round(zone_med)) - _TINT_TEXT_DELTA)
+                    ink = crop_gray < ink_T
+                else:
+                    ink = binary[y0i:y1i, x0i:x1i] == 0  # fallback
+                binary[y0i:y1i, x0i:x1i] = 255
+                region = binary[y0i:y1i, x0i:x1i]
+                region[ink] = 0
+                # Overlay: greyscale, downsampled like photo overlays.
+                ov_gray = zone.overlay_img              # HxW uint8
+                ov_ds = cv2.resize(
+                    ov_gray,
+                    (max(1, int((x1i - x0i) * self.scale)),
+                     max(1, int((y1i - y0i) * self.scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
+                tint_overlays.append({
+                    "pdf": encode_page_pdf(
+                        cv2.cvtColor(ov_ds, cv2.COLOR_GRAY2BGR), "gray", self.compress
+                    ),
+                    "rect": (x0i, h - y1i, x1i, h - y0i),  # PDF y-up
+                })
             for fill in vector_fills:
                 x0, y0, x1, y1 = fill["rect"]
                 x0i, y0i = max(0, int(x0)), max(0, int(y0))
@@ -89,6 +147,7 @@ class MrcPageBuilder:
         self._pages.append({
             "base": base_pdf,
             "overlays": overlays,
+            "tint_overlays": tint_overlays,
             "vector_fills": vector_fills,
             "w": w,
             "h": h,
@@ -124,6 +183,8 @@ class MrcPageBuilder:
                         pikepdf.Rectangle(*ov["rect"]),
                         f"/HPPhoto{i}_{j}",
                     )
+                if page.get("tint_overlays"):
+                    _add_tint_overlays(out, dest, page["tint_overlays"], i, sources)
                 if page["vector_fills"]:
                     _add_vector_fills(out, dest, page["vector_fills"], page["h"])
                 _add_overlay_named(dest, text_pdf.pages[i], None, f"/HPText{i}")
@@ -154,6 +215,47 @@ def _add_overlay_named(dest, overlay_page, rect, name: str) -> None:
     page.contents_add(b"Q\n", prepend=False)
     page.contents_add(content, prepend=False)
     page.contents_coalesce()
+
+
+def _add_tint_overlays(
+    pdf, page, tint_ovs: list, page_idx: int, sources: list
+) -> None:
+    """Place greyscale tint overlays with /BM /Multiply blend mode.
+
+    Each overlay is a greyscale JPEG image stored in a single-page PDF.
+    Multiply blend: overlay_value × bilevel_white = overlay_value (tint shows),
+    overlay_value × bilevel_black = 0 (text strokes stay black regardless).
+    Paper pixels are 255 in the overlay, so Multiply(1.0, bilevel) = bilevel
+    (no change on paper).
+    """
+    import pikepdf
+
+    resources = page.Resources
+    if "/ExtGState" not in resources:
+        resources.ExtGState = pikepdf.Dictionary()
+    resources.ExtGState[pikepdf.Name("/HPVecFillMultiply")] = pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/ExtGState"),
+        "/BM": pikepdf.Name("/Multiply"),
+    })
+
+    p = pikepdf.Page(page)
+    for i, ov in enumerate(tint_ovs):
+        ovpdf = pikepdf.open(BytesIO(ov["pdf"]))
+        sources.append(ovpdf)
+        form = pikepdf.Page(ovpdf.pages[0]).as_form_xobject()
+        name = pikepdf.Name(f"/HPTintOv{page_idx}_{i}")
+        placed = p.add_resource(form, pikepdf.Name.XObject, name=name)
+        rect = pikepdf.Rectangle(*ov["rect"])
+        inner = p.calc_form_xobject_placement(
+            form, placed, rect, allow_shrink=True, allow_expand=True
+        )
+        # Nested q/Q: outer activates Multiply; inner is from calc_form_xobject_placement.
+        # Multiply state established in the outer envelope propagates into the inner
+        # one because q/Q saves+restores the graphics state (and the inner envelope
+        # is encountered while Multiply is the active blend mode).
+        content = b"q /HPVecFillMultiply gs\n" + inner + b"\nQ\n"
+        p.contents_add(pikepdf.Stream(pdf, content), prepend=False)
+        p.contents_coalesce()
 
 
 def _add_vector_fills(pdf, page, vector_fills: list, page_h_px: int) -> None:
