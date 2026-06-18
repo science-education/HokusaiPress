@@ -113,9 +113,21 @@ class MrcPageBuilder:
                     ink = crop_gray < ink_T
                 else:
                     ink = binary[y0i:y1i, x0i:x1i] == 0  # fallback
-                binary[y0i:y1i, x0i:x1i] = 255
+                # Build polygon mask: only modify pixels inside the contour shape.
+                zone_h, zone_w = y1i - y0i, x1i - x0i
+                if zone.page_contour is not None:
+                    poly_mask = np.zeros((zone_h, zone_w), dtype=np.uint8)
+                    cnt_crop = zone.page_contour.copy()
+                    cnt_crop[:, 0, 0] -= x0i
+                    cnt_crop[:, 0, 1] -= y0i
+                    cv2.fillPoly(poly_mask, [cnt_crop], 255)
+                    in_shape = poly_mask > 0
+                else:
+                    in_shape = np.ones((zone_h, zone_w), dtype=bool)
+                ink_in_shape = ink & in_shape
                 region = binary[y0i:y1i, x0i:x1i]
-                region[ink] = 0
+                region[in_shape & ~ink_in_shape] = 255   # tint bg → white
+                region[ink_in_shape] = 0                  # text strokes → black
                 # Overlay: greyscale, downsampled like photo overlays.
                 ov_gray = zone.overlay_img              # HxW uint8
                 ov_ds = cv2.resize(
@@ -129,6 +141,8 @@ class MrcPageBuilder:
                         cv2.cvtColor(ov_ds, cv2.COLOR_GRAY2BGR), "gray", self.compress
                     ),
                     "rect": (x0i, h - y1i, x1i, h - y0i),  # PDF y-up
+                    "contour": zone.page_contour,
+                    "page_h_px": h,
                 })
             for fill in vector_fills:
                 x0, y0, x1, y1 = fill["rect"]
@@ -227,8 +241,15 @@ def _add_tint_overlays(
     overlay_value × bilevel_black = 0 (text strokes stay black regardless).
     Paper pixels are 255 in the overlay, so Multiply(1.0, bilevel) = bilevel
     (no change on paper).
+
+    When a contour is present the overlay is clipped to the exact tint-shape
+    polygon via a PDF clip path (W n operator) before the XObject is painted.
+    This eliminates the black fringe that occurs when the bounding rect extends
+    beyond the actual tint region (e.g. a circular badge or a rounded corner).
     """
     import pikepdf
+
+    from .tint_zone import contour_to_pdf_path
 
     resources = page.Resources
     if "/ExtGState" not in resources:
@@ -249,11 +270,13 @@ def _add_tint_overlays(
         inner = p.calc_form_xobject_placement(
             form, placed, rect, allow_shrink=True, allow_expand=True
         )
-        # Nested q/Q: outer activates Multiply; inner is from calc_form_xobject_placement.
-        # Multiply state established in the outer envelope propagates into the inner
-        # one because q/Q saves+restores the graphics state (and the inner envelope
-        # is encountered while Multiply is the active blend mode).
-        content = b"q /HPVecFillMultiply gs\n" + inner + b"\nQ\n"
+        # Nested q/Q: outer activates Multiply; clip path (if any) restricts
+        # painting to the actual tint polygon so corners/badges don't overflow.
+        if ov.get("contour") is not None:
+            clip = contour_to_pdf_path(ov["contour"], ov["page_h_px"])
+            content = b"q /HPVecFillMultiply gs\n" + clip + b"W n\n" + inner + b"\nQ\n"
+        else:
+            content = b"q /HPVecFillMultiply gs\n" + inner + b"\nQ\n"
         p.contents_add(pikepdf.Stream(pdf, content), prepend=False)
         p.contents_coalesce()
 

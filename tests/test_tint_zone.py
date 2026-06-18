@@ -171,16 +171,24 @@ def test_build_zones_single_row_panel():
     assert len(zones) == 1
     z = zones[0]
     assert isinstance(z, TintZone)
-    assert z.rect == (10, 10, 390, 100)
-    # Crop is entirely tint (170); no pixels > TINT_HI, so overlay is unchanged
-    assert z.overlay_img.max() == 170
+    # Contour-based detection: rect may be larger than the panel hint due to
+    # MORPH_CLOSE expansion; verify the original panel area is covered.
+    assert z.rect[0] <= 10 and z.rect[1] <= 10
+    assert z.rect[2] >= 390 and z.rect[3] >= 100
+    # Overlay includes paper pixels (expanded crop), so paper → 255.
+    # Tint pixels (170 ≤ TINT_HI) remain 170 → min is 170.
     assert z.overlay_img.min() == 170
 
 
 def test_build_zones_column_clipped_by_row():
-    """Column panel that overlaps at both ends with row panels should be clipped."""
+    """Column panel that overlaps at both ends with row panels should be clipped.
+
+    build_tint_zones uses _split_by_orientation + _clip_col_panel to prevent
+    double-blending: the column zone is restricted to the y-range not covered
+    by row zones.  The contour-based shape detection then runs locally within
+    this already-clipped panel rect.
+    """
     h, w = 1000, 400
-    # Row panels occupy y=0-100 and y=900-1000
     gray = np.full((h, w), 240, dtype=np.uint8)
     gray[0:100, 5:50] = 170    # col + row overlap top
     gray[100:900, 5:50] = 170  # col body
@@ -192,7 +200,6 @@ def test_build_zones_column_clipped_by_row():
     col_p = [{"rect": (5, 0, 50, 1000), "gray": 0.67}]
     zones = build_tint_zones(gray, row_p + col_p)
     # 2 row zones + 1 clipped col zone (y=100-900)
-    rects = [z.rect for z in zones]
     col_zone = [z for z in zones if z.rect[2] - z.rect[0] < z.rect[3] - z.rect[1]]
     assert len(col_zone) == 1
     assert col_zone[0].rect[1] >= 100   # clipped away the row-zone y-range
