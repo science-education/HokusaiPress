@@ -138,6 +138,27 @@ is slower than CPU on the tested page and should not replace the existing
 NDL-OCR/hybrid NPU path for throughput until the model shape/provider settings
 are optimized.
 
+Existing hybrid Yomitoku/NDLOCR baseline, measured with
+`tools/bench_hybrid_ocr.py` on the same `sample.pdf` page 0. `Yomitoku det`
+means the DBNet text-line detector used by the hybrid pipeline. `NDLOCR rec`
+means PARSeq recognition on the same detected crops. Warm result excludes the
+first timed iteration:
+
+| Input scale | Device | Full hybrid | Yomitoku det | NDLOCR rec |
+| --- | --- | ---: | ---: | ---: |
+| 0.25x `(754, 514, 3)` | OpenVINO EP `NPU` | avg 2.18s | avg 0.57s | avg 1.47s |
+| 0.25x `(754, 514, 3)` | CPU EP | avg 7.62s | avg 2.93s | avg 4.16s |
+| 0.50x `(1509, 1028, 3)` | OpenVINO EP `NPU` | avg 2.48s | avg 0.68s | avg 1.58s |
+| 0.50x `(1509, 1028, 3)` | CPU EP | avg 7.37s | avg 3.07s | avg 3.48s |
+| 1.00x `(3019, 2056, 3)` | OpenVINO EP `NPU` | 2.18s | 0.71s | 1.67s |
+| 1.00x `(3019, 2056, 3)` | CPU EP | 6.64s | 2.81s | 4.18s |
+
+For this page, the existing hybrid path is already a strong NPU baseline:
+NPU cruise speed is roughly 2.7-3.4x faster than CPU end-to-end. It is also far
+faster than the current PP-OCRv6 ONNX/OpenVINO-NPU path under the same page
+conditions. The detector timings are mostly stable across input scales because
+the NPU path uses the fixed 1536 detector export.
+
 Important runtime findings:
 
 - `onnxruntime-openvino==1.24.1` with `openvino==2026.2.1` exposed
