@@ -59,8 +59,12 @@ class CompositeOCREngine:
             self._text_engine.recognize_text(image_bgr)
             if self._text_engine is not None else []
         )
-        layout_boxes = (
-            self._layout_engine.analyze_layout(image_bgr)
-            if self._layout_engine is not None else []
-        )
+        layout_boxes = []
+        if self._layout_engine is not None:
+            try:
+                layout_boxes = self._layout_engine.analyze_layout(image_bgr)
+            except Exception:
+                # Layout is an enrichment signal. Keep text OCR usable when an
+                # optional layout backend is absent or fails on a page.
+                layout_boxes = []
         return {"lines": lines, "layout_boxes": layout_boxes}

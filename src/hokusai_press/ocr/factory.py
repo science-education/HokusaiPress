@@ -8,6 +8,7 @@ it only when the requested configuration changes.
 from __future__ import annotations
 
 import gc
+import importlib.util
 import threading
 from dataclasses import dataclass
 
@@ -151,6 +152,8 @@ def _build_layout_engine(
     if name == "none":
         return None
     if name == "yomitoku":
+        if importlib.util.find_spec("yomitoku") is None:
+            return None
         try:
             from .hybrid import YomitokuLayoutEngine
 

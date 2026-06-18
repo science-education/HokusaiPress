@@ -92,3 +92,52 @@ OpenVINO Execution Provider after converting Paddle models to ONNX. PP-OCRv6
 is the first engine to validate; PP-StructureV3 layout is the next practical
 target. PaddleOCR-VL is heavier and should be validated after the lighter
 layout/text split works.
+
+## Hardware Validation Notes
+
+Validated on Windows with a dedicated Python 3.12 venv:
+
+- `onnxruntime-openvino==1.23.0`
+- `openvino==2025.3.0`
+- `paddleocr==3.7.0`
+- `paddlex[ocr]==3.7.1`
+
+Working command:
+
+```powershell
+$env:PYTHONPATH = "C:\Users\user\dev\HokusaiPress-ocr-paddle\src"
+C:\tmp\hokusai-paddle-venv\Scripts\python.exe -m hokusai_press.cli run `
+  C:\tmp\tmp0613\sample.pdf `
+  --out C:\tmp\hokusai-ocr-engines\sample-ppocrv6.pdf `
+  --db C:\tmp\hokusai-ocr-engines\sample-ppocrv6.db `
+  --pages 0 `
+  --layout-engine none `
+  --text-engine ppocr-v6 `
+  --runtime onnxruntime `
+  --device npu `
+  --profile
+```
+
+Observed result: success, 1 page, 40 regions, 39 text regions, no review flags.
+The first cached run took about 128 seconds for the page, with about 125 seconds
+in OCR. The PP-OCRv6 ONNX models were cached under
+`C:\Users\user\.paddlex\official_models`.
+
+Important runtime findings:
+
+- `onnxruntime-openvino==1.24.1` with `openvino==2026.2.1` exposed
+  `OpenVINOExecutionProvider` but failed to load its provider DLL on this
+  machine. The known-good pairing here is ORT OpenVINO 1.23.0 + OpenVINO 2025.3.
+- On Windows, the adapter adds `openvino\libs` to the DLL search path before
+  ONNX Runtime creates the OpenVINO EP.
+- PaddleX 3.7 rejects `device_type=npu` for `engine='onnxruntime'` unless
+  providers are explicit. The adapter therefore passes `device='cpu'` to
+  PaddleOCR while setting providers to `OpenVINOExecutionProvider` with
+  `device_type=NPU`.
+- `PP-StructureV3` is not yet a clean NPU path in this environment. Even with
+  `runtime=onnxruntime`, parts of the pipeline instantiate `paddle_static`
+  models and the layout predictor currently fails inside Paddle with
+  `ConvertPirAttribute2RuntimeAttribute`.
+- `PaddleOCR-VL-1.6-0.9B` does not support `engine='onnxruntime'` for the VL
+  recognition model. PaddleX reports supported engines as `paddle_dynamic`,
+  `transformers`, and `genai_client`.

@@ -7,6 +7,8 @@ small HokusaiPress OCR contract: text lines plus optional layout boxes.
 
 from __future__ import annotations
 
+import os
+import sys
 import threading
 from collections.abc import Iterable, Mapping
 from typing import Any
@@ -35,6 +37,46 @@ def _device_for_paddle(device: str) -> str | None:
     if device in ("gpu", "xpu", "mlu", "dcu", "metax_gpu", "iluvatar_gpu"):
         return f"{device}:0"
     return device
+
+
+def _existing_model_dir(model_dir: str | None) -> str | None:
+    return model_dir if model_dir and os.path.isdir(model_dir) else None
+
+
+_dll_dirs = []
+_dll_dir_paths = set()
+
+
+def _ensure_openvino_dll_path() -> None:
+    if sys.platform != "win32" or not hasattr(os, "add_dll_directory"):
+        return
+    try:
+        import openvino
+    except ImportError:
+        return
+    libs_dir = os.path.join(os.path.dirname(openvino.__file__), "libs")
+    if not os.path.isdir(libs_dir):
+        return
+    if libs_dir not in _dll_dir_paths:
+        _dll_dirs.append(os.add_dll_directory(libs_dir))
+        _dll_dir_paths.add(libs_dir)
+
+
+def _runtime_kwargs(engine: str | None, device: str) -> dict[str, Any]:
+    if engine != "onnxruntime":
+        paddle_device = _device_for_paddle(device)
+        return {"device": paddle_device} if paddle_device else {}
+
+    if device == "npu":
+        _ensure_openvino_dll_path()
+        return {
+            "device": "cpu",
+            "engine_config": {
+                "providers": ["OpenVINOExecutionProvider", "CPUExecutionProvider"],
+                "provider_options": [{"device_type": "NPU"}, {}],
+            },
+        }
+    return {"device": _device_for_paddle(device) or "cpu"}
 
 
 def _result_mapping(obj: Any) -> Mapping[str, Any]:
@@ -133,13 +175,19 @@ def _build(cls, kwargs: dict[str, Any]):
         ("engine", "device", "text_detection_model_dir", "text_recognition_model_dir",
          "layout_detection_model_dir", "vl_rec_model_dir", "layout_shape_mode",
          "use_layout_detection"),
+        ("engine", "device", "engine_config",
+         "text_detection_model_dir", "text_recognition_model_dir",
+         "layout_detection_model_dir", "vl_rec_model_dir", "layout_shape_mode",
+         "use_layout_detection"),
     ]
     last_error = None
     for drop in keys_to_drop:
         filtered = {k: v for k, v in kwargs.items() if k not in drop}
         try:
             return cls(**filtered)
-        except TypeError as exc:
+        except (TypeError, ValueError) as exc:
+            if isinstance(exc, ValueError) and "Unknown argument:" not in str(exc):
+                raise
             last_error = exc
     raise last_error  # type: ignore[misc]
 
@@ -273,14 +321,13 @@ class PPOCRv6Engine:
             "use_doc_orientation_classify": False,
             "use_doc_unwarping": False,
             "use_textline_orientation": False,
+            "ocr_version": "PP-OCRv6",
             "engine": engine,
         }
-        paddle_device = _device_for_paddle(device)
-        if paddle_device:
-            kwargs["device"] = paddle_device
-        if model_dir:
-            kwargs["text_detection_model_dir"] = model_dir
-            kwargs["text_recognition_model_dir"] = model_dir
+        kwargs.update(_runtime_kwargs(engine, device))
+        if existing := _existing_model_dir(model_dir):
+            kwargs["text_detection_model_dir"] = existing
+            kwargs["text_recognition_model_dir"] = existing
         self._ocr = _build(PaddleOCR, {k: v for k, v in kwargs.items() if v is not None})
         self._lock = threading.Lock()
 
@@ -301,14 +348,17 @@ class PPStructureV3LayoutEngine:
             "use_doc_orientation_classify": False,
             "use_doc_unwarping": False,
             "use_layout_detection": True,
-            "layout_shape_mode": "rect",
+            "use_table_recognition": False,
+            "use_formula_recognition": False,
+            "use_chart_recognition": False,
+            "use_seal_recognition": False,
+            "use_region_detection": False,
+            "enable_mkldnn": False,
             "engine": engine,
         }
-        paddle_device = _device_for_paddle(device)
-        if paddle_device:
-            kwargs["device"] = paddle_device
-        if model_dir:
-            kwargs["layout_detection_model_dir"] = model_dir
+        kwargs.update(_runtime_kwargs(engine, device))
+        if existing := _existing_model_dir(model_dir):
+            kwargs["layout_detection_model_dir"] = existing
         self._pipeline = _build(
             PPStructureV3,
             {k: v for k, v in kwargs.items() if v is not None},
@@ -329,20 +379,24 @@ class PaddleOCRVLEngine:
                  engine: str | None = "paddle"):
         from paddleocr import PaddleOCRVL  # lazy, optional dependency
 
+        if engine == "onnxruntime":
+            raise ValueError(
+                "PaddleOCR-VL-1.6 does not support runtime='onnxruntime' for "
+                "the VL recognition model; use runtime='transformers', "
+                "runtime='paddle', or a genai/server backend."
+            )
+
         kwargs: dict[str, Any] = {
             "pipeline_version": "v1.6",
             "use_doc_orientation_classify": False,
             "use_doc_unwarping": False,
             "use_layout_detection": True,
-            "layout_shape_mode": "rect",
             "engine": engine,
         }
-        paddle_device = _device_for_paddle(device)
-        if paddle_device:
-            kwargs["device"] = paddle_device
-        if model_dir:
-            kwargs["layout_detection_model_dir"] = model_dir
-            kwargs["vl_rec_model_dir"] = model_dir
+        kwargs.update(_runtime_kwargs(engine, device))
+        if existing := _existing_model_dir(model_dir):
+            kwargs["layout_detection_model_dir"] = existing
+            kwargs["vl_rec_model_dir"] = existing
         self._pipeline = _build(
             PaddleOCRVL,
             {k: v for k, v in kwargs.items() if v is not None},

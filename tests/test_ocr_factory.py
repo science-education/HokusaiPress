@@ -23,6 +23,11 @@ class FakeLayout:
         }]
 
 
+class BrokenLayout:
+    def analyze_layout(self, image_bgr):
+        raise RuntimeError("layout backend failed")
+
+
 def test_legacy_hybrid_maps_to_yomitoku_and_ndlocr():
     assert resolve_engine_selection("hybrid", None, None) == ("yomitoku", "ndlocr")
 
@@ -47,3 +52,10 @@ def test_composite_engine_merges_text_and_layout_results():
 
     assert result["lines"][0]["source"] == "fake-text"
     assert result["layout_boxes"][0]["source"] == "fake-layout"
+
+
+def test_composite_engine_keeps_text_when_layout_fails():
+    result = CompositeOCREngine(FakeText(), BrokenLayout())(None)
+
+    assert result["lines"][0]["source"] == "fake-text"
+    assert result["layout_boxes"] == []

@@ -3,6 +3,7 @@ import numpy as np
 from hokusai_press.content import analyze
 from hokusai_press.model import Flag, RegionKind, SourceRef
 from hokusai_press.ocr.paddle import (
+    _runtime_kwargs,
     normalize_paddle_ocr_result,
     normalize_paddle_vl_result,
 )
@@ -23,6 +24,17 @@ def test_normalize_ppocr_v6_result_arrays():
     assert result["lines"][0]["box"] == (1.0, 2.0, 11.0, 8.0)
     assert result["lines"][0]["text"] == "北斎"
     assert result["lines"][0]["source"] == "ppocr-v6"
+
+
+def test_runtime_kwargs_maps_onnxruntime_npu_to_openvino_ep():
+    kwargs = _runtime_kwargs("onnxruntime", "npu")
+
+    assert kwargs["device"] == "cpu"
+    assert kwargs["engine_config"]["providers"] == [
+        "OpenVINOExecutionProvider",
+        "CPUExecutionProvider",
+    ]
+    assert kwargs["engine_config"]["provider_options"][0]["device_type"] == "NPU"
 
 
 def test_normalize_ppocr_v6_flat_single_box():

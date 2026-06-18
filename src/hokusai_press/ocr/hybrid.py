@@ -42,7 +42,11 @@ class YomitokuLayoutEngine:
 
     def analyze_layout(self, image_bgr):
         boxes = []
-        for box in self._provider.figures(image_bgr):
+        try:
+            figures = self._provider.figures(image_bgr)
+        except ImportError:
+            return boxes
+        for box in figures:
             boxes.append({
                 "box": (box.x0, box.y0, box.x1, box.y1),
                 "label": "figure",
