@@ -119,6 +119,24 @@ _CIRCULARITY_MIN: float = 0.85
 _MIN_HOLE_AREA_FRAC: float = 0.0005
 _MIN_HOLE_AREA_PX: int = 2000
 
+# Small holes are usually text-stroke gaps, but OCR text boxes can identify a
+# deliberate paper cavity inside a tint frame even when the cavity is below the
+# global area threshold (common after crop/scale normalization).
+_HOLE_TEXT_OVERLAP_FRAC: float = 0.15
+
+# A hole must also occupy at least this fraction of its OWN outer shape's
+# area, regardless of the page-relative checks above.  Without this, a
+# decorative caption inside a small zone (e.g. a badge) can exceed the
+# page-relative floor purely because the page is large, even though the
+# caption is a small sliver of the badge itself -- see build_tint_zones.
+#
+# A genuine cavity enclosed by a thin frame (e.g. a header/column/footer band
+# around the body text) is typically much LARGER in area than the thin band
+# enclosing it -- a real example measured well over 100% of its own outer
+# shape's area.  A badge caption's merged-by-closing text blob measured only
+# ~15-25%.  0.5 sits well inside that gap.
+_MIN_HOLE_FRAC_OF_ZONE: float = 0.5
+
 # An outer contour is only promoted to a TintZone if it overlaps at least one
 # detect_tint_panels hint by this fraction of the hint's own area -- filters
 # out unrelated tint-coloured noise elsewhere on the page.
@@ -146,6 +164,7 @@ class TintZone:
 def build_tint_zones(
     gray: np.ndarray,
     panels: list[dict],
+    text_boxes: list[tuple[float, float, float, float]] | None = None,
 ) -> list[TintZone]:
     """Convert raw detected panel dicts to TintZone objects.
 
@@ -170,6 +189,21 @@ def build_tint_zones(
     page_area = h * w
 
     tint_mask = ((gray >= TINT_LO) & (gray <= TINT_HI)).astype(np.uint8)
+    if text_boxes:
+        # Dense body text's own anti-aliased pixels routinely land in
+        # [TINT_LO, TINT_HI]; over a packed paragraph that can chain-bridge
+        # through MORPH_CLOSE across enough distance to fuse a real tint
+        # panel with an unrelated chunk of body text far away (found by
+        # comparing actual render output to the source scan -- the fused
+        # area then gets a Multiply overlay it was never meant to have).
+        # Zeroing OCR text-box pixels before closing removes them from the
+        # connectivity analysis entirely: a text box small enough to sit
+        # fully inside a real tint panel (e.g. a heading printed on a
+        # header band) still gets bridged over like any other text-stroke
+        # gap, but a body paragraph far from any panel no longer offers a
+        # path to bridge through.
+        text_mask = _boxes_to_mask(text_boxes, h, w)
+        tint_mask[text_mask] = 0
     kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (_CLOSE_PX * 2 + 1, _CLOSE_PX * 2 + 1)
     )
@@ -200,11 +234,29 @@ def build_tint_zones(
             for idx in overlap_idx:
                 claimed[idx] = True
 
+            outer_area = max(1.0, cv2.contourArea(outer_cnt))
             holes: list[np.ndarray] = []
             child = info[2]
             while child != -1:
                 hole_cnt = contours[child]
-                if cv2.contourArea(hole_cnt) >= min_hole_area:
+                hole_area = cv2.contourArea(hole_cnt)
+                # A real cavity (e.g. the body-text area enclosed by a
+                # header/column/footer frame) takes up a substantial share of
+                # its OWN outer shape's area.  A small decorative zone (e.g.
+                # a badge) can have a caption whose merged-by-closing white
+                # knockout blob exceeds the page-relative area floor purely
+                # because the page is large, while still being a small sliver
+                # of that badge's own area -- punching it out as a "hole"
+                # would skip ink/tint classification for any tint-coloured
+                # gaps the closing swept into that blob, exposing raw
+                # (un-tinted) Otsu bilevel underneath.  Requiring a minimum
+                # share of the outer shape's own area rejects those without
+                # affecting genuine cavities, which comfortably clear it.
+                large_enough_share = hole_area / outer_area >= _MIN_HOLE_FRAC_OF_ZONE
+                if large_enough_share and (
+                    hole_area >= min_hole_area
+                    or _hole_overlaps_text_box(hole_cnt, text_boxes)
+                ):
                     holes.append(hole_cnt)
                 child = hier[child][0]
 
@@ -314,6 +366,26 @@ def classify_tint_shape(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _boxes_to_mask(
+    boxes: list[tuple[float, float, float, float]],
+    h: int,
+    w: int,
+) -> np.ndarray:
+    """Rasterize a list of (x0,y0,x1,y1) boxes into a boolean (h, w) mask."""
+    mask = np.zeros((h, w), dtype=bool)
+    for box in boxes:
+        if len(box) < 4:
+            continue
+        x0f, y0f, x1f, y1f = (float(v) for v in box[:4])
+        x0 = max(0, min(w, int(np.floor(min(x0f, x1f)))))
+        y0 = max(0, min(h, int(np.floor(min(y0f, y1f)))))
+        x1 = max(0, min(w, int(np.ceil(max(x0f, x1f)))))
+        y1 = max(0, min(h, int(np.ceil(max(y0f, y1f)))))
+        if x1 > x0 and y1 > y0:
+            mask[y0:y1, x0:x1] = True
+    return mask
+
+
 def _overlapping_panel_indices(cnt: np.ndarray, panels: list[dict]) -> list[int]:
     """Indices of panel hints that this contour overlaps by enough to count.
 
@@ -338,6 +410,38 @@ def _overlapping_panel_indices(cnt: np.ndarray, panels: list[dict]) -> list[int]
             if inter / denom >= _MIN_PANEL_OVERLAP_FRAC:
                 found.append(idx)
     return found
+
+
+def _hole_overlaps_text_box(
+    hole_cnt: np.ndarray,
+    text_boxes: list[tuple[float, float, float, float]] | None,
+) -> bool:
+    """True when a small contour hole aligns with OCR text-region geometry.
+
+    The comparison intentionally uses bounding boxes instead of contour masks:
+    OCR regions are rectangular hints already in rendered-pixel coordinates,
+    and this mirrors the cheap intersection pattern used for panel hints above.
+    """
+    if not text_boxes:
+        return False
+
+    bx, by, bw, bh = cv2.boundingRect(hole_cnt)
+    hole_area = max(1.0, float(bw * bh))
+    for box in text_boxes:
+        if len(box) < 4:
+            continue
+        tx0, ty0, tx1, ty1 = (float(v) for v in box[:4])
+        x0, x1 = sorted((tx0, tx1))
+        y0, y1 = sorted((ty0, ty1))
+        text_area = max(1.0, (x1 - x0) * (y1 - y0))
+        ix0, iy0 = max(float(bx), x0), max(float(by), y0)
+        ix1, iy1 = min(float(bx + bw), x1), min(float(by + bh), y1)
+        if ix1 <= ix0 or iy1 <= iy0:
+            continue
+        inter = (ix1 - ix0) * (iy1 - iy0)
+        if inter / min(hole_area, text_area) >= _HOLE_TEXT_OVERLAP_FRAC:
+            return True
+    return False
 
 
 def _pad_and_simplify(
@@ -538,6 +642,110 @@ def zone_diff_stats(gray: np.ndarray, zones: list[TintZone]) -> list[dict]:
             "n_polygon_pts": len(zone.page_contour) if zone.page_contour is not None else 0,
         })
     return stats
+
+
+def tint_render_quality(
+    orig_gray: np.ndarray,
+    rendered_gray: np.ndarray,
+    text_boxes: list[tuple] | None = None,
+    tile: int = 32,
+    deviation_threshold: float = 40.0,
+    zone_mask: np.ndarray | None = None,
+) -> list[dict]:
+    """Find local tint-rendering failures while ignoring OCR text regions.
+
+    ``zone_diff_stats`` is polygon-coverage oriented and can count antialiased
+    text pixels as missed tint.  This diagnostic instead compares mean grey on
+    tint-heavy tiles after masking OCR text boxes, so intentionally bilevel text
+    does not look like a tint rendering error.
+
+    ``zone_mask``, if given, is a boolean (h, w) array marking pixels that are
+    actually inside a rendered TintZone's painted area (e.g. the union of each
+    zone's polygon minus its holes).  Real OCR coverage is often incomplete --
+    a page can have dense body-text tiles where >= 50% of pixels happen to
+    land in [TINT_LO, TINT_HI] purely from anti-aliasing, with no matching
+    text_box to exclude them.  Restricting evaluation to ``zone_mask`` (where
+    given) ties this diagnostic to "did we render the area we intended to
+    treat as tint", which is robust to OCR gaps; without it, the looser
+    >=50%-tint-pixel heuristic is used as a fallback.
+    """
+    if orig_gray.shape != rendered_gray.shape:
+        raise ValueError("orig_gray and rendered_gray must have the same shape")
+    if orig_gray.ndim != 2 or rendered_gray.ndim != 2:
+        raise ValueError("orig_gray and rendered_gray must be 2-D grayscale images")
+    if tile < 1:
+        raise ValueError("tile must be >= 1")
+    if zone_mask is not None and zone_mask.shape != orig_gray.shape:
+        raise ValueError("zone_mask must have the same shape as orig_gray")
+
+    h, w = orig_gray.shape
+    eval_mask = np.ones((h, w), dtype=bool) if zone_mask is None else zone_mask.astype(bool).copy()
+    if text_boxes:
+        eval_mask &= ~_boxes_to_mask(text_boxes, h, w)
+
+    issues: list[dict] = []
+    for y0 in range(0, h, tile):
+        y1 = min(h, y0 + tile)
+        for x0 in range(0, w, tile):
+            x1 = min(w, x0 + tile)
+            valid = eval_mask[y0:y1, x0:x1]
+            valid_px = int(valid.sum())
+            if valid_px == 0:
+                continue
+
+            orig_tile = orig_gray[y0:y1, x0:x1]
+            rendered_tile = rendered_gray[y0:y1, x0:x1]
+            if zone_mask is None:
+                tint_px = ((orig_tile >= TINT_LO) & (orig_tile <= TINT_HI) & valid)
+                if float(tint_px.sum()) / valid_px < 0.5:
+                    continue
+
+            orig_mean = float(orig_tile[valid].mean())
+            rendered_mean = float(rendered_tile[valid].mean())
+            deviation = rendered_mean - orig_mean
+            if abs(deviation) < deviation_threshold:
+                continue
+
+            issues.append({
+                "rect": (x0, y0, x1, y1),
+                "orig_mean": orig_mean,
+                "rendered_mean": rendered_mean,
+                "deviation": deviation,
+                "kind": "too_light" if deviation > 0 else "too_dark",
+            })
+
+    issues.sort(key=lambda item: abs(item["deviation"]), reverse=True)
+    return issues
+
+
+def zone_mask_from_zones(zones: list[TintZone], page_h: int, page_w: int) -> np.ndarray:
+    """Union of every zone's painted area (polygon minus its holes).
+
+    Convenience helper for ``tint_render_quality(..., zone_mask=...)`` so
+    callers don't have to re-derive the fillPoly/hole-punch logic that
+    ``mrc.py`` and ``zone_diff_stats`` already use.
+    """
+    mask = np.zeros((page_h, page_w), dtype=np.uint8)
+    for zone in zones:
+        x0, y0, x1, y1 = zone.rect
+        x0c, y0c = max(0, x0), max(0, y0)
+        x1c, y1c = min(page_w, x1), min(page_h, y1)
+        if x1c - x0c < 1 or y1c - y0c < 1:
+            continue
+        sub = mask[y0c:y1c, x0c:x1c]
+        if zone.page_contour is not None:
+            cnt = zone.page_contour.copy()
+            cnt[:, 0, 0] -= x0c
+            cnt[:, 0, 1] -= y0c
+            cv2.fillPoly(sub, [cnt], 255)
+            for hole in zone.hole_contours:
+                hc = hole.copy()
+                hc[:, 0, 0] -= x0c
+                hc[:, 0, 1] -= y0c
+                cv2.fillPoly(sub, [hc], 0)
+        else:
+            sub[:] = 255
+    return mask > 0
 
 
 # ---------------------------------------------------------------------------

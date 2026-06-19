@@ -10,6 +10,7 @@ from hokusai_press.tint_zone import (
     build_tint_zones,
     classify_tint_shape,
     make_tint_overlay,
+    tint_render_quality,
 )
 
 
@@ -182,3 +183,59 @@ def test_build_zones_connected_frame_has_one_hole():
     assert hx >= 50 and hy >= 90
     assert hx + hw <= 350 and hy + hh <= 910
     assert hw >= 250 and hh >= 750  # most of the cavity is captured
+
+
+def test_small_hole_overlapping_ocr_text_box_is_not_rescued_alone():
+    """OCR overlap alone must not rescue a hole that's a small SLICE of its
+    own outer shape's area.
+
+    This was the real failure mode found on a corpus page: a circular
+    badge's small caption ("コラム"/"COLUMN") merges into one knockout blob
+    per text line via the closing step, and OCR happily reports a text box
+    for it -- but that blob is only ~15-25% of the badge's own area, nowhere
+    near a real cavity's share.  Treating it as a hole left the gaps between
+    glyphs unprocessed (neither tinted nor ink-classified), exposing raw,
+    un-tinted Otsu bilevel underneath.  ``_MIN_HOLE_FRAC_OF_ZONE`` must reject
+    it regardless of OCR confirmation.
+    """
+    gray = np.full((3000, 3000), 240, dtype=np.uint8)
+    gray[100:400, 100:400] = 170
+    gray[200:260, 200:270] = 240  # a small slice of the 300x300 panel's area
+    panels = [{"rect": (100, 100, 400, 400), "gray": 0.67}]
+
+    zones_without_text = build_tint_zones(gray, panels)
+    assert len(zones_without_text) == 1
+    assert zones_without_text[0].hole_contours == []
+
+    zones_with_text = build_tint_zones(gray, panels, text_boxes=[(198, 198, 272, 262)])
+    assert len(zones_with_text) == 1
+    assert zones_with_text[0].hole_contours == []
+
+
+# ---------------------------------------------------------------------------
+# tint_render_quality
+# ---------------------------------------------------------------------------
+
+def test_tint_render_quality_detects_light_dark_and_ignores_text_boxes():
+    orig = np.full((96, 96), 170, dtype=np.uint8)
+    rendered = orig.copy()
+    rendered[0:32, 0:32] = 0        # darkened tint tile
+    rendered[0:32, 32:64] = 255     # missing tint tile
+    rendered[32:64, 0:32] = 0       # text region: should be ignored
+
+    issues = tint_render_quality(
+        orig,
+        rendered,
+        text_boxes=[(0, 32, 32, 64)],
+        tile=32,
+        deviation_threshold=40.0,
+    )
+
+    by_rect = {item["rect"]: item for item in issues}
+    assert by_rect[(0, 0, 32, 32)]["kind"] == "too_dark"
+    assert by_rect[(32, 0, 64, 32)]["kind"] == "too_light"
+    assert (0, 32, 32, 64) not in by_rect
+    assert [abs(item["deviation"]) for item in issues] == sorted(
+        [abs(item["deviation"]) for item in issues],
+        reverse=True,
+    )

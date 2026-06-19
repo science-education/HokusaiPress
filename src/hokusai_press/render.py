@@ -201,7 +201,11 @@ def _raster_tint_fills(out_bgr: np.ndarray, existing: list[dict]) -> list[dict]:
     return new_fills
 
 
-def _raster_tint_zones(out_bgr: np.ndarray, existing_fills: list[dict]):
+def _raster_tint_zones(
+    out_bgr: np.ndarray,
+    existing_fills: list[dict],
+    text_boxes: list[tuple[float, float, float, float]] | None = None,
+):
     """Detect tint panels and return non-overlapping TintZone objects.
 
     Panels that overlap with already-placed vector fills are skipped.
@@ -218,7 +222,7 @@ def _raster_tint_zones(out_bgr: np.ndarray, existing_fills: list[dict]):
         p for p in detect_tint_panels(out_bgr)
         if not _overlaps_any(p["rect"], existing_fills)
     ]
-    return build_tint_zones(gray, panels)
+    return build_tint_zones(gray, panels, text_boxes)
 
 
 def binarize_bw(bgr: np.ndarray) -> np.ndarray:
@@ -293,7 +297,8 @@ def build_pdf(
             original, params, document.render
         )
         vecfills = _figure_vecfills(out_bgr, params, document.render, original.shape)
-        tint_zones = _raster_tint_zones(out_bgr, vecfills)
+        text_boxes = [tuple(line["box"]) for line in lines]
+        tint_zones = _raster_tint_zones(out_bgr, vecfills, text_boxes)
         builder.add_page(out_bgr, lines, photo_boxes, mode, vecfills, tint_zones)
     builder.save(out_path)
     _set_physical_page_size(out_path, document.render.target_dpi)
