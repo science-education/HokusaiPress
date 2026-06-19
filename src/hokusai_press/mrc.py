@@ -81,6 +81,18 @@ _TINT_OVERLAY_DPI: int = 300
 # only erases noise that was never a real stroke to begin with.
 _INK_DESPECKLE_PX: int = 1
 
+# The GLOBAL Otsu threshold (binarize_bw) has no despeckling at all -- only
+# the tint-zone-internal ink mask above does.  Ordinary scan grain is an
+# invisible few grey levels of noise in the continuous-tone source, but a
+# hard threshold amplifies an unlucky noise dip into a stark, fully black
+# pixel: thresholding makes invisible noise visible.  This shows up as
+# isolated black flecks scattered near any tint/paper edge (where the global
+# threshold sits closest to the local pixel values) and is not specific to
+# tint zones -- it's a property of binarizing any noisy scan.  A connected-
+# component area filter removes specks below this size; a real character
+# stroke is always much larger and connected, so this never touches text.
+_GLOBAL_DESPECKLE_MIN_PX: int = 8
+
 
 class MrcPageBuilder:
     """Accumulates pages and writes one searchable MRC PDF."""
@@ -156,13 +168,6 @@ class MrcPageBuilder:
                 crop_gray = cv2.cvtColor(
                     out_bgr[y0i:y1i, x0i:x1i], cv2.COLOR_BGR2GRAY
                 )
-                tint_pix = crop_gray[
-                    (crop_gray >= _TINT_LO) & (crop_gray <= _TINT_HI)
-                ]
-                if tint_pix.size >= 100:
-                    ink = _tint_ink_mask(crop_gray)
-                else:
-                    ink = binary[y0i:y1i, x0i:x1i] == 0  # fallback
                 # Build polygon mask: only modify pixels inside the contour shape.
                 # Holes (e.g. the body-text cavity enclosed by a header/column/
                 # footer frame) are punched out so they're left untouched.
@@ -181,6 +186,28 @@ class MrcPageBuilder:
                     in_shape = poly_mask > 0
                 else:
                     in_shape = np.ones((zone_h, zone_w), dtype=bool)
+
+                tint_pix = crop_gray[
+                    (crop_gray >= _TINT_LO) & (crop_gray <= _TINT_HI) & in_shape
+                ]
+                if tint_pix.size >= 100:
+                    # The zone's bounding RECT is not the zone's own shape --
+                    # a rounded corner or circle's bbox always includes some
+                    # paper-coloured corner area outside the actual polygon.
+                    # Feeding that paper straight into the median window would
+                    # pull the local-background estimate toward white right
+                    # along the true tint/paper edge, the same way a bright
+                    # knockout letter does (see _local_tint_background) --
+                    # producing the same kind of false "ink" speck, but
+                    # tracing the zone's own outline instead of a letterform.
+                    # Filling out-of-shape pixels with the zone's own tint
+                    # median keeps that real edge from leaking into the
+                    # window used near it.
+                    fill_value = float(np.median(tint_pix))
+                    masked_crop = np.where(in_shape, crop_gray, fill_value).astype(np.uint8)
+                    ink = _tint_ink_mask(masked_crop)
+                else:
+                    ink = binary[y0i:y1i, x0i:x1i] == 0  # fallback
                 ink_in_shape = ink & in_shape
                 region = binary[y0i:y1i, x0i:x1i]
                 region[in_shape & ~ink_in_shape] = 255   # tint bg → white
@@ -216,6 +243,7 @@ class MrcPageBuilder:
                 binary[y0i:y1i, x0i:x1i] = 255
                 region = binary[y0i:y1i, x0i:x1i]
                 region[ink] = 0
+            binary = _despeckle_bilevel(binary)
             base_pdf = encode_page_pdf(binary, "bw", self.compress)
 
         self._pages.append({
@@ -266,6 +294,24 @@ class MrcPageBuilder:
         finally:
             for s in sources:
                 s.close()
+
+
+def _despeckle_bilevel(binary: np.ndarray) -> np.ndarray:
+    """Remove isolated ink specks below _GLOBAL_DESPECKLE_MIN_PX from a
+    bilevel ({0, 255}) page.  See that constant's docstring for why this is
+    needed even after Otsu: thresholding turns invisible scan grain into
+    stark black flecks, most visibly near tint/paper edges and any other
+    boundary where pixel values already sit close to the threshold.
+    """
+    ink = (binary == 0).astype(np.uint8)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    sizes = stats[1:, cv2.CC_STAT_AREA]  # skip background label 0
+    tiny = np.flatnonzero(sizes < _GLOBAL_DESPECKLE_MIN_PX) + 1
+    if tiny.size:
+        out = binary.copy()
+        out[np.isin(labels, tiny)] = 255
+        return out
+    return binary
 
 
 def _is_grayish(bgr: np.ndarray) -> bool:
