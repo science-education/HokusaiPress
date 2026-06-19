@@ -7,8 +7,6 @@ from hokusai_press.tint_zone import (
     TINT_HI,
     TINT_LO,
     TintZone,
-    _clip_col_panel,
-    _split_by_orientation,
     build_tint_zones,
     classify_tint_shape,
     make_tint_overlay,
@@ -107,54 +105,6 @@ def test_classify_real_rounded_corner():
 
 
 # ---------------------------------------------------------------------------
-# _split_by_orientation
-# ---------------------------------------------------------------------------
-
-def test_split_wide_panel_is_row():
-    panels = [{"rect": (0, 0, 800, 100), "gray": 0.7}]  # w/h = 8 → row
-    row_panels, col_panels = _split_by_orientation(panels, 800, 1200)
-    assert len(row_panels) == 1
-    assert len(col_panels) == 0
-
-
-def test_split_narrow_panel_is_col():
-    panels = [{"rect": (0, 0, 80, 1000), "gray": 0.7}]  # h/w = 12.5 → col
-    row_panels, col_panels = _split_by_orientation(panels, 800, 1200)
-    assert len(row_panels) == 0
-    assert len(col_panels) == 1
-
-
-# ---------------------------------------------------------------------------
-# _clip_col_panel
-# ---------------------------------------------------------------------------
-
-def test_clip_removes_row_overlap():
-    col = (10, 0, 50, 1000)  # x=10-50, y=0-1000
-    row_intervals = [(0, 200), (800, 1000)]
-    result = _clip_col_panel(col, row_intervals, 1000)
-    # Remaining free: y=200-800
-    assert len(result) == 1
-    x0, y0, x1, y1 = result[0]
-    assert x0 == 10 and x1 == 50
-    assert y0 == 200 and y1 == 800
-
-
-def test_clip_no_overlap_returns_original():
-    col = (10, 500, 50, 800)
-    row_intervals = [(0, 100), (900, 1000)]
-    result = _clip_col_panel(col, row_intervals, 1000)
-    assert len(result) == 1
-    assert result[0] == col
-
-
-def test_clip_fully_covered_returns_empty():
-    col = (10, 100, 50, 200)
-    row_intervals = [(0, 1000)]
-    result = _clip_col_panel(col, row_intervals, 1000)
-    assert result == []
-
-
-# ---------------------------------------------------------------------------
 # build_tint_zones integration
 # ---------------------------------------------------------------------------
 
@@ -171,8 +121,9 @@ def test_build_zones_single_row_panel():
     assert len(zones) == 1
     z = zones[0]
     assert isinstance(z, TintZone)
-    # Contour-based detection: rect may be larger than the panel hint due to
-    # MORPH_CLOSE expansion; verify the original panel area is covered.
+    assert z.hole_contours == []
+    # Contour-based detection: rect may be slightly larger than the panel hint
+    # (padding); verify the original panel area is covered.
     assert z.rect[0] <= 10 and z.rect[1] <= 10
     assert z.rect[2] >= 390 and z.rect[3] >= 100
     # Overlay includes paper pixels (expanded crop), so paper → 255.
@@ -180,27 +131,54 @@ def test_build_zones_single_row_panel():
     assert z.overlay_img.min() == 170
 
 
-def test_build_zones_column_clipped_by_row():
-    """Column panel that overlaps at both ends with row panels should be clipped.
-
-    build_tint_zones uses _split_by_orientation + _clip_col_panel to prevent
-    double-blending: the column zone is restricted to the y-range not covered
-    by row zones.  The contour-based shape detection then runs locally within
-    this already-clipped panel rect.
-    """
+def test_build_zones_separate_panels_stay_separate():
+    """Two tint panels that don't touch must remain two distinct zones."""
     h, w = 1000, 400
     gray = np.full((h, w), 240, dtype=np.uint8)
-    gray[0:100, 5:50] = 170    # col + row overlap top
-    gray[100:900, 5:50] = 170  # col body
-    gray[900:1000, 5:50] = 170 # col + row overlap bottom
-    row_p = [
+    gray[0:100, 0:400] = 170     # header
+    gray[900:1000, 0:400] = 170  # footer, far from header
+    panels = [
         {"rect": (0, 0, 400, 100), "gray": 0.67},
         {"rect": (0, 900, 400, 1000), "gray": 0.67},
     ]
-    col_p = [{"rect": (5, 0, 50, 1000), "gray": 0.67}]
-    zones = build_tint_zones(gray, row_p + col_p)
-    # 2 row zones + 1 clipped col zone (y=100-900)
-    col_zone = [z for z in zones if z.rect[2] - z.rect[0] < z.rect[3] - z.rect[1]]
-    assert len(col_zone) == 1
-    assert col_zone[0].rect[1] >= 100   # clipped away the row-zone y-range
-    assert col_zone[0].rect[3] <= 900
+    zones = build_tint_zones(gray, panels)
+    assert len(zones) == 2
+    assert all(z.hole_contours == [] for z in zones)
+
+
+def test_build_zones_connected_frame_has_one_hole():
+    """A header + footer + two columns that physically touch at their
+    corners form a single connected "frame" fully enclosing the body-text
+    area on all four sides.  The whole-page hierarchy-aware contour pass
+    must return ONE zone with ONE hole covering the body cavity -- not
+    several separately-clipped zones stitched together with an arbitrary
+    seam.  (A cavity that isn't enclosed on all sides -- e.g. left open to
+    the image border -- isn't a true topological hole, so the frame must
+    close on every side for cv2's hierarchy to detect it.)
+    """
+    h, w = 1000, 400
+    gray = np.full((h, w), 240, dtype=np.uint8)
+    gray[0:100, 0:400] = 170     # header (full width)
+    gray[900:1000, 0:400] = 170  # footer (full width)
+    gray[0:1000, 0:60] = 170     # left column (full height)
+    gray[0:1000, 340:400] = 170  # right column (full height) -- closes the frame
+    # body cavity: x=60-340, y=100-900 stays paper (240), enclosed on all sides
+
+    panels = [
+        {"rect": (0, 0, 400, 100), "gray": 0.67},
+        {"rect": (0, 900, 400, 1000), "gray": 0.67},
+        {"rect": (0, 0, 60, 1000), "gray": 0.67},
+        {"rect": (340, 0, 400, 1000), "gray": 0.67},
+    ]
+    zones = build_tint_zones(gray, panels)
+
+    assert len(zones) == 1
+    z = zones[0]
+    assert z.shape_type == "frame"
+    assert len(z.hole_contours) == 1
+
+    hx, hy, hw, hh = __import__("cv2").boundingRect(z.hole_contours[0])
+    # Hole should approximate the body cavity (x=60-340, y=100-900).
+    assert hx >= 50 and hy >= 90
+    assert hx + hw <= 350 and hy + hh <= 910
+    assert hw >= 250 and hh >= 750  # most of the cavity is captured

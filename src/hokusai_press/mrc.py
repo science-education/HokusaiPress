@@ -114,6 +114,8 @@ class MrcPageBuilder:
                 else:
                     ink = binary[y0i:y1i, x0i:x1i] == 0  # fallback
                 # Build polygon mask: only modify pixels inside the contour shape.
+                # Holes (e.g. the body-text cavity enclosed by a header/column/
+                # footer frame) are punched out so they're left untouched.
                 zone_h, zone_w = y1i - y0i, x1i - x0i
                 if zone.page_contour is not None:
                     poly_mask = np.zeros((zone_h, zone_w), dtype=np.uint8)
@@ -121,6 +123,11 @@ class MrcPageBuilder:
                     cnt_crop[:, 0, 0] -= x0i
                     cnt_crop[:, 0, 1] -= y0i
                     cv2.fillPoly(poly_mask, [cnt_crop], 255)
+                    for hole in zone.hole_contours:
+                        hole_crop = hole.copy()
+                        hole_crop[:, 0, 0] -= x0i
+                        hole_crop[:, 0, 1] -= y0i
+                        cv2.fillPoly(poly_mask, [hole_crop], 0)
                     in_shape = poly_mask > 0
                 else:
                     in_shape = np.ones((zone_h, zone_w), dtype=bool)
@@ -142,6 +149,7 @@ class MrcPageBuilder:
                     ),
                     "rect": (x0i, h - y1i, x1i, h - y0i),  # PDF y-up
                     "contour": zone.page_contour,
+                    "holes": zone.hole_contours,
                     "circle_fit": zone.circle_fit,
                     "page_h_px": h,
                 })
@@ -244,9 +252,11 @@ def _add_tint_overlays(
     (no change on paper).
 
     When a contour is present the overlay is clipped to the exact tint-shape
-    polygon via a PDF clip path (W n operator) before the XObject is painted.
-    This eliminates the black fringe that occurs when the bounding rect extends
-    beyond the actual tint region (e.g. a circular badge or a rounded corner).
+    polygon via a PDF clip path (W/W* n operator) before the XObject is
+    painted.  This eliminates the black fringe that occurs when the bounding
+    rect extends beyond the actual tint region (e.g. a circular badge or a
+    rounded corner), and -- when the zone has holes (a header/column/footer
+    frame enclosing the body text) -- keeps the enclosed cavity unpainted.
     """
     import pikepdf
 
@@ -275,15 +285,23 @@ def _add_tint_overlays(
         # painting to the actual tint polygon so corners/badges don't overflow.
         # Circles use 4-arc Bézier for mathematical precision; polygons use
         # approxPolyDP-simplified m/l/h paths.
+        # Holes (e.g. the body-text cavity enclosed by a header/column/footer
+        # frame) are appended as extra subpaths in the same clip path, and
+        # the clip operator switches to "W*" (even-odd) so they're excluded
+        # from the painted region -- the standard PDF "donut clip" technique.
         if ov.get("circle_fit") is not None:
             cx, cy, r = ov["circle_fit"]
             clip = circle_to_pdf_path(cx, cy, r, ov["page_h_px"])
+            clip_op = b"W n\n"
         elif ov.get("contour") is not None:
-            clip = contour_to_pdf_path(ov["contour"], ov["page_h_px"])
+            holes = ov.get("holes") or []
+            clip = contour_to_pdf_path(ov["contour"], ov["page_h_px"], holes)
+            clip_op = b"W* n\n" if holes else b"W n\n"
         else:
             clip = b""
+            clip_op = b"W n\n"
         if clip:
-            content = b"q /HPVecFillMultiply gs\n" + clip + b"W n\n" + inner + b"\nQ\n"
+            content = b"q /HPVecFillMultiply gs\n" + clip + clip_op + inner + b"\nQ\n"
         else:
             content = b"q /HPVecFillMultiply gs\n" + inner + b"\nQ\n"
         p.contents_add(pikepdf.Stream(pdf, content), prepend=False)

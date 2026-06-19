@@ -10,6 +10,12 @@ The goal is to reproduce this appearance in the output PDF with maximum fidelity
   - White paper areas within the panel boundary must stay white.
   - Non-rectangular shapes (rounded corners, circular badges extending beyond
     the rectangular band, L-shapes, etc.) must be clipped precisely.
+  - Panels that are physically connected on the page (e.g. a header, a
+    binding-shadow column and a footer that all touch at their corners,
+    forming a frame around the body text) must be rendered as ONE shape with
+    a hole, not as several separately-clipped rectangles stitched together --
+    any artificial split leaves a visible seam or a double-blended overlap at
+    the cut.
 
 Architecture (layered compositing with Multiply blend):
 
@@ -18,29 +24,47 @@ Architecture (layered compositing with Multiply blend):
                            identified with a zone-local threshold and kept black.
   2. Tint overlay        -- Greyscale JPEG image placed with /BM /Multiply,
                            clipped to the exact tint-shape contour via a PDF
-                           clip path (W n operator).
+                           clip path (W/W* n operator).
                            • tint background  → original grey value × 1.0 = tint
                            • paper (> TINT_HI) → 255 × 1.0 = white (identity)
                            • text stroke area → any × 0 = 0 (stays black)
 
-Contour-based clipping (replacing the earlier rectangular approach):
+Whole-page, hierarchy-aware contour detection:
   1. Compute tint_mask = pixels in [TINT_LO, TINT_HI] on the full grey image.
-  2. Apply morphological CLOSE to fill text-stroke holes and connect any
-     extensions (e.g. a circular badge hanging below the main band).
-     The close radius is ~3 % of the shorter page dimension.
-  3. cv2.findContours(RETR_EXTERNAL) gives the outer boundary of each
-     connected tint region.
-  4. cv2.approxPolyDP simplifies each contour to a manageable polyline;
-     the polyline is emitted as PDF "m / l / h" operators before "W n"
-     to set a clip path for the Multiply overlay.
-  5. The bounding rect of the contour (which may be larger than the
-     detect_tint_panels hint rect) is used as the JPEG image boundary.
+  2. Apply a modest morphological CLOSE (a small, fixed pixel radius -- not
+     scaled to page size) to bridge text-stroke holes within a tint panel
+     without eroding real shape features like rounded corners.
+  3. cv2.findContours(RETR_CCOMP) on the WHOLE PAGE in one pass gives a
+     2-level hierarchy: each top-level (outer) contour plus any holes
+     directly inside it.  If a header, a column and a footer are physically
+     touching, MORPH_CLOSE merges them into ONE connected component whose
+     outer contour is the frame's outline and whose hole is the body-text
+     cavity it encloses -- exactly the topology of the source artwork, with
+     no arbitrary row/column split and therefore no seam.
+  4. Holes much smaller than a plausible body-text cavity (i.e. ordinary
+     text-stroke gaps that MORPH_CLOSE didn't fully bridge) are discarded so
+     they don't get carved out of the tint as if they were real cavities.
+  5. cv2.approxPolyDP simplifies each outer/hole contour to a manageable
+     polyline (epsilon capped in pixels, not scaled to perimeter, so a small
+     curved feature on a very large combined contour still gets enough
+     vertices).  A small dilate/erode pass beforehand removes the hairline
+     notch that can otherwise appear where a curve is tangent to a flat edge.
+  6. The outer polyline is emitted as PDF "m/l/h" path operators; each hole's
+     polyline is appended as an additional subpath in the SAME path object,
+     and the clip operator is "W*" (even-odd) instead of "W" (nonzero) so the
+     hole is excluded from the painted area -- the standard PDF technique for
+     clipping to a shape with a cutout ("donut" clipping).
 
-Overlap deduplication:
-  Adjacent panels that share tint pixels (e.g. a horizontal band meeting a
-  vertical binding-shadow column at a corner) are merged into one connected
-  component by MORPH_CLOSE and share one contour.  A second Multiply pass
-  over the same area is therefore impossible by construction.
+Why not just keep the previous per-panel approach?  ``detect_tint_panels``
+hands us independent rectangular hints (header / footer / column) and the
+earlier implementation processed each hint in its own local crop to avoid a
+historical bug: closing the WHOLE page with a large kernel merged the three
+into one connected blob, and cv2.RETR_EXTERNAL discards a contour's holes --
+so cv2.fillPoly on that single outer contour filled the body-text cavity
+solid, not just the thin frame.  The bug was never "merging is wrong"; it was
+that the hole information was being thrown away.  Once RETR_CCOMP keeps that
+hole, the panels can be processed together -- which is also strictly simpler
+than the previous per-orientation expansion / seam-margin machinery.
 """
 
 from __future__ import annotations
@@ -60,50 +84,56 @@ ROUNDED_COVERAGE_MIN: float = 0.85
 # Minimum corner-curve pixels to qualify as a rounded rect (fraction of short side).
 CORNER_RADIUS_MIN_FRAC: float = 0.02
 
-# MORPH_CLOSE kernel: fraction of the shorter dimension of the LOCAL crop.
-# Applied per-panel on an expanded crop, so fills text-stroke holes without
-# bridging distant separate panels (which full-page MORPH_CLOSE would do).
-_CLOSE_FRAC: float = 0.030
+# Whole-page MORPH_CLOSE kernel radius, in pixels -- a FIXED absolute value,
+# not scaled to page size.  Its job is to bridge ordinary text-stroke holes
+# (a property of stroke width / scan resolution, not of how big the page is);
+# scaling it to page dimensions made it large enough to erode real rounded
+# corners on a typical-sized scan.
+_CLOSE_PX: int = 12
 _CLOSE_ITERATIONS: int = 2
 
-# Search margin beyond each panel hint rect: fraction of the larger panel dim.
-# Generous enough to capture circular badges / rounded corners that hang just
-# outside the detection hint while staying well within the panel neighbourhood.
-_EXPAND_FRAC: float = 0.10
-
 # Contour simplification: fraction of arc length used as epsilon for
-# cv2.approxPolyDP.  Keeps ~0.3 % of perimeter as maximum deviation,
-# but capped at _MAX_APPROX_ERR_PX so curved features on large contours
-# (e.g. a circle badge attached to a wide header band) retain enough vertices.
+# cv2.approxPolyDP, capped at _MAX_APPROX_ERR_PX regardless of perimeter so a
+# small curved feature (e.g. a circular badge) on a very large combined
+# contour (e.g. header+column+footer merged into one frame) still keeps
+# enough vertices to look smooth.
 _APPROX_FRAC: float = 0.003
-_MAX_APPROX_ERR_PX: float = 3.0   # hard cap on polygon approximation error (px)
+_MAX_APPROX_ERR_PX: float = 3.0
 
-# Iterative re-expansion: if the local contour touches the crop boundary we
-# may have clipped the shape.  Re-expand up to _MAX_EXPAND_ITERS times,
-# growing the margin by _EXPAND_GROW each time.
-_MAX_EXPAND_ITERS: int = 3
-_EXPAND_GROW: float = 2.0
+# Pad contours by this many pixels (dilate outer / erode holes) before
+# simplifying.  At a tangent point where a curve meets a flat edge,
+# approxPolyDP's vertex placement can leave a hairline notch a few px wide;
+# padding removes it at the cost of a few extra paper pixels marked in-shape
+# (harmless: Multiply renders paper as identity).
+_PAD_PX: int = 2
 
-# Circle detection: if a contour's compactness (4π·area/perimeter²) exceeds
-# this threshold the shape is treated as a circle and rendered with Bézier
-# arcs rather than a polygon (exact to < 0.03 % error).
+# Circle detection: if a (hole-free) contour's compactness exceeds this
+# threshold it's treated as a circle and clipped with exact Bézier arcs
+# rather than a polygon.
 _CIRCULARITY_MIN: float = 0.85
 
-# Seam margin between a clipped column and an adjacent row zone (fraction of
-# page height).  Keeps the column short of the row boundary so a transition
-# curve at the seam (e.g. column flaring into a header/footer) lands entirely
-# inside the row zone's expanded crop rather than being split between zones.
-_SEAM_MARGIN_FRAC: float = 0.025
+# A hole must occupy at least this fraction of the page area (with an
+# absolute pixel floor) to be treated as a real structural cavity -- e.g. the
+# body-text area enclosed by a header/footer/column frame -- rather than an
+# ordinary text-stroke gap that MORPH_CLOSE left unbridged.
+_MIN_HOLE_AREA_FRAC: float = 0.0005
+_MIN_HOLE_AREA_PX: int = 2000
+
+# An outer contour is only promoted to a TintZone if it overlaps at least one
+# detect_tint_panels hint by this fraction of the hint's own area -- filters
+# out unrelated tint-coloured noise elsewhere on the page.
+_MIN_PANEL_OVERLAP_FRAC: float = 0.3
 
 
 @dataclass
 class TintZone:
-    """Rendering data for one tint panel."""
+    """Rendering data for one tint shape (possibly with one or more holes)."""
 
     rect: tuple[int, int, int, int]      # (x0, y0, x1, y1) in page-image pixels
     overlay_img: np.ndarray              # HxW uint8 greyscale; 255 = transparent
     page_contour: np.ndarray | None = None  # (N,1,2) int32, page-image space (y-down)
-    shape_type: str = "rect"             # "rect" | "rounded_rect" | "poly" | "circle"
+    hole_contours: list = field(default_factory=list)  # list of (N,1,2) int32 holes
+    shape_type: str = "rect"             # "rect" | "rounded_rect" | "poly" | "circle" | "frame"
     corner_radius: float = 0.0
     contour_pts: list = field(default_factory=list)
     circle_fit: tuple[float, float, float] | None = None  # (cx, cy, r) page-image coords y-down
@@ -119,218 +149,80 @@ def build_tint_zones(
 ) -> list[TintZone]:
     """Convert raw detected panel dicts to TintZone objects.
 
-    ``panels`` is the output of ``tint_panel.detect_tint_panels``.
+    ``panels`` is the output of ``tint_panel.detect_tint_panels`` and is used
+    only as a hint to decide which connected tint components on the page are
+    worth turning into zones (filters out unrelated tint-coloured noise).
 
-    Strategy:
-      1. Split panels by orientation (row vs column) and clip column panels
-         against row-panel y-intervals to prevent overlap / double-blending.
-      2. For each panel, detect its accurate shape contour using a LOCAL
-         MORPH_CLOSE on an orientation-aware expanded crop:
-           - Row panels: expand downward only (captures circular badges that
-             hang below the detection hint rect).
-           - Column panels: expand horizontally only (captures shape edges).
-         Orientation-specific expansion avoids including tint from the
-         intersecting band, which would create a C-shape contour.
-      3. Build a TintZone with the local contour translated to page coordinates.
+    Strategy: one whole-page MORPH_CLOSE + RETR_CCOMP pass finds every
+    connected tint component together with its holes (see module docstring).
+    Physically touching panels (header/column/footer forming a frame around
+    the body text) therefore come back as ONE zone with one hole -- no
+    artificial seam between them.  A panel hint with no matching component
+    (e.g. too small / isolated for the synthetic-test cases) falls back to a
+    plain rectangular zone.
 
-    Returns a list of non-overlapping TintZone objects.
+    Returns a list of TintZone objects.
     """
     if not panels:
         return []
 
     h, w = gray.shape[:2]
+    page_area = h * w
 
-    # Step 1: separate by orientation and clip columns against rows.
-    # A small seam margin keeps the column short of each row boundary so that
-    # a column-to-row transition curve (e.g. a decorative strip flaring into a
-    # footer) is left entirely inside the row zone's expanded crop instead of
-    # being cut in half by an arbitrary y-split between the two zones.
-    row_panels, col_panels = _split_by_orientation(panels, w, h)
-    row_y_intervals = [(p["rect"][1], p["rect"][3]) for p in row_panels]
-    seam_margin = max(15, int(h * _SEAM_MARGIN_FRAC))
+    tint_mask = ((gray >= TINT_LO) & (gray <= TINT_HI)).astype(np.uint8)
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (_CLOSE_PX * 2 + 1, _CLOSE_PX * 2 + 1)
+    )
+    closed = cv2.morphologyEx(
+        tint_mask, cv2.MORPH_CLOSE, kernel, iterations=_CLOSE_ITERATIONS
+    )
 
-    clipped_cols: list[dict] = []
-    for cp in col_panels:
-        for rect in _clip_col_panel(cp["rect"], row_y_intervals, h, seam_margin):
-            clipped_cols.append({"rect": rect, "gray": cp.get("gray", 0.67)})
+    contours, hierarchy = cv2.findContours(closed, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
 
-    # Build column zones FIRST so their claimed area is known before any row
-    # zone's contour search runs.  A row zone's iterative downward/upward
-    # growth (added to capture badges and seam curves) can otherwise re-trace
-    # tint pixels that a column zone already owns -- both zones would then
-    # paint the same pixels with their own Multiply overlay, doubling the
-    # tint there (visible as an abnormally dark band down the column).
-    col_zones: list[TintZone] = []
-    for p in sorted(clipped_cols, key=lambda p: -(p["rect"][2]-p["rect"][0])*(p["rect"][3]-p["rect"][1])):
-        z = _build_zone_with_local_contour(gray, p, w, h)
+    zones: list[TintZone] = []
+    claimed = [False] * len(panels)
+
+    if contours:
+        hier = hierarchy[0]
+        min_hole_area = max(_MIN_HOLE_AREA_PX, int(page_area * _MIN_HOLE_AREA_FRAC))
+
+        for i, info in enumerate(hier):
+            parent = info[3]
+            if parent != -1:
+                continue  # a hole; collected below together with its outer parent
+            outer_cnt = contours[i]
+            if cv2.contourArea(outer_cnt) < 16:
+                continue
+
+            overlap_idx = _overlapping_panel_indices(outer_cnt, panels)
+            if not overlap_idx:
+                continue
+            for idx in overlap_idx:
+                claimed[idx] = True
+
+            holes: list[np.ndarray] = []
+            child = info[2]
+            while child != -1:
+                hole_cnt = contours[child]
+                if cv2.contourArea(hole_cnt) >= min_hole_area:
+                    holes.append(hole_cnt)
+                child = hier[child][0]
+
+            zone = _make_zone_from_components(gray, outer_cnt, holes, w, h)
+            if zone is not None:
+                zones.append(zone)
+
+    # Fallback: any hint with no matching connected component (too small or
+    # isolated for MORPH_CLOSE/area thresholds to pick up) still gets a
+    # simple rectangular zone so it isn't silently dropped.
+    for idx, p in enumerate(panels):
+        if claimed[idx]:
+            continue
+        z = _make_tint_zone_rect(gray, p["rect"])
         if z is not None:
-            col_zones.append(z)
-
-    exclude_mask = np.zeros((h, w), dtype=bool)
-    for z in col_zones:
-        ex0, ey0, ex1, ey1 = z.rect
-        if z.page_contour is not None:
-            sub = np.zeros((ey1 - ey0, ex1 - ex0), dtype=np.uint8)
-            cnt = z.page_contour.copy()
-            cnt[:, 0, 0] -= ex0
-            cnt[:, 0, 1] -= ey0
-            cv2.fillPoly(sub, [cnt], 255)
-            exclude_mask[ey0:ey1, ex0:ex1] |= sub > 0
-        else:
-            exclude_mask[ey0:ey1, ex0:ex1] = True
-
-    # Row zones search a version of the page with already-claimed column
-    # pixels hidden (forced to "paper"), so their contour can never grow back
-    # into column territory.  Their final rect/contour therefore naturally
-    # excludes it; the PDF clip path (built from that contour) is what
-    # actually gates painting, so this has no effect on legitimate areas.
-    search_gray = gray.copy()
-    search_gray[exclude_mask] = 255
-
-    row_zones: list[TintZone] = []
-    for p in sorted(row_panels, key=lambda p: -(p["rect"][2]-p["rect"][0])*(p["rect"][3]-p["rect"][1])):
-        z = _build_zone_with_local_contour(search_gray, p, w, h)
-        if z is not None:
-            row_zones.append(z)
-
-    zones = row_zones + col_zones
+            zones.append(z)
 
     return zones
-
-
-def _build_zone_with_local_contour(
-    gray: np.ndarray,
-    panel: dict,
-    page_w: int,
-    page_h: int,
-) -> "TintZone | None":
-    """Find the tint-shape contour for one panel using a LOCAL MORPH_CLOSE crop.
-
-    Expansion is orientation-aware to avoid including adjacent panels' tint:
-    row panels expand only downward (captures badges below the hint rect),
-    column panels expand only horizontally (captures side-edge variations).
-
-    Iterative re-expansion: if the found contour touches the expansion boundary
-    the badge may extend further out; the crop is doubled up to _MAX_EXPAND_ITERS
-    times in the allowed direction so the full shape is captured.
-
-    Polygon precision: epsilon is capped at _MAX_APPROX_ERR_PX regardless of
-    total perimeter, so curved features on large contours (e.g. a circle badge
-    attached to a wide header) get enough polygon vertices to look smooth.
-
-    Circle detection: contours with compactness ≥ _CIRCULARITY_MIN are stored
-    with a circle_fit (cx, cy, r) so the PDF clip path can use exact Bézier arcs.
-    """
-    x0, y0, x1, y1 = panel["rect"]
-    pw, ph = max(1, x1 - x0), max(1, y1 - y0)
-    ratio = pw / ph
-
-    if ratio >= 2.0:          # landscape / row → extend downward for badges
-        exp_left = exp_right = 0
-        # Small FIXED (non-iterating) upward margin, sized to match the seam
-        # buffer that _clip_col_panel leaves around row boundaries: large
-        # enough to capture a rounded-corner / transition curve that pokes
-        # above the hint rect at a zone seam (e.g. a column flaring into a
-        # footer), but deliberately not grown iteratively -- the column tint
-        # runs the full page height right at this x-range, so any large or
-        # iterative upward growth would bridge into it and recreate the
-        # C-shape merge bug.
-        exp_up = max(15, int(page_h * _SEAM_MARGIN_FRAC))
-        exp_down = max(20, int(ph * _EXPAND_FRAC))
-    elif ratio <= 0.5:        # portrait / column → extend horizontally only
-        exp_left = exp_right = max(20, int(pw * _EXPAND_FRAC))
-        exp_up = exp_down = 0
-    else:                      # square-ish → all-round expansion
-        margin = max(15, int(min(pw, ph) * _EXPAND_FRAC))
-        exp_left = exp_right = exp_up = exp_down = margin
-
-    best_cnt = None
-    ex0 = ey0 = ex1 = ey1 = 0
-
-    for _attempt in range(_MAX_EXPAND_ITERS):
-        ex0 = max(0, x0 - exp_left);    ey0 = max(0, y0 - exp_up)
-        ex1 = min(page_w, x1 + exp_right); ey1 = min(page_h, y1 + exp_down)
-
-        local_gray = gray[ey0:ey1, ex0:ex1]
-        local_contours = _find_tint_contours(local_gray)
-
-        lx = (x0 + x1) // 2 - ex0
-        ly = (y0 + y1) // 2 - ey0
-
-        best_cnt = None
-        for cnt in local_contours:
-            if cv2.pointPolygonTest(cnt, (float(lx), float(ly)), False) >= 0:
-                best_cnt = cnt
-                break
-
-        if best_cnt is None:
-            break  # no contour → use rect fallback below
-
-        # Check whether the contour touches the expansion boundary in the
-        # direction we are allowed to grow; if so, double the margin and retry.
-        bx, by, bw, bh = cv2.boundingRect(best_cnt)
-        crop_h, crop_w = local_gray.shape[:2]
-        need_more = False
-        if ratio >= 2.0 and (by + bh) >= crop_h - 2 and ey1 < page_h:
-            exp_down = min(page_h - y1, int(exp_down * _EXPAND_GROW))
-            need_more = True
-        elif ratio <= 0.5:
-            if bx <= 2 and ex0 > 0:
-                exp_left = min(x0, int(exp_left * _EXPAND_GROW))
-                need_more = True
-            if (bx + bw) >= crop_w - 2 and ex1 < page_w:
-                exp_right = min(page_w - x1, int(exp_right * _EXPAND_GROW))
-                need_more = True
-
-        if not need_more:
-            break
-
-    if best_cnt is None:
-        return _make_tint_zone_rect(gray, panel["rect"])
-
-    # Pad the contour by a couple of pixels before simplifying.  At a tangent
-    # point where a rounded corner meets a flat edge, approxPolyDP's vertex
-    # placement can leave a hairline notch (a few px) between the polygon and
-    # the true tint boundary; that notch shows up as a black wedge in the
-    # bilevel layer.  A small dilation removes it at the cost of a few extra
-    # paper pixels being marked in-shape, which Multiply renders as identity.
-    pad_mask = np.zeros(local_gray.shape[:2], dtype=np.uint8)
-    cv2.drawContours(pad_mask, [best_cnt], -1, 255, thickness=cv2.FILLED)
-    pad_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    pad_mask = cv2.dilate(pad_mask, pad_kernel, iterations=1)
-    padded_contours, _ = cv2.findContours(
-        pad_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
-    )
-    if padded_contours:
-        best_cnt = max(padded_contours, key=cv2.contourArea)
-
-    # Translate contour from local crop → page coordinates.
-    page_cnt = best_cnt.copy()
-    page_cnt[:, 0, 0] += ex0
-    page_cnt[:, 0, 1] += ey0
-
-    bx, by, bw, bh = cv2.boundingRect(page_cnt)
-    bx = max(0, bx);  by = max(0, by)
-    bw = min(bw, page_w - bx);  bh = min(bh, page_h - by)
-    contour_rect = (bx, by, bx + bw, by + bh)
-
-    # Adaptive approxPolyDP: cap error at _MAX_APPROX_ERR_PX so that curved
-    # sections on large contours get adequate vertex density.
-    peri = cv2.arcLength(best_cnt, True)
-    epsilon = max(1.5, min(_MAX_APPROX_ERR_PX, peri * _APPROX_FRAC))
-    approx = cv2.approxPolyDP(best_cnt, epsilon, True)
-    approx_page = approx.copy()
-    approx_page[:, 0, 0] += ex0
-    approx_page[:, 0, 1] += ey0
-
-    # Circle fit: if the contour is nearly circular use a parametric fit so the
-    # PDF clip can use exact Bézier arcs instead of a polygon.
-    circle_fit: tuple[float, float, float] | None = None
-    if _contour_circularity(best_cnt) >= _CIRCULARITY_MIN:
-        (cx_l, cy_l), r_l = cv2.minEnclosingCircle(best_cnt)
-        circle_fit = (float(cx_l) + ex0, float(cy_l) + ey0, float(r_l))
-
-    return _make_tint_zone_with_contour(gray, contour_rect, approx_page, circle_fit)
 
 
 def make_tint_overlay(gray_crop: np.ndarray) -> np.ndarray:
@@ -344,31 +236,46 @@ def make_tint_overlay(gray_crop: np.ndarray) -> np.ndarray:
     return overlay
 
 
-def contour_to_pdf_path(contour: np.ndarray, page_h_px: int) -> bytes:
-    """Convert an (N,1,2) OpenCV contour to PDF path bytes.
+def contour_to_pdf_path(
+    contour: np.ndarray,
+    page_h_px: int,
+    holes: list | None = None,
+) -> bytes:
+    """Convert an outer contour (plus optional holes) to PDF path bytes.
 
     Coordinate conversion: image space (y-down) → PDF space (y-up).
       pdf_y = page_h_px - image_y
 
-    Returns bytes suitable for insertion before "W n" in a PDF content stream.
-    The path uses the m / l / h operators (moveto / lineto / closepath).
-    All coordinates are integer pixel values; the caller's responsibility to
-    apply any further scale transform (e.g. the 72/dpi scale set by
-    _set_physical_page_size wraps the whole page in a cm, so nothing extra
-    is needed here).
+    Returns bytes suitable for insertion before a clip operator in a PDF
+    content stream.  Each contour becomes its own "m / l ... / h" subpath;
+    when holes are present the caller MUST use the even-odd clip operator
+    ("W* n") rather than nonzero ("W n") so the hole subpaths are excluded
+    from the clipped (painted) region -- the standard PDF "donut clip"
+    technique. All coordinates are integer pixel values; the caller's
+    responsibility to apply any further scale transform (e.g. the 72/dpi
+    scale set by _set_physical_page_size wraps the whole page in a cm, so
+    nothing extra is needed here).
     """
-    if contour is None or len(contour) < 3:
+    def _emit(cnt: np.ndarray) -> str | None:
+        if cnt is None or len(cnt) < 3:
+            return None
+        parts: list[str] = []
+        for i, pt in enumerate(cnt):
+            x = int(pt[0][0])
+            y = page_h_px - int(pt[0][1])   # y-up
+            parts.append(f"{x} {y} m" if i == 0 else f"{x} {y} l")
+        parts.append("h")
+        return " ".join(parts)
+
+    outer = _emit(contour)
+    if outer is None:
         return b""
-    parts: list[str] = []
-    for i, pt in enumerate(contour):
-        x = int(pt[0][0])
-        y = page_h_px - int(pt[0][1])   # y-up
-        if i == 0:
-            parts.append(f"{x} {y} m")
-        else:
-            parts.append(f"{x} {y} l")
-    parts.append("h")
-    return (" ".join(parts) + "\n").encode()
+    pieces = [outer]
+    for hole in (holes or []):
+        piece = _emit(hole)
+        if piece is not None:
+            pieces.append(piece)
+    return ("\n".join(pieces) + "\n").encode()
 
 
 def classify_tint_shape(
@@ -407,29 +314,111 @@ def classify_tint_shape(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _find_tint_contours(gray: np.ndarray) -> list[np.ndarray]:
-    """Compute tint region outer contours on the full grey image.
+def _overlapping_panel_indices(cnt: np.ndarray, panels: list[dict]) -> list[int]:
+    """Indices of panel hints that this contour overlaps by enough to count.
 
-    MORPH_CLOSE fills text-stroke holes within tint panels so that the
-    contour traces the panel boundary correctly (including extensions like
-    circular badges).  Connected tint regions (e.g. a horizontal band whose
-    binding-shadow column is also tint-coloured) are merged into one contour.
+    The overlap fraction is taken against the SMALLER of the panel hint's
+    own area and the contour's bounding-box area (not just the hint's area).
+    A small badge attached to (or near) a large header hint can overlap that
+    header by a tiny fraction of the header's own huge area while still
+    being entirely inside it -- checking only against the hint's area would
+    incorrectly reject it as "unrelated noise".
     """
-    h, w = gray.shape[:2]
-    tint_mask = ((gray >= TINT_LO) & (gray <= TINT_HI)).astype(np.uint8)
+    bx, by, bw, bh = cv2.boundingRect(cnt)
+    cnt_area = max(1, bw * bh)
+    found: list[int] = []
+    for idx, p in enumerate(panels):
+        px0, py0, px1, py1 = p["rect"]
+        ix0, iy0 = max(bx, px0), max(by, py0)
+        ix1, iy1 = min(bx + bw, px1), min(by + bh, py1)
+        if ix1 > ix0 and iy1 > iy0:
+            inter = (ix1 - ix0) * (iy1 - iy0)
+            panel_area = max(1, (px1 - px0) * (py1 - py0))
+            denom = min(panel_area, cnt_area)
+            if inter / denom >= _MIN_PANEL_OVERLAP_FRAC:
+                found.append(idx)
+    return found
 
-    close_px = max(15, int(min(h, w) * _CLOSE_FRAC))
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (close_px * 2 + 1, close_px * 2 + 1)
-    )
-    closed = cv2.morphologyEx(
-        tint_mask, cv2.MORPH_CLOSE, kernel, iterations=_CLOSE_ITERATIONS
-    )
 
-    contours, _ = cv2.findContours(
-        closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+def _pad_and_simplify(
+    cnt: np.ndarray,
+    page_h: int,
+    page_w: int,
+    grow: bool,
+) -> np.ndarray:
+    """Dilate (grow=True, for outer contours) or erode (grow=False, for
+    holes) by _PAD_PX before approxPolyDP, removing hairline notches at
+    tangent points between curves and flat edges; then simplify."""
+    bx, by, bw, bh = cv2.boundingRect(cnt)
+    pad = _PAD_PX + 2
+    x0 = max(0, bx - pad); y0 = max(0, by - pad)
+    x1 = min(page_w, bx + bw + pad); y1 = min(page_h, by + bh + pad)
+    local = cnt.copy()
+    local[:, 0, 0] -= x0
+    local[:, 0, 1] -= y0
+
+    mask = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+    cv2.drawContours(mask, [local], -1, 255, thickness=cv2.FILLED)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_PAD_PX * 2 + 1, _PAD_PX * 2 + 1))
+    mask = cv2.dilate(mask, k, iterations=1) if grow else cv2.erode(mask, k, iterations=1)
+
+    padded, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    best = max(padded, key=cv2.contourArea) if padded else local
+
+    peri = cv2.arcLength(best, True)
+    epsilon = max(1.5, min(_MAX_APPROX_ERR_PX, peri * _APPROX_FRAC))
+    approx = cv2.approxPolyDP(best, epsilon, True)
+    approx[:, 0, 0] += x0
+    approx[:, 0, 1] += y0
+    return approx
+
+
+def _make_zone_from_components(
+    gray: np.ndarray,
+    outer_cnt: np.ndarray,
+    holes: list[np.ndarray],
+    page_w: int,
+    page_h: int,
+) -> TintZone | None:
+    outer = _pad_and_simplify(outer_cnt, page_h, page_w, grow=True)
+    hole_polys = [_pad_and_simplify(hc, page_h, page_w, grow=False) for hc in holes]
+
+    bx, by, bw, bh = cv2.boundingRect(outer)
+    x0 = max(0, bx); y0 = max(0, by)
+    x1 = min(page_w, bx + bw); y1 = min(page_h, by + bh)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return None
+
+    overlay = make_tint_overlay(gray[y0:y1, x0:x1])
+
+    circle_fit: tuple[float, float, float] | None = None
+    if not hole_polys and _contour_circularity(outer_cnt) >= _CIRCULARITY_MIN:
+        (cx, cy), r = cv2.minEnclosingCircle(outer_cnt)
+        circle_fit = (float(cx), float(cy), float(r))
+
+    if circle_fit is not None:
+        shape_type = "circle"
+        corner_radius = 0.0
+    elif hole_polys:
+        shape_type = "frame"
+        corner_radius = 0.0
+    else:
+        gray_crop = gray[y0:y1, x0:x1]
+        tint_mask = ((gray_crop >= TINT_LO) & (gray_crop <= TINT_HI)).astype(np.uint8)
+        shape_type, corner_radius, _ = classify_tint_shape(tint_mask)
+        if len(outer) > 8:
+            shape_type = "poly"
+
+    return TintZone(
+        rect=(x0, y0, x1, y1),
+        overlay_img=overlay,
+        page_contour=outer,
+        hole_contours=hole_polys,
+        shape_type=shape_type,
+        corner_radius=corner_radius,
+        contour_pts=[],
+        circle_fit=circle_fit,
     )
-    return list(contours)
 
 
 def _make_tint_zone_rect(
@@ -456,117 +445,6 @@ def _make_tint_zone_rect(
         corner_radius=corner_radius,
         contour_pts=contour_pts,
     )
-
-
-def _make_tint_zone_with_contour(
-    gray: np.ndarray,
-    rect: tuple[int, int, int, int],
-    contour: np.ndarray,
-    circle_fit: tuple[float, float, float] | None = None,
-) -> TintZone | None:
-    """Build a TintZone using the actual contour (not just bounding rect)."""
-    x0, y0, x1, y1 = rect
-    h_full, w_full = gray.shape[:2]
-    x0 = max(0, x0); y0 = max(0, y0)
-    x1 = min(w_full, x1); y1 = min(h_full, y1)
-    if x1 - x0 < 4 or y1 - y0 < 4:
-        return None
-    overlay = make_tint_overlay(gray[y0:y1, x0:x1])
-
-    if circle_fit is not None:
-        shape_type = "circle"
-        corner_radius = 0.0
-    else:
-        gray_crop = gray[y0:y1, x0:x1]
-        tint_mask = (
-            (gray_crop >= TINT_LO) & (gray_crop <= TINT_HI)
-        ).astype(np.uint8)
-        shape_type, corner_radius, _ = classify_tint_shape(tint_mask)
-        if len(contour) > 8:
-            shape_type = "poly"
-
-    return TintZone(
-        rect=(x0, y0, x1, y1),
-        overlay_img=overlay,
-        page_contour=contour,
-        shape_type=shape_type,
-        corner_radius=corner_radius,
-        contour_pts=[],
-        circle_fit=circle_fit,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Orientation split and column-clip helpers (used by build_tint_zones)
-# ---------------------------------------------------------------------------
-
-def _split_by_orientation(
-    panels: list[dict],
-    page_w: int,
-    page_h: int,
-) -> tuple[list[dict], list[dict]]:
-    row_panels: list[dict] = []
-    col_panels: list[dict] = []
-    for p in panels:
-        x0, y0, x1, y1 = p["rect"]
-        pw = x1 - x0; ph = y1 - y0
-        if pw == 0 or ph == 0:
-            continue
-        ratio = pw / ph
-        if ratio >= 2.0:
-            row_panels.append(p)
-        elif ratio <= 0.5:
-            col_panels.append(p)
-        else:
-            row_panels.append(p)
-    return row_panels, col_panels
-
-
-def _clip_col_panel(
-    col_rect: tuple[int, int, int, int],
-    row_y_intervals: list[tuple[int, int]],
-    page_h: int,
-    seam_margin: int = 0,
-) -> list[tuple[int, int, int, int]]:
-    """Clip a column rect against row y-intervals.
-
-    ``seam_margin`` (page pixels) is subtracted from each free interval's edge
-    that borders a row interval, so the column stops short of the row
-    boundary.  This leaves a buffer strip that belongs to neither zone's
-    *hint rect*, which the row zone's small upward expansion (see
-    ``_build_zone_with_local_contour``) can then claim -- keeping a
-    column-to-row transition curve whole instead of split at an arbitrary
-    y-coordinate.  Default 0 preserves exact-boundary clipping for callers
-    that don't need the buffer (e.g. unit tests).
-    """
-    x0, y0, y1_orig = col_rect[0], col_rect[1], col_rect[3]
-    x1 = col_rect[2]
-    blocked: list[tuple[int, int]] = []
-    for ry0, ry1 in row_y_intervals:
-        lo = max(y0, ry0); hi = min(y1_orig, ry1)
-        if hi > lo:
-            blocked.append((lo, hi))
-    if not blocked:
-        return [(x0, y0, x1, y1_orig)]
-    blocked.sort()
-    merged: list[tuple[int, int]] = [blocked[0]]
-    for lo, hi in blocked[1:]:
-        if lo <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
-        else:
-            merged.append((lo, hi))
-    free: list[tuple[int, int, int, int]] = []
-    cursor = y0
-    for blo, bhi in merged:
-        if cursor < blo:
-            seg_end = max(cursor, blo - seam_margin)
-            if seg_end > cursor:
-                free.append((x0, cursor, x1, seg_end))
-        cursor = max(cursor, bhi + seam_margin)
-    if cursor < y1_orig:
-        free.append((x0, cursor, x1, y1_orig))
-    min_h = max(4, int(page_h * 0.030))
-    return [(x0, y0c, x1, y1c) for (x0, y0c, x1, y1c) in free if y1c - y0c >= min_h]
 
 
 # ---------------------------------------------------------------------------
@@ -605,9 +483,12 @@ def circle_to_pdf_path(cx: float, cy: float, r: float, page_h_px: int) -> bytes:
 def zone_diff_stats(gray: np.ndarray, zones: list[TintZone]) -> list[dict]:
     """Per-zone accuracy: false-negative (missed tint) and false-positive counts.
 
+    Holes are subtracted from the in-shape mask, matching the actual rendered
+    (even-odd clipped / hole-punched) coverage.
+
     Returns a list of dicts::
         zone_idx, rect, shape_type, tint_px,
-        false_neg_px  (tint outside the polygon),
+        false_neg_px  (tint outside the polygon, or inside a hole),
         false_pos_px  (non-tint inside the polygon),
         coverage_pct  (tint pixels covered / total tint pixels × 100),
         n_polygon_pts
@@ -632,6 +513,11 @@ def zone_diff_stats(gray: np.ndarray, zones: list[TintZone]) -> list[dict]:
             cnt_crop[:, 0, 0] -= x0c
             cnt_crop[:, 0, 1] -= y0c
             cv2.fillPoly(mask, [cnt_crop], 255)
+            for hole in zone.hole_contours:
+                hole_crop = hole.copy()
+                hole_crop[:, 0, 0] -= x0c
+                hole_crop[:, 0, 1] -= y0c
+                cv2.fillPoly(mask, [hole_crop], 0)
             in_shape = mask > 0
         else:
             in_shape = np.ones((zh, zw), dtype=bool)
