@@ -34,26 +34,52 @@ _TINT_LO: int = 60
 _TINT_HI: int = 220
 _TINT_TEXT_DELTA: int = 40  # local_bg(tint pix) - 40 → local ink threshold
 
-# Morphological-closing radius used to estimate the LOCAL background tone
-# (see _local_tint_background).  A single TintZone can now span most of the
-# page (header+column+footer merged into one shape -- see tint_zone.py), so
-# one median over the whole zone is too coarse: a darker accent area (e.g. a
-# title printed on a deliberately darker strip of the header) sits close
-# enough to the page-wide median that ordinary scan grain straddles the
-# resulting threshold, speckling that area black/white at the pixel level.
-# 25px is wide enough to fully bridge ordinary body-text-scale stroke gaps
-# without eroding genuine background-tone transitions at that scale.
+# Local-background window radius (see _local_tint_background).  A single
+# TintZone can now span most of the page (header+column+footer merged into
+# one shape -- see tint_zone.py), so one median over the whole zone is too
+# coarse: a darker accent area (e.g. a title printed on a deliberately
+# darker strip of the header) sits close enough to the page-wide median that
+# ordinary scan grain straddles the resulting threshold, speckling that area
+# black/white at the pixel level.
 #
+# The estimator is a MEDIAN filter, not morphological closing: closing
+# (dilate-then-erode) is biased toward the brighter extreme near any bright
+# feature -- right around a white knockout letter, dilate spreads the
+# letter's brightness outward and erode needs an even wider dark margin to
+# pull it back down, so the background estimate just outside the letter
+# reads brighter than the true tint.  That inflates ink_T enough to
+# misclassify genuine tint-background pixels near the letter as ink, drawn
+# as a dark halo hugging every stroke.  A median is symmetric: as long as
+# background pixels are the majority inside the window (true away from
+# unusually dense text), it tracks the true local tint regardless of nearby
+# bright or dark outliers.
+#
+# 25px is wide enough to outvote ordinary body-text-scale stroke width
+# without blurring across genuine background-tone transitions at that scale.
 # Small, mostly-decorative zones (e.g. a circular badge with its own small
-# caption text, detected as its own zone because it isn't physically
-# connected to a larger panel) use a smaller radius instead: a badge's own
-# lettering is small enough that a 25px close bridges across letterforms
-# entirely, pulling the white knockout's brightness into the surrounding
-# tint estimate and making the background read as darker than it is.
-_LOCAL_BG_CLOSE_PX: int = 25
-_LOCAL_BG_CLOSE_SMALL_PX: int = 10
-_LOCAL_BG_SMALL_ZONE_DIM: int = 600  # zones with both dims <= this use the small radius
-_LOCAL_BG_MAX_DIM: int = 1800  # downscale ceiling so closing a page-sized zone stays cheap
+# caption, detected as its own zone because it isn't physically connected to
+# a larger panel) use a smaller window: a badge's own lettering is small
+# enough that a 25px window would itself be dominated by the letters' own
+# white knockout rather than the surrounding tint.
+_LOCAL_BG_WINDOW_PX: int = 25
+_LOCAL_BG_WINDOW_SMALL_PX: int = 10
+_LOCAL_BG_SMALL_ZONE_DIM: int = 600  # zones with both dims <= this use the small window
+_LOCAL_BG_MAX_DIM: int = 2400  # downscale ceiling so filtering a page-sized zone stays cheap
+
+# Tint overlays downsample less aggressively than photo overlays
+# (self.scale, tied to photo_dpi).  A real photograph's own texture hides
+# JPEG block boundaries; a tint panel is a large flat colour field, so the
+# SAME amount of downsampling makes 8x8 JPEG blocks clearly visible once
+# upsampled back to page resolution -- a "mosaic" that doesn't exist in the
+# source scan.  300 dpi (vs photo_dpi's default 200) costs roughly +30% on
+# this layer's bytes but removes the visible blocking.
+_TINT_OVERLAY_DPI: int = 300
+
+# After thresholding, an isolated 1-2px "ink" speck (ordinary scan grain that
+# dipped just below ink_T) is removed: a real text stroke is always several
+# pixels wide and connected, so opening with a kernel below stroke width
+# only erases noise that was never a real stroke to begin with.
+_INK_DESPECKLE_PX: int = 1
 
 
 class MrcPageBuilder:
@@ -63,6 +89,7 @@ class MrcPageBuilder:
                  target_dpi: int = 600, jpeg_quality: int = 85):
         self.compress = compress
         self.scale = max(photo_dpi / target_dpi, 0.05)
+        self.tint_scale = max(_TINT_OVERLAY_DPI / target_dpi, 0.05)
         self.jpeg_quality = jpeg_quality
         self._pages: list[dict] = []
 
@@ -158,12 +185,13 @@ class MrcPageBuilder:
                 region = binary[y0i:y1i, x0i:x1i]
                 region[in_shape & ~ink_in_shape] = 255   # tint bg → white
                 region[ink_in_shape] = 0                  # text strokes → black
-                # Overlay: greyscale, downsampled like photo overlays.
+                # Overlay: greyscale, downsampled to _TINT_OVERLAY_DPI (less
+                # aggressively than photo overlays -- see that constant).
                 ov_gray = zone.overlay_img              # HxW uint8
                 ov_ds = cv2.resize(
                     ov_gray,
-                    (max(1, int((x1i - x0i) * self.scale)),
-                     max(1, int((y1i - y0i) * self.scale))),
+                    (max(1, int((x1i - x0i) * self.tint_scale)),
+                     max(1, int((y1i - y0i) * self.tint_scale))),
                     interpolation=cv2.INTER_AREA,
                 )
                 tint_overlays.append({
@@ -247,25 +275,22 @@ def _is_grayish(bgr: np.ndarray) -> bool:
 
 
 def _local_tint_background(crop_gray: np.ndarray) -> np.ndarray:
-    """Per-pixel local background estimate via morphological closing.
+    """Per-pixel local background estimate via a median filter.
 
-    Closing (dilate then erode) replaces a dark text stroke with the
-    brighter background around it, as long as the kernel is wider than the
-    stroke -- giving a smooth "what colour is the paper/tint here, ignoring
-    ink" estimate at every pixel.  Radius is picked from the crop's own size
-    (see _LOCAL_BG_CLOSE_PX docstring) rather than from crop content: an
+    See _LOCAL_BG_WINDOW_PX docstring for why a median (not morphological
+    closing) is used.  Window radius is picked from the crop's own size: an
     earlier content-based estimate (measuring stroke width via a coarse ink
     mask) was tried and discarded -- for a zone whose crop spans most of the
     page, the dominant "ink" by area is ordinary body-paragraph text, which
     has nothing to do with the stroke scale actually relevant to the tint
-    panel embedded in that same crop, and using it skewed the radius badly.
-    Downscaled for very large zones so closing a page-sized crop stays cheap.
+    panel embedded in that same crop, and using it skewed the window badly.
+    Downscaled for very large zones so filtering a page-sized crop stays cheap.
     """
     h, w = crop_gray.shape[:2]
     radius = (
-        _LOCAL_BG_CLOSE_SMALL_PX
+        _LOCAL_BG_WINDOW_SMALL_PX
         if max(h, w) <= _LOCAL_BG_SMALL_ZONE_DIM
-        else _LOCAL_BG_CLOSE_PX
+        else _LOCAL_BG_WINDOW_PX
     )
 
     max_dim = max(h, w)
@@ -281,11 +306,12 @@ def _local_tint_background(crop_gray: np.ndarray) -> np.ndarray:
         work = crop_gray
 
     k = 2 * radius + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    closed = cv2.morphologyEx(work, cv2.MORPH_CLOSE, kernel)
+    # cv2.medianBlur only accepts uint8/float32 with ksize <= 5 for multi-
+    # channel; for single-channel uint8 any odd ksize is fine.
+    bg = cv2.medianBlur(work, k)
     if work.shape != crop_gray.shape:
-        closed = cv2.resize(closed, (w, h), interpolation=cv2.INTER_LINEAR)
-    return closed.astype(np.float32)
+        bg = cv2.resize(bg, (w, h), interpolation=cv2.INTER_LINEAR)
+    return bg.astype(np.float32)
 
 
 def _tint_ink_mask(crop_gray: np.ndarray) -> np.ndarray:
@@ -295,10 +321,17 @@ def _tint_ink_mask(crop_gray: np.ndarray) -> np.ndarray:
     background tone at each pixel instead of one value for the whole zone,
     so a darker accent area elsewhere in a (now potentially page-spanning)
     zone doesn't get judged against an unrelated, brighter global median.
+    A small opening removes isolated scan-grain pixels that dipped just
+    below the threshold without forming an actual (multi-pixel, connected)
+    stroke -- see _INK_DESPECKLE_PX.
     """
     local_bg = _local_tint_background(crop_gray)
     ink_t = np.maximum(_TINT_LO, local_bg - float(_TINT_TEXT_DELTA))
-    return crop_gray.astype(np.float32) < ink_t
+    ink = (crop_gray.astype(np.float32) < ink_t).astype(np.uint8)
+    dk = 2 * _INK_DESPECKLE_PX + 1
+    despeckle_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dk, dk))
+    ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, despeckle_kernel)
+    return ink > 0
 
 
 def _add_overlay_named(dest, overlay_page, rect, name: str) -> None:

@@ -8,8 +8,8 @@ import pikepdf
 
 from hokusai_press.mrc import (
     MrcPageBuilder,
-    _LOCAL_BG_CLOSE_PX,
-    _LOCAL_BG_CLOSE_SMALL_PX,
+    _LOCAL_BG_WINDOW_PX,
+    _LOCAL_BG_WINDOW_SMALL_PX,
     _TINT_LO,
     _TINT_HI,
     _TINT_TEXT_DELTA,
@@ -134,12 +134,19 @@ def test_tint_ink_mask_uses_local_background_for_mixed_tones():
     assert local_ink[:, split:].mean() == 0.0
 
 
-def test_tint_ink_mask_small_zone_uses_small_radius_for_badge_text():
+def test_tint_ink_mask_median_avoids_closing_halo_around_small_glyphs():
     """A small standalone zone (e.g. a circular badge with its own small
-    caption) must not use the large-panel closing radius: that radius is
-    wide enough to bridge clean across the badge's own small letterforms,
-    pulling the white knockout's brightness into the surrounding tint
-    estimate and making the background between strokes read as ink.
+    caption) must not misclassify the tint background around its own
+    letterforms as ink.
+
+    Morphological closing (the earlier approach) is biased toward the
+    brighter extreme near any bright feature: dilating spreads a white
+    knockout letter's brightness outward, and eroding needs an even wider
+    dark margin to pull the estimate back down, so the background estimate
+    right around the letter reads brighter than the true tint -- which
+    inflates ink_T enough to draw a dark halo hugging every stroke.  A
+    median has no such bias, so it shouldn't reproduce the halo even at the
+    same (large) window the old closing-based code used.
     """
     crop_gray = np.full((90, 170), 255, dtype=np.uint8)
     y0, y1 = 23, 67
@@ -150,20 +157,21 @@ def test_tint_ink_mask_small_zone_uses_small_radius_for_badge_text():
         cv2.rectangle(crop_gray, (x, y0 + 17), (x + 11, y0 + 21), 85, -1)
     assert max(crop_gray.shape) <= 600  # this is the "small zone" regime
 
-    fixed_k = 2 * _LOCAL_BG_CLOSE_PX + 1
-    fixed_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (fixed_k, fixed_k))
-    fixed_bg = cv2.morphologyEx(crop_gray, cv2.MORPH_CLOSE, fixed_kernel)
-    fixed_ink_t = np.maximum(_TINT_LO, fixed_bg.astype(np.float32) - _TINT_TEXT_DELTA)
-    fixed_ink = crop_gray.astype(np.float32) < fixed_ink_t
+    old_closing_k = 2 * _LOCAL_BG_WINDOW_PX + 1
+    old_closing_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (old_closing_k, old_closing_k)
+    )
+    old_bg = cv2.morphologyEx(crop_gray, cv2.MORPH_CLOSE, old_closing_kernel)
+    old_ink_t = np.maximum(_TINT_LO, old_bg.astype(np.float32) - _TINT_TEXT_DELTA)
+    old_closing_ink = crop_gray.astype(np.float32) < old_ink_t
 
     # Probe only the tint background between/around the glyphs, not the
-    # strokes themselves.  The large radius lets the white area surrounding
-    # this narrow badge band flood in and turns this background black.
+    # strokes themselves -- closing's halo shows up there as false "ink".
     tint_background = np.zeros_like(crop_gray, dtype=bool)
     tint_background[y0 + 8:y1 - 8, 25:145] = True
     tint_background &= crop_gray == 180
-    assert fixed_ink[tint_background].mean() > 0.90
+    assert old_closing_ink[tint_background].mean() > 0.90
 
-    small_radius_ink = _tint_ink_mask(crop_gray)
-    assert small_radius_ink[tint_background].mean() == 0.0
-    assert _LOCAL_BG_CLOSE_SMALL_PX < _LOCAL_BG_CLOSE_PX
+    median_ink = _tint_ink_mask(crop_gray)
+    assert median_ink[tint_background].mean() == 0.0
+    assert _LOCAL_BG_WINDOW_SMALL_PX < _LOCAL_BG_WINDOW_PX
