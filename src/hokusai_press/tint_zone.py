@@ -154,17 +154,46 @@ def build_tint_zones(
         for rect in _clip_col_panel(cp["rect"], row_y_intervals, h, seam_margin):
             clipped_cols.append({"rect": rect, "gray": cp.get("gray", 0.67)})
 
-    # Rows first (largest first), then clipped columns.
-    all_panels = (
-        sorted(row_panels, key=lambda p: -(p["rect"][2]-p["rect"][0])*(p["rect"][3]-p["rect"][1]))
-        + sorted(clipped_cols, key=lambda p: -(p["rect"][2]-p["rect"][0])*(p["rect"][3]-p["rect"][1]))
-    )
-
-    zones: list[TintZone] = []
-    for p in all_panels:
+    # Build column zones FIRST so their claimed area is known before any row
+    # zone's contour search runs.  A row zone's iterative downward/upward
+    # growth (added to capture badges and seam curves) can otherwise re-trace
+    # tint pixels that a column zone already owns -- both zones would then
+    # paint the same pixels with their own Multiply overlay, doubling the
+    # tint there (visible as an abnormally dark band down the column).
+    col_zones: list[TintZone] = []
+    for p in sorted(clipped_cols, key=lambda p: -(p["rect"][2]-p["rect"][0])*(p["rect"][3]-p["rect"][1])):
         z = _build_zone_with_local_contour(gray, p, w, h)
         if z is not None:
-            zones.append(z)
+            col_zones.append(z)
+
+    exclude_mask = np.zeros((h, w), dtype=bool)
+    for z in col_zones:
+        ex0, ey0, ex1, ey1 = z.rect
+        if z.page_contour is not None:
+            sub = np.zeros((ey1 - ey0, ex1 - ex0), dtype=np.uint8)
+            cnt = z.page_contour.copy()
+            cnt[:, 0, 0] -= ex0
+            cnt[:, 0, 1] -= ey0
+            cv2.fillPoly(sub, [cnt], 255)
+            exclude_mask[ey0:ey1, ex0:ex1] |= sub > 0
+        else:
+            exclude_mask[ey0:ey1, ex0:ex1] = True
+
+    # Row zones search a version of the page with already-claimed column
+    # pixels hidden (forced to "paper"), so their contour can never grow back
+    # into column territory.  Their final rect/contour therefore naturally
+    # excludes it; the PDF clip path (built from that contour) is what
+    # actually gates painting, so this has no effect on legitimate areas.
+    search_gray = gray.copy()
+    search_gray[exclude_mask] = 255
+
+    row_zones: list[TintZone] = []
+    for p in sorted(row_panels, key=lambda p: -(p["rect"][2]-p["rect"][0])*(p["rect"][3]-p["rect"][1])):
+        z = _build_zone_with_local_contour(search_gray, p, w, h)
+        if z is not None:
+            row_zones.append(z)
+
+    zones = row_zones + col_zones
 
     return zones
 
