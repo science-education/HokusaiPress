@@ -453,3 +453,26 @@ HokusaiPressでの利用:
   - zone1（大ゾーン）は `k4_flate`, `class=solid_fill`, `mae=9.42`, `p95=26`, `bad_frac=0.0298`, centers `[134, 163, 187, 192]`。
   - `tint_render_quality(..., deviation_threshold=40.0)` は境界タイル1件（`too_light`, deviation約40.8）を検出したため、上記の最終ラベル割当修正を追加した。
   - 保存crop: `p29_k4_flate_title_crop.png`, `p29_k4_flate_badge_crop.png`。
+
+### 10b. 2026-06-20 追記: 最終検証完走 + コミット済み（後続セッション向け）
+
+Codexのシェル障害(`-1073741502`)で未完だった検証を、別セッションで完走させた。
+
+- 原因: 多数の孤児プロセス(codex.exe等)残留によるリソース枯渇。`taskkill /F /IM codex.exe` で解消後は正常動作。
+- **full pytest: `151 passed, 2 warnings`**（`tests/` 全体）。
+- **p29再計測（最終ラベル割当修正後の現行コード）**:
+  - スクリプトはインラインで再実行（`render_page_image`→`build_pdf`→pikepdfでfilter確認→pdfiumでレンダリングし`tint_render_quality`）。
+  - 出力: `C:\tmp\improvements_review\abc_visual\k4flate_FINAL.pdf`。
+  - **サイズ: `961,865 -> 390,823 bytes`（約59%削減）**。
+    - ※Codex報告の193,098 bytesより大きいが、これは最終ラベル割当修正(境界タイル対策)を含む現行コードでの実測値。193KB版は対策前の計測なので、391KBが正。
+  - filters: `CCITTFaxDecode + DCTDecode + FlateDecode`（意図通り）。
+  - **`tint_render_quality(..., deviation_threshold=40.0)` → 問題タイル0件**（境界タイル対策が効いている）。
+  - 目視crop: `k4_title.png`(タイトル帯=k4+Flate), `k4_badge.png`(コラム=JPEGフォールバック), `k4_fullpage.png`(全体)。いずれも文字滲み・黒塊なし。
+- **コミット済み**:
+  - HokusaiPress(ブランチ `param-profile`): `4137ba7` "Compress tint overlays via photo-aware k4 posterize + FlateDecode"
+  - Yomitoku_NDL-OCR-Lite(ブランチ `main`): `b44b07f` "Fix _page_pdf_jbig2 page construction for newer pikepdf"
+
+### 残課題・次セッションの注意点
+- **JBIG2は導入済みだが既定では未使用**: `MrcPageBuilder(compress=...)` のデフォルトは `g4`。JBIG2を使うには `compress="jbig2"` を渡す必要がある。`jbig2`バイナリはWSLラッパー(`%LOCALAPPDATA%\jbig2-wrapper\jbig2.cmd`)経由で、**新しいシェルのPATHにwrapperディレクトリが通っていることが前提**。CI/別マシンでは未導入なので、JBIG2をデフォルト化する場合はフォールバック設計が要る。
+- **k4 posterizeのパラメータ**は p29 一枚で調整した値（`mae<=10`, `p95<=28`, `bad_frac<=0.03`, K=4）。他ページ・他冊子での汎化は未検証。写真誤判定が起きると破綻するので、複数ページでの回帰確認が望ましい。
+- これらk4関連定数・関数は `src/hokusai_press/mrc.py`(`_try_posterized_tint_overlay_pdf`, `_smooth_tint_for_posterize`, `_encode_gray_flate_page_pdf` 等)にある。
