@@ -78,6 +78,29 @@ def test_confident_nombre_anchored_else_fallback_all_keep_margin():
     assert abs(o0 - o1) < 1.0
 
 
+def test_confident_nombre_anchored_horizontally_too():
+    # Two confident recto pages whose content boxes differ in WIDTH (one page
+    # simply has more ink) but whose nombre sits the same distance in from the
+    # content's left edge. Centering on each page's own (slightly different)
+    # content width alone would make the nombre drift sideways in the output --
+    # it must instead land at a consistent horizontal offset, exactly like the
+    # vertical anchor above.
+    def conf(idx, content, nombre):
+        p = _page(idx, content, dpi=600, nombre=nombre)
+        p.page_number = 10 + idx
+        return p
+
+    pages = [
+        conf(0, Box(200, 300, 600, 900), Box(220, 930, 260, 960)),
+        conf(2, Box(200, 300, 700, 900), Box(220, 930, 260, 960)),
+    ]
+    normalize_margins(pages, output_margin_mm=5.0)
+
+    x0 = pages[0].margin.nombre_box.x0 - pages[0].margin.crop.x0
+    x1 = pages[1].margin.nombre_box.x0 - pages[1].margin.crop.x0
+    assert abs(x0 - x1) < 1.0
+
+
 def test_margin_at_least_output_margin_on_all_sides():
     # the crop must sit >= output margin outside the content on every side
     # (never touching it) -- deterministic centered + head-margin placement.

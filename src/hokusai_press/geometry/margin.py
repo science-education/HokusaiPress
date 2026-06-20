@@ -241,8 +241,14 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     Positioning fuses two strategies under a hard ">= output margin on all four
     sides" guarantee (the crop never touches the content):
     - when a page's nombre is CONFIDENT (a page number was assigned by the OCR
-      sequence resolver), its vertical position is nombre-anchored to that
-      parity's common offset so the body sits consistently across the book;
+      sequence resolver), its position is nombre-anchored on BOTH axes to that
+      parity's common offset so the body -- and the nombre itself -- sits
+      consistently across the book (an unanchored axis lets the nombre's
+      pixel position drift page to page, e.g. horizontally if only the
+      vertical axis is anchored: each page's own content-box width/center
+      varies a little with how much ink it has, and "centered on content"
+      reintroduces exactly the per-page jitter nombre-anchoring was meant to
+      remove);
     - otherwise (low-confidence / no OCR), it falls back to the deterministic
       placement: horizontally centered with a constant head (top) margin.
     Either way the offset is clamped so every side keeps >= the output margin.
@@ -262,8 +268,9 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     max_w = max(extent(p, p.margin.content.width) for p in have)
     max_h = max(extent(p, p.margin.content.height) for p in have)
 
-    # common nombre vertical offset per parity, from CONFIDENT pages only
+    # common nombre offset per parity (both axes), from CONFIDENT pages only
     common_noff: dict[int, float] = {}
+    common_noff_x: dict[int, float] = {}
     by_parity: dict[int, list] = {0: [], 1: []}
     for p in have:
         by_parity[p.source.page_index % 2].append(p)
@@ -272,6 +279,10 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
                 for p in group if confident(p)]
         if offs:
             common_noff[parity] = float(np.median(offs))
+        offs_x = [extent(p, p.margin.nombre_box.x0 - p.margin.content.x0)
+                  for p in group if confident(p)]
+        if offs_x:
+            common_noff_x[parity] = float(np.median(offs_x))
 
     for p in have:
         dpi = p.dpi if use_dpi else 1.0
@@ -279,8 +290,15 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
         crop_w = (max_w + 2 * (output_margin_mm / 25.4)) * (dpi if use_dpi else 1)
         crop_h = (max_h + 2 * (output_margin_mm / 25.4)) * (dpi if use_dpi else 1)
         c = p.margin.content
-        x0 = c.x0 + c.width / 2 - crop_w / 2          # horizontal: centered
         noff = common_noff.get(p.source.page_index % 2)
+        noff_x = common_noff_x.get(p.source.page_index % 2)
+        if confident(p) and noff_x is not None:
+            # place the body so this page's nombre sits at the common
+            # horizontal offset too, not just centered on this page's own
+            # (slightly varying) content-box width
+            x0 = p.margin.nombre_box.x0 - noff_x * (dpi if use_dpi else 1) - margin_px
+        else:
+            x0 = c.x0 + c.width / 2 - crop_w / 2      # fallback: centered
         if confident(p) and noff is not None:
             # place the body so this page's nombre sits at the common offset
             y0 = p.margin.nombre_box.y0 - noff * (dpi if use_dpi else 1) - margin_px
