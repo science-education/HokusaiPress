@@ -21,6 +21,7 @@ to physical points afterwards.
 from __future__ import annotations
 
 from io import BytesIO
+import zlib
 
 import cv2
 import numpy as np
@@ -75,11 +76,57 @@ _LOCAL_BG_MAX_DIM: int = 2400  # downscale ceiling so filtering a page-sized zon
 # this layer's bytes but removes the visible blocking.
 _TINT_OVERLAY_DPI: int = 300
 
+# Posterized lossless tint overlays.  These are only used for non-photo tint
+# panels and only when the measured error against the source overlay stays low.
+_TINT_POSTERIZE_K: int = 4
+_TINT_POSTERIZE_SAMPLE_MAX: int = 200_000
+_TINT_POSTERIZE_MAE_MAX: float = 10.0
+_TINT_POSTERIZE_P95_MAX: float = 28.0
+_TINT_POSTERIZE_BAD_DELTA: int = 32
+_TINT_POSTERIZE_BAD_FRAC_MAX: float = 0.03
+
+# The PDF tint overlay is clipped to the exact contour, but the bilevel base
+# layer should be a little more forgiving at the OUTER tint boundary.  ADF/Otsu
+# can leave a tiny black edge blob just outside the contour; whitening the base
+# under a slightly dilated outer mask removes that without changing the overlay
+# geometry.  Holes are not dilated, so body text inside a frame cavity is not
+# eaten.
+_BASE_WHITEOUT_DILATE_PX: int = 2
+_TINT_EDGE_DIRT_BAND_PX: int = 8
+
 # After thresholding, an isolated 1-2px "ink" speck (ordinary scan grain that
 # dipped just below ink_T) is removed: a real text stroke is always several
 # pixels wide and connected, so opening with a kernel below stroke width
 # only erases noise that was never a real stroke to begin with.
 _INK_DESPECKLE_PX: int = 1
+
+# White knockout text / paper cutouts inside a tint zone are deliberately NOT
+# ink.  Scanner noise in those bright areas can be very dark and can form
+# clusters too large for the final page-level despeckle.  OCR text boxes let
+# us distinguish "text for search" from "black text for bilevel rendering":
+# a bright text box on a tint background is rendered by the tint overlay, not
+# by the bilevel ink mask.
+_KNOCKOUT_WHITE_MIN: int = 225
+_KNOCKOUT_DILATE_PX: int = 2
+_KNOCKOUT_NOISE_MAX_AREA: int = 512
+_KNOCKOUT_TEXT_BRIGHT_FRAC_MIN: float = 0.02
+_KNOCKOUT_TEXT_DARK_FRAC_MAX: float = 0.12
+_KNOCKOUT_TEXT_PAD_PX: int = 2
+
+# Hysteresis for tint-zone ink.  Weak pixels are kept only when connected to a
+# stronger core, which prevents ordinary tint grain from becoming a black
+# component while preserving real strokes that have a dark centre.
+_TINT_STRONG_TEXT_DELTA: int = 65
+_TINT_STRONG_ABS_MAX: int = 105
+
+# A tint tone transition (for example the lower-right corner of a dark header
+# block meeting a lighter band) can make halftone dots connect into a compact
+# component.  It passes the weak/strong hysteresis, but unlike real black text
+# it has no genuinely dark core and it sits in a high-contrast neighbourhood.
+_TINT_EDGE_NOISE_MAX_AREA: int = 192
+_TINT_EDGE_NOISE_DARK_CORE_MAX: int = 95
+_TINT_EDGE_NOISE_NEIGHBOR_PX: int = 8
+_TINT_EDGE_NOISE_NEIGHBOR_RANGE_MIN: int = 80
 
 # The GLOBAL Otsu threshold (binarize_bw) has no despeckling at all -- only
 # the tint-zone-internal ink mask above does.  Ordinary scan grain is an
@@ -117,6 +164,7 @@ class MrcPageBuilder:
         vector_fills = vector_fills or []
         tint_zones = tint_zones or []
         tint_overlays: list[dict] = []
+        vector_tint_fills: list[dict] = []
 
         if mode in ("gray", "color"):
             base_pdf = encode_page_pdf(out_bgr, mode, self.compress)
@@ -173,23 +221,31 @@ class MrcPageBuilder:
                 # footer frame) are punched out so they're left untouched.
                 zone_h, zone_w = y1i - y0i, x1i - x0i
                 if zone.page_contour is not None:
-                    poly_mask = np.zeros((zone_h, zone_w), dtype=np.uint8)
+                    outer_mask = np.zeros((zone_h, zone_w), dtype=np.uint8)
                     cnt_crop = zone.page_contour.copy()
                     cnt_crop[:, 0, 0] -= x0i
                     cnt_crop[:, 0, 1] -= y0i
-                    cv2.fillPoly(poly_mask, [cnt_crop], 255)
+                    cv2.fillPoly(outer_mask, [cnt_crop], 255)
+                    hole_mask = np.zeros((zone_h, zone_w), dtype=np.uint8)
                     for hole in zone.hole_contours:
                         hole_crop = hole.copy()
                         hole_crop[:, 0, 0] -= x0i
                         hole_crop[:, 0, 1] -= y0i
-                        cv2.fillPoly(poly_mask, [hole_crop], 0)
-                    in_shape = poly_mask > 0
+                        cv2.fillPoly(hole_mask, [hole_crop], 255)
+                    in_shape = (outer_mask > 0) & (hole_mask == 0)
+                    base_shape = _base_whiteout_mask(outer_mask, hole_mask)
                 else:
+                    outer_mask = np.full((zone_h, zone_w), 255, dtype=np.uint8)
+                    hole_mask = np.zeros((zone_h, zone_w), dtype=np.uint8)
                     in_shape = np.ones((zone_h, zone_w), dtype=bool)
+                    base_shape = in_shape
 
                 tint_pix = crop_gray[
                     (crop_gray >= _TINT_LO) & (crop_gray <= _TINT_HI) & in_shape
                 ]
+                edge_fill_value = (
+                    int(round(float(np.median(tint_pix)))) if tint_pix.size else 255
+                )
                 if tint_pix.size >= 100:
                     # The zone's bounding RECT is not the zone's own shape --
                     # a rounded corner or circle's bbox always includes some
@@ -203,33 +259,71 @@ class MrcPageBuilder:
                     # Filling out-of-shape pixels with the zone's own tint
                     # median keeps that real edge from leaking into the
                     # window used near it.
-                    fill_value = float(np.median(tint_pix))
-                    masked_crop = np.where(in_shape, crop_gray, fill_value).astype(np.uint8)
-                    ink = _tint_ink_mask(masked_crop)
+                    masked_crop = np.where(
+                        in_shape, crop_gray, edge_fill_value
+                    ).astype(np.uint8)
+                    knockout_text = _knockout_text_mask(
+                        crop_gray, lines, x0i, y0i, in_shape
+                    )
+                    ink = _tint_ink_mask(masked_crop, knockout_text)
                 else:
                     ink = binary[y0i:y1i, x0i:x1i] == 0  # fallback
+                edge_dirt = _tint_overlay_edge_dirt_mask(crop_gray, outer_mask, hole_mask)
+                ink[edge_dirt] = 0
                 ink_in_shape = ink & in_shape
                 region = binary[y0i:y1i, x0i:x1i]
-                region[in_shape & ~ink_in_shape] = 255   # tint bg → white
+                region[base_shape & ~ink_in_shape] = 255  # tint bg / edge → white
                 region[ink_in_shape] = 0                  # text strokes → black
+                if zone.page_contour is not None:
+                    fx0, fy0, fringe = _base_edge_fringe_mask(
+                        zone.page_contour, zone.hole_contours, h, w
+                    )
+                    if fringe.size:
+                        edge_region = binary[fy0:fy0 + fringe.shape[0],
+                                             fx0:fx0 + fringe.shape[1]]
+                        edge_region[fringe] = 255
                 # Overlay: greyscale, downsampled to _TINT_OVERLAY_DPI (less
                 # aggressively than photo overlays -- see that constant).
+                #
+                # Do not reduce tint zones to PDF vector fills here.  Large
+                # halftone areas can be semantically flat, but clipped vector
+                # fills make seams visible at tone boundaries and glyph holes.
+                # Keep tint as raster and investigate posterized lossless
+                # image compression instead.
                 ov_gray = zone.overlay_img              # HxW uint8
+                ov_gray = _clean_tint_overlay_edge(ov_gray, edge_dirt, edge_fill_value)
                 ov_ds = cv2.resize(
                     ov_gray,
                     (max(1, int((x1i - x0i) * self.tint_scale)),
                      max(1, int((y1i - y0i) * self.tint_scale))),
                     interpolation=cv2.INTER_AREA,
                 )
-                tint_overlays.append({
-                    "pdf": encode_page_pdf(
+                in_shape_ds = cv2.resize(
+                    in_shape.astype(np.uint8),
+                    (ov_ds.shape[1], ov_ds.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                ) > 0
+                ink_ds = cv2.resize(
+                    ink_in_shape.astype(np.uint8),
+                    (ov_ds.shape[1], ov_ds.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                ) > 0
+                posterized = _try_posterized_tint_overlay_pdf(ov_ds, in_shape_ds, ink_ds)
+                if posterized is not None:
+                    overlay_pdf, poster_stats = posterized
+                else:
+                    overlay_pdf = encode_page_pdf(
                         cv2.cvtColor(ov_ds, cv2.COLOR_GRAY2BGR), "gray", self.compress
-                    ),
+                    )
+                    poster_stats = {"codec": "jpeg_fallback"}
+                tint_overlays.append({
+                    "pdf": overlay_pdf,
                     "rect": (x0i, h - y1i, x1i, h - y0i),  # PDF y-up
                     "contour": zone.page_contour,
                     "holes": zone.hole_contours,
                     "circle_fit": zone.circle_fit,
                     "page_h_px": h,
+                    "posterize": poster_stats,
                 })
             for fill in vector_fills:
                 x0, y0, x1, y1 = fill["rect"]
@@ -240,6 +334,7 @@ class MrcPageBuilder:
                 crop = out_bgr[y0i:y1i, x0i:x1i]
                 gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
                 ink = gray < max(0, int(round(fill["gray"] * 255)) - 50)
+                ink[_rect_edge_dirt_mask(gray)] = False
                 binary[y0i:y1i, x0i:x1i] = 255
                 region = binary[y0i:y1i, x0i:x1i]
                 region[ink] = 0
@@ -250,6 +345,7 @@ class MrcPageBuilder:
             "base": base_pdf,
             "overlays": overlays,
             "tint_overlays": tint_overlays,
+            "vector_tint_fills": vector_tint_fills,
             "vector_fills": vector_fills,
             "w": w,
             "h": h,
@@ -287,6 +383,8 @@ class MrcPageBuilder:
                     )
                 if page.get("tint_overlays"):
                     _add_tint_overlays(out, dest, page["tint_overlays"], i, sources)
+                if page.get("vector_tint_fills"):
+                    _add_vector_tint_fills(out, dest, page["vector_tint_fills"], page["h"])
                 if page["vector_fills"]:
                     _add_vector_fills(out, dest, page["vector_fills"], page["h"])
                 _add_overlay_named(dest, text_pdf.pages[i], None, f"/HPText{i}")
@@ -320,6 +418,104 @@ def _is_grayish(bgr: np.ndarray) -> bool:
     return chroma <= 16.0
 
 
+def _base_whiteout_mask(outer_mask: np.ndarray, hole_mask: np.ndarray) -> np.ndarray:
+    """Bilevel-base whitening mask for a tint zone.
+
+    The overlay is clipped to the exact contour, but the base layer is whitened
+    under a slightly dilated OUTER shape so Otsu-created black edge flecks just
+    outside the contour do not survive.  Structural holes are subtracted after
+    dilation, keeping body-text cavities untouched.
+    """
+    if _BASE_WHITEOUT_DILATE_PX <= 0:
+        grown = outer_mask > 0
+    else:
+        k = 2 * _BASE_WHITEOUT_DILATE_PX + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        grown = cv2.dilate(outer_mask, kernel, iterations=1) > 0
+    return grown & (hole_mask == 0)
+
+
+def _base_edge_fringe_mask(
+    page_contour: np.ndarray,
+    hole_contours: list,
+    page_h: int,
+    page_w: int,
+) -> tuple[int, int, np.ndarray]:
+    """Outer-edge-only part of _base_whiteout_mask in page coordinates."""
+    if _BASE_WHITEOUT_DILATE_PX <= 0 or page_contour is None or len(page_contour) < 3:
+        return 0, 0, np.zeros((0, 0), dtype=bool)
+
+    bx, by, bw, bh = cv2.boundingRect(page_contour)
+    pad = _BASE_WHITEOUT_DILATE_PX + 2
+    x0 = max(0, bx - pad)
+    y0 = max(0, by - pad)
+    x1 = min(page_w, bx + bw + pad)
+    y1 = min(page_h, by + bh + pad)
+    if x1 <= x0 or y1 <= y0:
+        return 0, 0, np.zeros((0, 0), dtype=bool)
+
+    outer = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+    cnt = page_contour.copy()
+    cnt[:, 0, 0] -= x0
+    cnt[:, 0, 1] -= y0
+    cv2.fillPoly(outer, [cnt], 255)
+
+    holes = np.zeros_like(outer)
+    for hole in hole_contours or []:
+        hc = hole.copy()
+        hc[:, 0, 0] -= x0
+        hc[:, 0, 1] -= y0
+        cv2.fillPoly(holes, [hc], 255)
+
+    in_shape = (outer > 0) & (holes == 0)
+    whiteout = _base_whiteout_mask(outer, holes)
+    return x0, y0, whiteout & ~in_shape
+
+
+def _tint_overlay_edge_dirt_mask(
+    gray: np.ndarray,
+    outer_mask: np.ndarray,
+    hole_mask: np.ndarray,
+) -> np.ndarray:
+    in_shape = (outer_mask > 0) & (hole_mask == 0)
+    if not in_shape.any():
+        return np.zeros_like(gray, dtype=bool)
+
+    k = 2 * _TINT_EDGE_DIRT_BAND_PX + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    eroded = cv2.erode(in_shape.astype(np.uint8), kernel, iterations=1) > 0
+    boundary = in_shape & ~eroded
+    return (gray <= _TINT_STRONG_ABS_MAX) & boundary
+
+
+def _clean_tint_overlay_edge(
+    overlay_gray: np.ndarray,
+    edge_dirt: np.ndarray,
+    fill_value: int,
+) -> np.ndarray:
+    """Replace dark overlay dirt in the outer tint boundary band."""
+    if not edge_dirt.any():
+        return overlay_gray
+    out = overlay_gray.copy()
+    fill = np.uint8(max(0, min(255, int(fill_value))))
+    out[edge_dirt] = fill
+    return out
+
+
+def _rect_edge_dirt_mask(gray: np.ndarray) -> np.ndarray:
+    """Dark boundary artifacts for rectangular vector-fill regions."""
+    h, w = gray.shape[:2]
+    if h < 1 or w < 1:
+        return np.zeros_like(gray, dtype=bool)
+    band = max(1, _TINT_EDGE_DIRT_BAND_PX)
+    edge = np.zeros((h, w), dtype=bool)
+    edge[:band, :] = True
+    edge[max(0, h - band):, :] = True
+    edge[:, :band] = True
+    edge[:, max(0, w - band):] = True
+    return (gray <= _TINT_STRONG_ABS_MAX) & edge
+
+
 def _local_tint_background(crop_gray: np.ndarray) -> np.ndarray:
     """Per-pixel local background estimate via a median filter.
 
@@ -333,6 +529,19 @@ def _local_tint_background(crop_gray: np.ndarray) -> np.ndarray:
     Downscaled for very large zones so filtering a page-sized crop stays cheap.
     """
     h, w = crop_gray.shape[:2]
+    # Estimate the background of the tint itself.  Bright knockout letters and
+    # paper corners must not pull the median upward, and black strokes must not
+    # pull it downward; both are replaced by the zone's own tint median before
+    # the local median filter runs.  This keeps the estimate tied to "what the
+    # tint would be here", not to the visible foreground currently occupying
+    # the pixel.
+    tint = (crop_gray >= _TINT_LO) & (crop_gray <= _TINT_HI)
+    if int(tint.sum()) >= 4:
+        fill_value = int(round(float(np.median(crop_gray[tint]))))
+        work_src = np.where(tint, crop_gray, fill_value).astype(np.uint8)
+    else:
+        work_src = crop_gray
+
     radius = (
         _LOCAL_BG_WINDOW_SMALL_PX
         if max(h, w) <= _LOCAL_BG_SMALL_ZONE_DIM
@@ -343,13 +552,13 @@ def _local_tint_background(crop_gray: np.ndarray) -> np.ndarray:
     if max_dim > _LOCAL_BG_MAX_DIM:
         scale = _LOCAL_BG_MAX_DIM / float(max_dim)
         work = cv2.resize(
-            crop_gray,
+            work_src,
             (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
             interpolation=cv2.INTER_AREA,
         )
         radius = max(1, int(round(radius * scale)))
     else:
-        work = crop_gray
+        work = work_src
 
     k = 2 * radius + 1
     # cv2.medianBlur only accepts uint8/float32 with ksize <= 5 for multi-
@@ -360,24 +569,366 @@ def _local_tint_background(crop_gray: np.ndarray) -> np.ndarray:
     return bg.astype(np.float32)
 
 
-def _tint_ink_mask(crop_gray: np.ndarray) -> np.ndarray:
+def _knockout_text_mask(
+    crop_gray: np.ndarray,
+    lines: list,
+    crop_x0: int,
+    crop_y0: int,
+    in_shape: np.ndarray,
+) -> np.ndarray:
+    """Mask OCR text boxes that are bright knockout text, not black ink.
+
+    OCR text remains searchable through the invisible text layer.  This mask is
+    only about whether a text box should contribute black pixels to the bilevel
+    base layer.  A box with visible white glyph pixels and little dark ink is a
+    knockout label on a tint background, so its whole box is left to the tint
+    overlay instead of being thresholded into black.
+    """
+    h, w = crop_gray.shape[:2]
+    out = np.zeros((h, w), dtype=bool)
+    for line in lines:
+        box = line.get("box") if isinstance(line, dict) else None
+        if not box or len(box) < 4:
+            continue
+        x0f, y0f, x1f, y1f = (float(v) for v in box[:4])
+        x0 = max(0, int(np.floor(min(x0f, x1f))) - crop_x0)
+        y0 = max(0, int(np.floor(min(y0f, y1f))) - crop_y0)
+        x1 = min(w, int(np.ceil(max(x0f, x1f))) - crop_x0)
+        y1 = min(h, int(np.ceil(max(y0f, y1f))) - crop_y0)
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            continue
+
+        valid = in_shape[y0:y1, x0:x1]
+        valid_px = int(valid.sum())
+        if valid_px < 8:
+            continue
+        sub = crop_gray[y0:y1, x0:x1]
+        bright_frac = float(((sub >= _KNOCKOUT_WHITE_MIN) & valid).sum()) / valid_px
+        dark_frac = float(((sub <= _TINT_STRONG_ABS_MAX) & valid).sum()) / valid_px
+        if (
+            bright_frac >= _KNOCKOUT_TEXT_BRIGHT_FRAC_MIN
+            and dark_frac <= _KNOCKOUT_TEXT_DARK_FRAC_MAX
+        ):
+            x0p = max(0, x0 - _KNOCKOUT_TEXT_PAD_PX)
+            y0p = max(0, y0 - _KNOCKOUT_TEXT_PAD_PX)
+            x1p = min(w, x1 + _KNOCKOUT_TEXT_PAD_PX)
+            y1p = min(h, y1 + _KNOCKOUT_TEXT_PAD_PX)
+            out[y0p:y1p, x0p:x1p] |= in_shape[y0p:y1p, x0p:x1p]
+    return out
+
+
+def _ocr_text_box_mask(
+    crop_gray: np.ndarray,
+    lines: list,
+    crop_x0: int,
+    crop_y0: int,
+    in_shape: np.ndarray,
+) -> np.ndarray:
+    """Mask OCR text boxes for local raster fallback over vector tint fills."""
+    h, w = crop_gray.shape[:2]
+    out = np.zeros((h, w), dtype=bool)
+    pad = 4
+    for line in lines:
+        box = line.get("box") if isinstance(line, dict) else None
+        if not box or len(box) < 4:
+            continue
+        x0f, y0f, x1f, y1f = (float(v) for v in box[:4])
+        x0 = max(0, int(np.floor(min(x0f, x1f))) - crop_x0 - pad)
+        y0 = max(0, int(np.floor(min(y0f, y1f))) - crop_y0 - pad)
+        x1 = min(w, int(np.ceil(max(x0f, x1f))) - crop_x0 + pad)
+        y1 = min(h, int(np.ceil(max(y0f, y1f))) - crop_y0 + pad)
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            continue
+        sub = crop_gray[y0:y1, x0:x1]
+        valid = in_shape[y0:y1, x0:x1]
+        valid_px = int(valid.sum())
+        if valid_px < 8:
+            continue
+        bright_frac = float(((sub >= _KNOCKOUT_WHITE_MIN) & valid).sum()) / valid_px
+        dark_frac = float(((sub <= _TINT_STRONG_ABS_MAX) & valid).sum()) / valid_px
+        if not (
+            bright_frac >= _KNOCKOUT_TEXT_BRIGHT_FRAC_MIN
+            and dark_frac <= _KNOCKOUT_TEXT_DARK_FRAC_MAX
+        ):
+            continue
+        text_pixels = (sub >= _KNOCKOUT_WHITE_MIN) & valid
+        if int(text_pixels.sum()) < 4:
+            continue
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        text_pixels = cv2.dilate(text_pixels.astype(np.uint8), kernel, iterations=1) > 0
+        out[y0:y1, x0:x1] |= text_pixels & valid
+    return out
+
+
+def _tint_ink_mask(
+    crop_gray: np.ndarray,
+    knockout_text_mask: np.ndarray | None = None,
+) -> np.ndarray:
     """Boolean ink mask using a per-pixel local background threshold.
 
-    ``ink_T(y, x) = local_bg(y, x) - _TINT_TEXT_DELTA`` tracks the
-    background tone at each pixel instead of one value for the whole zone,
-    so a darker accent area elsewhere in a (now potentially page-spanning)
-    zone doesn't get judged against an unrelated, brighter global median.
-    A small opening removes isolated scan-grain pixels that dipped just
-    below the threshold without forming an actual (multi-pixel, connected)
-    stroke -- see _INK_DESPECKLE_PX.
+    ``ink_T(y, x) = local_bg(y, x) - _TINT_TEXT_DELTA`` tracks the background
+    tone at each pixel instead of one value for the whole zone.  Bright
+    knockout text/paper is excluded from the local background estimator so it
+    cannot raise the threshold and turn its own scan grain into black ink.
+    OCR boxes classified as knockout text are removed from the ink mask
+    altogether: they are text semantically, but not black bilevel strokes
+    visually.  Weak ink pixels are kept only if they connect to a strong core.
     """
     local_bg = _local_tint_background(crop_gray)
-    ink_t = np.maximum(_TINT_LO, local_bg - float(_TINT_TEXT_DELTA))
-    ink = (crop_gray.astype(np.float32) < ink_t).astype(np.uint8)
+    gray_f = crop_gray.astype(np.float32)
+
+    weak_t = np.maximum(_TINT_LO, local_bg - float(_TINT_TEXT_DELTA))
+    strong_t = np.maximum(_TINT_LO, local_bg - float(_TINT_STRONG_TEXT_DELTA))
+    weak = gray_f < weak_t
+    strong = (gray_f < strong_t) | (crop_gray <= _TINT_STRONG_ABS_MAX)
+
+    # Hysteresis: weak pixels are accepted only when their connected component
+    # contains at least one strong pixel.  This is intentionally component-
+    # based rather than another morphology pass so thin real strokes survive.
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        weak.astype(np.uint8), connectivity=8
+    )
+    ink = np.zeros_like(weak, dtype=np.uint8)
+    if n_labels > 1:
+        strong_labels = np.unique(labels[strong & weak])
+        strong_labels = strong_labels[strong_labels != 0]
+        if strong_labels.size:
+            ink[np.isin(labels, strong_labels)] = 1
+
+    if knockout_text_mask is not None:
+        ink[knockout_text_mask] = 0
+
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        ink.astype(np.uint8), connectivity=8
+    )
+    for label in range(1, n_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area > _TINT_EDGE_NOISE_MAX_AREA:
+            continue
+        component = labels == label
+        if int(crop_gray[component].min()) <= _TINT_EDGE_NOISE_DARK_CORE_MAX:
+            continue
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        ww = int(stats[label, cv2.CC_STAT_WIDTH])
+        hh = int(stats[label, cv2.CC_STAT_HEIGHT])
+        pad = _TINT_EDGE_NOISE_NEIGHBOR_PX
+        x0 = max(0, x - pad)
+        y0 = max(0, y - pad)
+        x1 = min(crop_gray.shape[1], x + ww + pad)
+        y1 = min(crop_gray.shape[0], y + hh + pad)
+        neighbourhood = crop_gray[y0:y1, x0:x1]
+        if (
+            int(neighbourhood.max()) - int(neighbourhood.min())
+            >= _TINT_EDGE_NOISE_NEIGHBOR_RANGE_MIN
+        ):
+            ink[component] = 0
+
+    knockout = crop_gray >= _KNOCKOUT_WHITE_MIN
+    if knockout.any():
+        k = 2 * _KNOCKOUT_DILATE_PX + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        knockout_near = cv2.dilate(knockout.astype(np.uint8), kernel) > 0
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            ink.astype(np.uint8), connectivity=8
+        )
+        for label in range(1, n_labels):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if area > _KNOCKOUT_NOISE_MAX_AREA:
+                continue
+            component = labels == label
+            if np.any(component & knockout_near):
+                ink[component] = 0
+
     dk = 2 * _INK_DESPECKLE_PX + 1
     despeckle_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dk, dk))
     ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, despeckle_kernel)
     return ink > 0
+
+
+def _try_posterized_tint_overlay_pdf(
+    overlay_gray: np.ndarray,
+    in_shape: np.ndarray,
+    ink: np.ndarray,
+) -> tuple[bytes, dict] | None:
+    """Return a k4+Flate tint-overlay PDF, or None for JPEG fallback."""
+    if overlay_gray.dtype != np.uint8 or overlay_gray.ndim != 2:
+        return None
+    if overlay_gray.shape != in_shape.shape or overlay_gray.shape != ink.shape:
+        return None
+
+    valid = in_shape & ~ink & (overlay_gray < 255)
+    valid_count = int(valid.sum())
+    if valid_count < max(100, _TINT_POSTERIZE_K):
+        return None
+
+    smoothed = _smooth_tint_for_posterize(overlay_gray, valid)
+    patch_class = _classify_tint_candidate(smoothed, valid)
+    if patch_class == "photo":
+        return None
+    pixels = smoothed[valid]
+    if pixels.size < _TINT_POSTERIZE_K:
+        return None
+
+    sample = pixels
+    if sample.size > _TINT_POSTERIZE_SAMPLE_MAX:
+        step = int(np.ceil(sample.size / _TINT_POSTERIZE_SAMPLE_MAX))
+        sample = sample[::step]
+    data = sample.astype(np.float32).reshape(-1, 1)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 0.5)
+    try:
+        _, _, centers = cv2.kmeans(
+            data, _TINT_POSTERIZE_K, None, criteria, 5, cv2.KMEANS_PP_CENTERS
+        )
+    except Exception:
+        return None
+
+    center_vals = centers.flatten().astype(np.float32)
+    labels = _nearest_gray_centers(smoothed[valid].astype(np.float32), center_vals)
+    source_pixels = overlay_gray[valid]
+    representative_vals = center_vals.copy()
+    for idx in range(center_vals.size):
+        members = source_pixels[labels == idx]
+        if members.size:
+            representative_vals[idx] = float(np.median(members))
+    labels = _nearest_gray_centers(source_pixels.astype(np.float32), representative_vals)
+    quant_vals = np.clip(np.round(representative_vals[labels]), 0, 255).astype(np.uint8)
+
+    quantized = np.full_like(overlay_gray, 255)
+    quantized[valid] = quant_vals
+    quantized[ink & in_shape] = overlay_gray[ink & in_shape]
+
+    diff = np.abs(
+        overlay_gray[valid].astype(np.int16) - quantized[valid].astype(np.int16)
+    )
+    mae = float(diff.mean()) if diff.size else 0.0
+    p95 = float(np.percentile(diff, 95)) if diff.size else 0.0
+    bad_frac = float((diff > _TINT_POSTERIZE_BAD_DELTA).mean()) if diff.size else 0.0
+    if (
+        mae > _TINT_POSTERIZE_MAE_MAX
+        or p95 > _TINT_POSTERIZE_P95_MAX
+        or bad_frac > _TINT_POSTERIZE_BAD_FRAC_MAX
+    ):
+        return None
+
+    pdf = _encode_gray_flate_page_pdf(quantized)
+    return pdf, {
+        "codec": "k4_flate",
+        "class": patch_class,
+        "mae": mae,
+        "p95": p95,
+        "bad_frac": bad_frac,
+        "valid_pixels": valid_count,
+        "centers": [int(round(float(c))) for c in sorted(representative_vals)],
+    }
+
+
+def _smooth_tint_for_posterize(overlay_gray: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """Median-smooth tint background without letting ink/paper dominate."""
+    h, w = overlay_gray.shape[:2]
+    vals = overlay_gray[valid]
+    fill_value = int(round(float(np.median(vals)))) if vals.size else 255
+    work_src = np.where(valid, overlay_gray, fill_value).astype(np.uint8)
+
+    radius = (
+        _LOCAL_BG_WINDOW_SMALL_PX
+        if max(h, w) <= _LOCAL_BG_SMALL_ZONE_DIM
+        else _LOCAL_BG_WINDOW_PX
+    )
+    max_dim = max(h, w)
+    if max_dim > _LOCAL_BG_MAX_DIM:
+        scale = _LOCAL_BG_MAX_DIM / float(max_dim)
+        work = cv2.resize(
+            work_src,
+            (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+        radius = max(1, int(round(radius * scale)))
+    else:
+        work = work_src
+
+    k = max(3, 2 * radius + 1)
+    if k % 2 == 0:
+        k += 1
+    smoothed = cv2.medianBlur(work, k)
+    if smoothed.shape != overlay_gray.shape:
+        smoothed = cv2.resize(smoothed, (w, h), interpolation=cv2.INTER_LINEAR)
+    return smoothed.astype(np.uint8)
+
+
+def _classify_tint_candidate(smoothed_gray: np.ndarray, valid: np.ndarray) -> str:
+    """Classify tint content using classify_patch on local valid tiles."""
+    from .region_class import classify_patch
+
+    fill_value = int(round(float(np.median(smoothed_gray[valid])))) if valid.any() else 255
+    h, w = smoothed_gray.shape[:2]
+    tile = 256
+    classes: list[str] = []
+    for y0 in range(0, h, tile):
+        y1 = min(h, y0 + tile)
+        for x0 in range(0, w, tile):
+            x1 = min(w, x0 + tile)
+            tile_valid = valid[y0:y1, x0:x1]
+            if int(tile_valid.sum()) < 512:
+                continue
+            patch = np.where(
+                tile_valid, smoothed_gray[y0:y1, x0:x1], fill_value
+            ).astype(np.uint8)
+            classes.append(classify_patch(patch))
+    if not classes:
+        patch = np.where(valid, smoothed_gray, fill_value).astype(np.uint8)
+        return classify_patch(patch)
+    photo_frac = classes.count("photo") / len(classes)
+    if photo_frac >= 0.5:
+        return "photo"
+    if "solid_fill" in classes:
+        return "solid_fill"
+    if "line_art" in classes:
+        return "line_art"
+    if "text" in classes:
+        return "text"
+    return classes[0]
+
+
+def _nearest_gray_centers(values: np.ndarray, centers: np.ndarray) -> np.ndarray:
+    best_dist = np.full(values.shape, np.inf, dtype=np.float32)
+    labels = np.zeros(values.shape, dtype=np.int16)
+    for idx, center in enumerate(centers):
+        dist = np.abs(values - center)
+        take = dist < best_dist
+        labels[take] = idx
+        best_dist[take] = dist[take]
+    return labels
+
+
+def _encode_gray_flate_page_pdf(gray: np.ndarray) -> bytes:
+    """Single-page PDF containing an 8-bit DeviceGray FlateDecode image."""
+    import pikepdf
+
+    if gray.dtype != np.uint8 or gray.ndim != 2:
+        raise ValueError("gray must be an HxW uint8 array")
+    h, w = gray.shape
+    pdf = pikepdf.new()
+    image = pikepdf.Stream(
+        pdf,
+        zlib.compress(np.ascontiguousarray(gray).tobytes()),
+        Filter=pikepdf.Name("/FlateDecode"),
+    )
+    image.Type = pikepdf.Name("/XObject")
+    image.Subtype = pikepdf.Name("/Image")
+    image.Width = w
+    image.Height = h
+    image.ColorSpace = pikepdf.Name("/DeviceGray")
+    image.BitsPerComponent = 8
+    content = pikepdf.Stream(pdf, f"q {w} 0 0 {h} 0 0 cm /Im0 Do Q".encode())
+    page = pdf.add_blank_page(page_size=(w, h))
+    page.obj.Resources = pikepdf.Dictionary(
+        XObject=pikepdf.Dictionary(Im0=pdf.make_indirect(image))
+    )
+    page.obj.Contents = pdf.make_indirect(content)
+    buf = BytesIO()
+    pdf.save(buf)
+    return buf.getvalue()
 
 
 def _add_overlay_named(dest, overlay_page, rect, name: str) -> None:
@@ -484,4 +1035,32 @@ def _add_vector_fills(pdf, page, vector_fills: list, page_h_px: int) -> None:
         x0, y0, x1, y1 = fill["rect"]
         parts.append(fill_rect_ops(x0, y0, x1, y1, fill["gray"], page_h_px, scale))
     parts.append(b"Q\n")
+    pikepdf.Page(page).contents_add(pikepdf.Stream(pdf, b"".join(parts)))
+
+
+def _add_vector_tint_fills(pdf, page, vector_tint_fills: list, page_h_px: int) -> None:
+    import pikepdf
+    from .tint_zone import contour_to_pdf_path
+
+    resources = page.Resources
+    if "/ExtGState" not in resources:
+        resources.ExtGState = pikepdf.Dictionary()
+    resources.ExtGState[pikepdf.Name("/HPVecFillMultiply")] = pikepdf.Dictionary({
+        "/Type": pikepdf.Name("/ExtGState"),
+        "/BM": pikepdf.Name("/Multiply"),
+    })
+
+    parts = [b"q /HPVecFillMultiply gs\n"]
+    for fill in vector_tint_fills:
+        gray = fill["gray"]
+        contour = fill["contour"]
+        holes = fill["holes"]
+
+        color_op = f"{gray:.4f} g\n".encode('ascii')
+        path_bytes = contour_to_pdf_path(contour, page_h_px, holes)
+        fill_op = b"f*\n" if holes else b"f\n"
+
+        parts.append(color_op + path_bytes + fill_op)
+    parts.append(b"Q\n")
+
     pikepdf.Page(page).contents_add(pikepdf.Stream(pdf, b"".join(parts)))

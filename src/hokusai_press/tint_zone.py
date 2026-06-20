@@ -107,6 +107,38 @@ _MAX_APPROX_ERR_PX: float = 3.0
 # (harmless: Multiply renders paper as identity).
 _PAD_PX: int = 2
 
+# Vector tint fills are only worthwhile for very smooth, low-complexity tone
+# panels.  Real scanned halftone noise can quantize into thousands of tiny
+# islands; keep these limits deliberately conservative so JPEG remains the
+# fallback whenever polygon output is likely to grow the PDF.
+_VEC_TINT_SMOOTH_RADIUS_PX: int = 3
+_VEC_TINT_MIN_COMPONENT_AREA_PX: int = 64
+_VEC_TINT_MIN_COMPONENT_AREA_FRAC: float = 0.0001
+_VEC_TINT_MAX_COMPONENT_AREA_PX: int = 1000
+_VEC_TINT_MAX_COMPONENTS: int = 50
+_VEC_TINT_MAX_VERTICES: int = 500
+_VEC_TINT_KMEANS_SAMPLE_MAX: int = 200_000
+_VEC_TINT_MAX_DRAWABLE_PIXELS: int = 750_000
+
+# Large scanned halftone areas are often semantically one flat printed colour:
+# the dot pattern is a printing/optical artifact, not artwork that must be
+# preserved as thousands of tiny polygons.  This flat-tone path deliberately
+# looks at a low-frequency version of the zone, then emits only large regions.
+_VEC_FLAT_MIN_DRAWABLE_PIXELS: int = 100_000
+_VEC_FLAT_DOWNSCALE_MAX_DIM: int = 900
+_VEC_FLAT_MAX_K: int = 4
+_VEC_FLAT_QUANT_GOOD_MIN: float = 0.70
+_VEC_FLAT_TILE_PX: int = 64
+_VEC_FLAT_TILE_MEDIAN_IQR_MAX: float = 28.0
+_VEC_FLAT_MIN_COMPONENT_AREA_PX: int = 4_000
+_VEC_FLAT_MIN_COMPONENT_AREA_FRAC: float = 0.0002
+_VEC_FLAT_MAX_COMPONENTS: int = 28
+_VEC_FLAT_MAX_VERTICES: int = 6_000
+_VEC_FLAT_CLOSE_PX: int = 4
+_VEC_FLAT_BRIGHT_HOLE_MIN_AREA_PX: int = 24
+_VEC_PATCH_PAD_PX: int = 6
+_VEC_PATCH_MAX_RECTS: int = 80
+
 # Circle detection: if a (hole-free) contour's compactness exceeds this
 # threshold it's treated as a circle and clipped with exact Bézier arcs
 # rather than a polygon.
@@ -155,6 +187,9 @@ class TintZone:
     corner_radius: float = 0.0
     contour_pts: list = field(default_factory=list)
     circle_fit: tuple[float, float, float] | None = None  # (cx, cy, r) page-image coords y-down
+    vectorize_success: bool = False
+    vectorized_fills: list[dict] = field(default_factory=list)
+    vectorized_patches: list[tuple[int, int, int, int]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -784,3 +819,526 @@ def _estimate_corner_radius(tint_mask: np.ndarray, h: int, w: int) -> float:
         if r <= min(h, w) / 2:
             radii.append(r)
     return float(np.mean(radii)) if radii else 0.0
+
+
+def try_vectorize_zone(
+    zone: TintZone,
+    crop_gray: np.ndarray,
+    in_shape: np.ndarray,
+    ink: np.ndarray,
+    protect_mask: np.ndarray | None = None,
+) -> bool:
+    """平網タイントをPDFベクター図形に量子化・ポリゴン化可能か検証し、可能ならベクター化データを設定する。"""
+    overlay_img = zone.overlay_img
+    zone.vectorize_success = False
+    zone.vectorized_fills = []
+    zone.vectorized_patches = []
+
+    protected = (
+        np.zeros_like(in_shape, dtype=bool)
+        if protect_mask is None
+        else (protect_mask & in_shape)
+    )
+    valid_mask = in_shape & ~ink & ~protected
+    pixels = overlay_img[valid_mask]
+
+    # 255 (紙の白) は Multiplyブレンドで描画不要なので、ベクター化の量子化対象からは除外する
+    pixels = pixels[pixels < 255]
+
+    if pixels.size < 100:
+        return False
+    if pixels.size >= _VEC_FLAT_MIN_DRAWABLE_PIXELS:
+        if _try_vectorize_flat_tone_zone(
+            zone, overlay_img, valid_mask, pixels, protected
+        ):
+            return True
+    if pixels.size > _VEC_TINT_MAX_DRAWABLE_PIXELS:
+        return False
+
+    best_K = None
+    best_centers = None
+    best_reconstructed = None
+
+    if pixels.size > _VEC_TINT_KMEANS_SAMPLE_MAX:
+        step = int(np.ceil(pixels.size / _VEC_TINT_KMEANS_SAMPLE_MAX))
+        kmeans_pixels = pixels[::step]
+    else:
+        kmeans_pixels = pixels
+    data = kmeans_pixels.astype(np.float32).reshape(-1, 1)
+    drawable_total = max(1, int(pixels.size))
+
+    for K in range(2, 7):
+        if kmeans_pixels.size < K:
+            break
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+        flags = cv2.KMEANS_PP_CENTERS
+        try:
+            compactness, labels, centers = cv2.kmeans(data, K, None, criteria, 10, flags)
+        except Exception:
+            continue
+
+        reconstructed = np.full_like(overlay_img, 255)
+        drawable = valid_mask & (overlay_img < 255)
+        full_pixels = overlay_img[drawable].astype(np.float32)
+        center_vals = centers.flatten().astype(np.float32)
+        best_dist = np.full(full_pixels.shape, np.inf, dtype=np.float32)
+        quantized_pixels = np.empty(full_pixels.shape, dtype=np.float32)
+        for c in center_vals:
+            dist = np.abs(full_pixels - c)
+            take = dist < best_dist
+            quantized_pixels[take] = c
+            best_dist[take] = dist[take]
+        reconstructed[drawable] = np.clip(
+            np.round(quantized_pixels), 0, 255
+        ).astype(np.uint8)
+
+        diff = np.abs(overlay_img.astype(np.int32) - reconstructed.astype(np.int32))
+        good_pixels = int(np.sum(diff[drawable] <= 15))
+
+        if (good_pixels / drawable_total) >= 0.95:
+            best_K = K
+            best_centers = centers
+            best_reconstructed = reconstructed
+            break
+
+    if best_K is None:
+        return False
+
+    zone_h, zone_w = overlay_img.shape[:2]
+    zone_area = max(1, zone_h * zone_w)
+    min_component_area = max(
+        _VEC_TINT_MIN_COMPONENT_AREA_PX,
+        min(
+            _VEC_TINT_MAX_COMPONENT_AREA_PX,
+            int(round(zone_area * _VEC_TINT_MIN_COMPONENT_AREA_FRAC)),
+        ),
+    )
+    smooth_k = _VEC_TINT_SMOOTH_RADIUS_PX * 2 + 1
+    smooth_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (smooth_k, smooth_k))
+    unique_centers = sorted(best_centers.flatten())
+
+    cleaned_masks: list[tuple[int, np.ndarray]] = []
+    for c in unique_centers:
+        c_int = int(round(c))
+        if c_int >= 255:
+            continue
+
+        color_mask = (best_reconstructed == c_int).astype(np.uint8)
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, smooth_kernel, iterations=1)
+        color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, smooth_kernel, iterations=1)
+        color_mask = (color_mask > 0) & valid_mask
+        if int(color_mask.sum()) < min_component_area:
+            continue
+        cleaned_masks.append((c_int, color_mask))
+
+    if not cleaned_masks:
+        return False
+
+    drawable_mask = valid_mask & (overlay_img < 255)
+    assigned = np.zeros((zone_h, zone_w), dtype=bool)
+    smoothed = np.full_like(overlay_img, 255)
+    for c_int, color_mask in sorted(cleaned_masks, key=lambda item: int(item[1].sum()), reverse=True):
+        take = color_mask & ~assigned
+        smoothed[take] = c_int
+        assigned[take] = True
+
+    missing = drawable_mask & ~assigned
+    if missing.any():
+        dist_maps = []
+        for _, color_mask in cleaned_masks:
+            if color_mask.any():
+                dist_maps.append(cv2.distanceTransform((~color_mask).astype(np.uint8), cv2.DIST_L2, 3))
+            else:
+                dist_maps.append(np.full((zone_h, zone_w), np.inf, dtype=np.float32))
+        nearest = np.argmin(np.stack(dist_maps, axis=0), axis=0)
+        for i, (c_int, _) in enumerate(cleaned_masks):
+            smoothed[missing & (nearest == i)] = c_int
+
+    smooth_diff = np.abs(overlay_img.astype(np.int32) - smoothed.astype(np.int32))
+    smooth_good = int(np.sum(smooth_diff[drawable_mask] <= 20))
+    if smooth_good / max(1, int(drawable_mask.sum())) < 0.95:
+        return False
+
+    vector_fills = []
+    total_components = 0
+    total_vertices = 0
+
+    for c_int, _ in cleaned_masks:
+        color_mask = ((smoothed == c_int) & drawable_mask).astype(np.uint8)
+        contours, hierarchy = cv2.findContours(color_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+        if not contours:
+            continue
+
+        hier = hierarchy[0]
+        for idx, info in enumerate(hier):
+            parent = info[3]
+            if parent != -1:
+                continue
+            outer_cnt = contours[idx]
+            if cv2.contourArea(outer_cnt) < min_component_area:
+                continue
+
+            holes = []
+            child = info[2]
+            while child != -1:
+                hole_cnt = contours[child]
+                if cv2.contourArea(hole_cnt) >= min_component_area:
+                    holes.append(hole_cnt)
+                child = hier[child][0]
+
+            try:
+                simplified_outer = _pad_and_simplify(outer_cnt, zone_h, zone_w, grow=True)
+                simplified_holes = [
+                    _pad_and_simplify(hc, zone_h, zone_w, grow=False)
+                    for hc in holes
+                ]
+            except Exception:
+                simplified_outer = outer_cnt
+                simplified_holes = holes
+
+            total_components += 1
+            total_vertices += len(simplified_outer) + sum(len(hc) for hc in simplified_holes)
+            if (
+                total_components > _VEC_TINT_MAX_COMPONENTS
+                or total_vertices > _VEC_TINT_MAX_VERTICES
+            ):
+                return False
+
+            x0, y0 = zone.rect[:2]
+
+            page_outer = simplified_outer.copy()
+            page_outer[:, 0, 0] += x0
+            page_outer[:, 0, 1] += y0
+
+            page_holes = []
+            for hc in simplified_holes:
+                page_hc = hc.copy()
+                page_hc[:, 0, 0] += x0
+                page_hc[:, 0, 1] += y0
+                page_holes.append(page_hc)
+
+            gray_val = float(c_int) / 255.0
+
+            vector_fills.append({
+                "gray": gray_val,
+                "contour": page_outer,
+                "holes": page_holes,
+            })
+
+    if not vector_fills:
+        return False
+
+    zone.vectorize_success = True
+    zone.vectorized_fills = vector_fills
+    return True
+
+
+def _try_vectorize_flat_tone_zone(
+    zone: TintZone,
+    overlay_img: np.ndarray,
+    valid_mask: np.ndarray,
+    pixels: np.ndarray,
+    protected: np.ndarray,
+) -> bool:
+    """Vectorize large halftone regions as a few flat printed tone areas."""
+    h, w = overlay_img.shape[:2]
+    drawable = valid_mask & (overlay_img < 255)
+    if int(drawable.sum()) < _VEC_FLAT_MIN_DRAWABLE_PIXELS:
+        return False
+
+    max_dim = max(h, w)
+    scale = min(1.0, _VEC_FLAT_DOWNSCALE_MAX_DIM / float(max_dim))
+    if scale < 1.0:
+        small_w = max(1, int(round(w * scale)))
+        small_h = max(1, int(round(h * scale)))
+        small_img = cv2.resize(
+            overlay_img, (small_w, small_h), interpolation=cv2.INTER_AREA
+        )
+        small_drawable = cv2.resize(
+            drawable.astype(np.uint8), (small_w, small_h), interpolation=cv2.INTER_NEAREST
+        ) > 0
+    else:
+        small_img = overlay_img
+        small_drawable = drawable
+
+    small_pixels = small_img[small_drawable]
+    small_pixels = small_pixels[small_pixels < 255]
+    if small_pixels.size < 100:
+        return False
+
+    sample = (
+        small_pixels[:: int(np.ceil(small_pixels.size / _VEC_TINT_KMEANS_SAMPLE_MAX))]
+        if small_pixels.size > _VEC_TINT_KMEANS_SAMPLE_MAX
+        else small_pixels
+    )
+    data = sample.astype(np.float32).reshape(-1, 1)
+
+    best: tuple[np.ndarray, np.ndarray, float] | None = None
+    full_small = small_img[small_drawable].astype(np.float32)
+    for k in range(1, _VEC_FLAT_MAX_K + 1):
+        if sample.size < k:
+            break
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+        try:
+            _, _, centers = cv2.kmeans(
+                data, k, None, criteria, 5, cv2.KMEANS_PP_CENTERS
+            )
+        except Exception:
+            continue
+        center_vals = centers.flatten().astype(np.float32)
+        labels = _nearest_gray_labels(full_small, center_vals)
+        quant = center_vals[labels]
+        good = float((np.abs(full_small - quant) <= 25).mean())
+        if good >= _VEC_FLAT_QUANT_GOOD_MIN:
+            best = (center_vals, labels, good)
+    if best is None:
+        return False
+
+    center_vals, labels_1d, good = best
+    if good < _VEC_FLAT_QUANT_GOOD_MIN:
+        return False
+
+    label_img = np.full(small_img.shape, -1, dtype=np.int16)
+    label_img[small_drawable] = labels_1d.astype(np.int16)
+
+    min_area = max(
+        _VEC_FLAT_MIN_COMPONENT_AREA_PX,
+        int(round(h * w * _VEC_FLAT_MIN_COMPONENT_AREA_FRAC)),
+    )
+    small_min_area = max(4, int(round(min_area * scale * scale)))
+    close_k = max(3, _VEC_FLAT_CLOSE_PX * 2 + 1)
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
+
+    vector_fills: list[dict] = []
+    total_components = 0
+    total_vertices = 0
+    bright_holes = _bright_knockout_hole_contours(overlay_img, valid_mask)
+    protected_holes = _protected_hole_contours(protected)
+
+    order = sorted(range(len(center_vals)), key=lambda i: float(center_vals[i]))
+    for label in order:
+        small_mask = ((label_img == label) & small_drawable).astype(np.uint8)
+        if int(small_mask.sum()) < small_min_area:
+            continue
+        small_mask = cv2.morphologyEx(
+            small_mask, cv2.MORPH_CLOSE, close_kernel, iterations=1
+        )
+        small_mask = cv2.morphologyEx(
+            small_mask, cv2.MORPH_OPEN, close_kernel, iterations=1
+        )
+        small_mask = (small_mask > 0) & small_drawable
+        if int(small_mask.sum()) < small_min_area:
+            continue
+        mask = cv2.resize(
+            small_mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST
+        ) > 0
+        mask &= drawable
+        if int(mask.sum()) < min_area:
+            continue
+        if not _flat_component_distribution_ok(overlay_img, mask):
+            continue
+
+        contours, hierarchy = cv2.findContours(
+            small_mask.astype(np.uint8), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE
+        )
+        if hierarchy is None:
+            continue
+        hier = hierarchy[0]
+        for idx, info in enumerate(hier):
+            if info[3] != -1:
+                continue
+            outer_cnt = contours[idx]
+            if cv2.contourArea(outer_cnt) < small_min_area:
+                continue
+            holes = []
+            child = info[2]
+            while child != -1:
+                hole_cnt = contours[child]
+                if cv2.contourArea(hole_cnt) >= small_min_area:
+                    holes.append(hole_cnt)
+                child = hier[child][0]
+
+            simplified_outer = _scale_simplified_contour(outer_cnt, scale, w, h)
+            simplified_holes = [
+                _scale_simplified_contour(hc, scale, w, h) for hc in holes
+            ]
+            simplified_holes.extend(_holes_inside_mask(bright_holes, mask))
+            simplified_holes.extend(_holes_inside_mask(protected_holes, mask))
+
+            total_components += 1
+            total_vertices += len(simplified_outer) + sum(len(hc) for hc in simplified_holes)
+            if (
+                total_components > _VEC_FLAT_MAX_COMPONENTS
+                or total_vertices > _VEC_FLAT_MAX_VERTICES
+            ):
+                return False
+
+            x0, y0 = zone.rect[:2]
+            page_outer = simplified_outer.copy()
+            page_outer[:, 0, 0] += x0
+            page_outer[:, 0, 1] += y0
+            page_holes = []
+            for hc in simplified_holes:
+                page_hc = hc.copy()
+                page_hc[:, 0, 0] += x0
+                page_hc[:, 0, 1] += y0
+                page_holes.append(page_hc)
+
+            component_pixels = overlay_img[(mask > 0) & (overlay_img < 255)]
+            gray_val = (
+                float(np.median(component_pixels)) / 255.0
+                if component_pixels.size
+                else float(center_vals[label]) / 255.0
+            )
+            vector_fills.append({
+                "gray": gray_val,
+                "contour": page_outer,
+                "holes": page_holes,
+            })
+
+    if not vector_fills:
+        return False
+    zone.vectorize_success = True
+    zone.vectorized_fills = vector_fills
+    zone.vectorized_patches = []
+    return True
+
+
+def _protected_hole_contours(mask: np.ndarray) -> list[np.ndarray]:
+    """Convert OCR-protected knockout text pixels into vector fill holes."""
+    if not mask.any():
+        return []
+    contours, _ = cv2.findContours(
+        mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+    )
+    holes: list[np.ndarray] = []
+    for cnt in contours:
+        if cv2.contourArea(cnt) < 4:
+            continue
+        simplified = cv2.approxPolyDP(cnt, 1.2, True)
+        if len(simplified) >= 3:
+            holes.append(simplified.astype(np.int32))
+    return holes
+
+
+def _nearest_gray_labels(values: np.ndarray, centers: np.ndarray) -> np.ndarray:
+    best_dist = np.full(values.shape, np.inf, dtype=np.float32)
+    labels = np.zeros(values.shape, dtype=np.int16)
+    for idx, center in enumerate(centers):
+        dist = np.abs(values - center)
+        take = dist < best_dist
+        labels[take] = idx
+        best_dist[take] = dist[take]
+    return labels
+
+
+def _patch_rects_from_mask(
+    mask: np.ndarray,
+    shape: tuple[int, int],
+) -> list[tuple[int, int, int, int]]:
+    if not mask.any():
+        return []
+    h, w = shape[:2]
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    work = cv2.dilate(mask.astype(np.uint8), kernel, iterations=1)
+    n_labels, _, stats, _ = cv2.connectedComponentsWithStats(work, connectivity=8)
+    rects: list[tuple[int, int, int, int]] = []
+    for label in range(1, n_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < 16:
+            continue
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        ww = int(stats[label, cv2.CC_STAT_WIDTH])
+        hh = int(stats[label, cv2.CC_STAT_HEIGHT])
+        x0 = max(0, x - _VEC_PATCH_PAD_PX)
+        y0 = max(0, y - _VEC_PATCH_PAD_PX)
+        x1 = min(w, x + ww + _VEC_PATCH_PAD_PX)
+        y1 = min(h, y + hh + _VEC_PATCH_PAD_PX)
+        if x1 - x0 >= 2 and y1 - y0 >= 2:
+            rects.append((x0, y0, x1, y1))
+    return rects
+
+
+def _rect_to_contour(rect: tuple[int, int, int, int]) -> np.ndarray:
+    x0, y0, x1, y1 = rect
+    return np.array(
+        [[[x0, y0]], [[x1, y0]], [[x1, y1]], [[x0, y1]]],
+        dtype=np.int32,
+    )
+
+
+def _scale_simplified_contour(
+    contour: np.ndarray,
+    scale: float,
+    full_w: int,
+    full_h: int,
+) -> np.ndarray:
+    epsilon = max(0.75, _APPROX_FRAC * cv2.arcLength(contour, True))
+    approx = cv2.approxPolyDP(contour, epsilon, True).astype(np.float32)
+    if scale > 0:
+        approx[:, 0, 0] /= float(scale)
+        approx[:, 0, 1] /= float(scale)
+    approx[:, 0, 0] = np.clip(np.round(approx[:, 0, 0]), 0, max(0, full_w - 1))
+    approx[:, 0, 1] = np.clip(np.round(approx[:, 0, 1]), 0, max(0, full_h - 1))
+    return approx.astype(np.int32)
+
+
+def _bright_knockout_hole_contours(
+    gray: np.ndarray,
+    valid_mask: np.ndarray,
+) -> list[np.ndarray]:
+    bright = ((gray >= 245) & valid_mask).astype(np.uint8)
+    contours, _ = cv2.findContours(bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    holes: list[np.ndarray] = []
+    for cnt in contours:
+        if cv2.contourArea(cnt) < _VEC_FLAT_BRIGHT_HOLE_MIN_AREA_PX:
+            continue
+        epsilon = max(0.75, _APPROX_FRAC * cv2.arcLength(cnt, True))
+        holes.append(cv2.approxPolyDP(cnt, epsilon, True).astype(np.int32))
+    return holes
+
+
+def _holes_inside_mask(
+    holes: list[np.ndarray],
+    mask: np.ndarray,
+) -> list[np.ndarray]:
+    out: list[np.ndarray] = []
+    h, w = mask.shape[:2]
+    for hole in holes:
+        m = cv2.moments(hole)
+        if abs(m["m00"]) > 1e-6:
+            cx = int(round(m["m10"] / m["m00"]))
+            cy = int(round(m["m01"] / m["m00"]))
+        else:
+            pts = hole[:, 0, :]
+            cx = int(round(float(np.mean(pts[:, 0]))))
+            cy = int(round(float(np.mean(pts[:, 1]))))
+        if 0 <= cx < w and 0 <= cy < h and bool(mask[cy, cx]):
+            out.append(hole.copy())
+    return out
+
+
+def _flat_component_distribution_ok(gray: np.ndarray, mask: np.ndarray) -> bool:
+    ys, xs = np.where(mask)
+    if ys.size < _VEC_FLAT_MIN_COMPONENT_AREA_PX:
+        return False
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    medians: list[float] = []
+    for yy in range(y0, y1, _VEC_FLAT_TILE_PX):
+        for xx in range(x0, x1, _VEC_FLAT_TILE_PX):
+            tile_mask = mask[yy:min(y1, yy + _VEC_FLAT_TILE_PX),
+                             xx:min(x1, xx + _VEC_FLAT_TILE_PX)]
+            if int(tile_mask.sum()) < 16:
+                continue
+            tile = gray[yy:min(y1, yy + _VEC_FLAT_TILE_PX),
+                        xx:min(x1, xx + _VEC_FLAT_TILE_PX)]
+            vals = tile[tile_mask]
+            vals = vals[vals < 255]
+            if vals.size >= 16:
+                medians.append(float(np.median(vals)))
+    if len(medians) < 4:
+        return True
+    q25, q75 = np.percentile(np.asarray(medians, dtype=np.float32), [25, 75])
+    return float(q75 - q25) <= _VEC_FLAT_TILE_MEDIAN_IQR_MAX
