@@ -36,10 +36,26 @@ from .model import Box, Flag, Region, RegionKind, SourceRef
 PHOTO_AREA_FRAC = 0.01      # dense residual blob larger than this = photo
 PHOTO_FILL = 0.2           # connected-component fill ratio separating photo from line art
 TEXT_DILATE_PX = 6
+
+# A photo/figure box from either source (rtdetr or the residual ink-threshold
+# component) is a TIGHT bound on whichever pixels happened to clear the ink
+# threshold. A soft, low-contrast edge -- e.g. the lightest ring of a
+# concentric-circle diagram, where anti-aliasing spreads the contour line's
+# darkness over several pixels right where the curve is most tangential --
+# can fall just under threshold there and clip the box a few pixels short.
+# Pad outward so that sliver still lands inside the overlay crop instead of
+# being silently left as plain white base-layer background.
+PHOTO_BOX_PAD_FRAC = 0.01
+PHOTO_BOX_PAD_MIN_PX = 3
 LOW_COVERAGE_FRAC = 0.3    # text+figure covers < 30% of ink -> flag for review.
 # Calibrated on real books: detected-line polygons cover only ~40% of text ink
 # even on clean dense pages (boxes are tight), so 0.5 flagged the median page.
 # At 0.3 only genuine outliers (OCR truly missed most text) reach the queue.
+
+def _pad_box(x0: int, y0: int, x1: int, y1: int, w: int, h: int) -> tuple[int, int, int, int]:
+    pad = max(PHOTO_BOX_PAD_MIN_PX, int(PHOTO_BOX_PAD_FRAC * max(x1 - x0, y1 - y0)))
+    return (max(0, x0 - pad), max(0, y0 - pad), min(w, x1 + pad), min(h, y1 + pad))
+
 
 _ocr_engine = None
 _engine_lock = threading.Lock()   # one NPU/OCR engine shared across worker threads
@@ -127,6 +143,7 @@ def analyze(
                 flags.append(Flag.NO_TEXT)
 
     # layout-model figure/photo regions (optional, e.g. RT-DETRv2)
+    ocr_h, ocr_w = ocr_bgr.shape[:2]
     layout_boxes_px: list[tuple] = []
     if layout_provider is not None:
         try:
@@ -134,6 +151,7 @@ def analyze(
                 x0, y0, x1, y1 = int(b.x0), int(b.y0), int(b.x1), int(b.y1)
                 if x1 - x0 < 4 or y1 - y0 < 4:
                     continue
+                x0, y0, x1, y1 = _pad_box(x0, y0, x1, y1, ocr_w, ocr_h)
                 layout_boxes_px.append((x0, y0, x1, y1))
                 crop = ocr_bgr[max(0, y0):y1, max(0, x0):x1]
                 kind = RegionKind.PHOTO if _is_continuous_tone(crop) else RegionKind.FIGURE
@@ -171,11 +189,12 @@ def analyze(
         if area < PHOTO_AREA_FRAC * h * w:
             continue
         if area / float(cw * ch) >= PHOTO_FILL:
+            px0, py0, px1, py1 = _pad_box(x, y, x + cw, y + ch, w, h)
             regions.append(
                 Region(
                     kind=RegionKind.PHOTO,
-                    box=Box(x * inv_scale, y * inv_scale,
-                            (x + cw) * inv_scale, (y + ch) * inv_scale),
+                    box=Box(px0 * inv_scale, py0 * inv_scale,
+                            px1 * inv_scale, py1 * inv_scale),
                     source="residual",
                 )
             )
