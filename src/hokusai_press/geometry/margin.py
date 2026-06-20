@@ -35,6 +35,19 @@ SHADOW_EDGE_FRAC = 0.15      # a shadow lives within the outer 15% of a side
 SHADOW_SIDE_FRAC = 0.5       # ... and runs >= half that side's length
 SHADOW_THIN_FRAC = 0.15      # ... while staying thin (not a big figure)
 
+# A binding/ADF shadow doesn't always run a clean >=50% of the side -- partial
+# contact during the scan can leave it covering as little as ~15% (measured
+# on real corpus pages: img20260427_0001 has a 1-6px line hugging the left
+# edge at the SAME x across many pages, 15.6%-49.5% of page height). The
+# SHADOW_SIDE_FRAC rule above misses these because requiring only "thin" at
+# 15% width still risks eating real content. The fix is tightening the OTHER
+# axis instead: within the truly extreme edge (not just outer 15%, but outer
+# ~3% -- the scanner-bleed zone no real text ever starts in) a thin component
+# is a shadow fragment regardless of how much of the side it covers.
+EXTREME_EDGE_FRAC = 0.03
+EXTREME_THIN_FRAC = 0.01
+EXTREME_SIDE_FRAC = 0.12     # still need *some* length, to spare true speckle
+
 # Binarization threshold for the bw output layer, shadow detection and the blank
 # gate. Otsu finds the real ink/paper valley on a normal scan and must be used as
 # is: on this ADF the text strokes span the ~130-218 gray band (they are NOT all
@@ -89,6 +102,7 @@ def remove_edge_shadows(img: np.ndarray) -> np.ndarray:
     binv = (gray <= ink_threshold(gray)).astype(np.uint8)
     n, lbl, stats, _ = cv2.connectedComponentsWithStats(binv, connectivity=8)
     ew, eh = w * SHADOW_EDGE_FRAC, h * SHADOW_EDGE_FRAC
+    xew, xeh = w * EXTREME_EDGE_FRAC, h * EXTREME_EDGE_FRAC
     out = img.copy()
     for i in range(1, n):
         x, y, cw, ch, _ = stats[i]
@@ -96,7 +110,11 @@ def remove_edge_shadows(img: np.ndarray) -> np.ndarray:
              and (x <= ew or x + cw >= w - ew))
         hsh = (cw >= SHADOW_SIDE_FRAC * w and ch <= SHADOW_THIN_FRAC * h
                and (y <= eh or y + ch >= h - eh))
-        if v or hsh:
+        xv = (ch >= EXTREME_SIDE_FRAC * h and cw <= EXTREME_THIN_FRAC * w
+              and (x <= xew or x + cw >= w - xew))
+        xh = (cw >= EXTREME_SIDE_FRAC * w and ch <= EXTREME_THIN_FRAC * h
+              and (y <= xeh or y + ch >= h - xeh))
+        if v or hsh or xv or xh:
             out[lbl == i] = 255
     return out
 

@@ -74,6 +74,21 @@ def test_remove_edge_shadows_keeps_short_edge_mark():
     assert (out[10:40, 295:300] == 0).all()    # kept (too short to be a shadow)
 
 
+def test_remove_edge_shadows_removes_partial_height_extreme_edge_line():
+    # Real-world finding (img20260427_0001.pdf, 0427_0010, 0430_0002): a 1-6px
+    # line hugging the SAME x just inside the raw scan edge, covering only
+    # ~15-50% of the page height (partial scanner/ADF contact) -- too short
+    # for the >=50%-of-side shadow rule, but no real text ever starts this
+    # close (1.8%) to the physical edge, so a thin extreme-edge line is a
+    # shadow fragment regardless of how much of the side it covers.
+    img = np.full((1000, 700, 3), 255, dtype=np.uint8)
+    img[400:650, 10:13] = 0      # 3px wide, 25% tall, x=10 is 1.4% of width
+    img[300:700, 90:250] = 0     # interior body-text block, untouched
+    out = remove_edge_shadows(img)
+    assert (out[400:650, 10:13] == 255).all()   # fragment removed
+    assert (out[300:700, 90:250] == 0).all()    # real content preserved
+
+
 def _params(margin_box, dpi=600, kind=PageKind.AUTO, regions=None):
     return PageParams(
         source=SourceRef(path="x.png"),
