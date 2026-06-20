@@ -980,7 +980,13 @@ def _try_posterized_tint_overlay_pdf(
     ):
         return None
 
-    pdf = _encode_gray_flate_page_pdf(quantized)
+    try:
+        pdf = _encode_gray_flate_page_pdf(quantized)
+    except ValueError:
+        # pikepdf rejects page sizes outside [3, 14400] PDF units; a degenerate
+        # (near-zero or huge) downsampled tint zone hits this -- fall back to
+        # the JPEG/img2pdf path like any other posterize-quality failure.
+        return None
     return pdf, {
         "codec": "k4_flate",
         "class": patch_class,

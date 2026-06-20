@@ -607,3 +607,19 @@ def test_tint_posterize_knockout_text_leaves_no_white_speckle():
     assert (decoded[glyph] == 255).all()
     background = in_shape & ~hole
     assert int((decoded[background] >= 220).sum()) == 0
+
+
+def test_tint_posterize_degenerate_size_falls_back_instead_of_crashing():
+    # A downsampled tint zone can end up only 1-2px tall/wide (a hairline
+    # shadow band, near-blank fallback region, etc). pikepdf.add_blank_page
+    # rejects page sizes outside [3, 14400] PDF units -- this must surface as
+    # a None (-> JPEG/img2pdf fallback in render.py), not an uncaught
+    # ValueError that kills the whole page/document (seen on real corpus
+    # data: img20260430_0002.pdf during the 2026-06-20 5-book reprocess).
+    h, w = 2, 40
+    overlay = np.full((h, w), 170, dtype=np.uint8)
+    in_shape = np.ones((h, w), dtype=bool)
+    ink = np.zeros((h, w), dtype=bool)
+
+    result = _try_posterized_tint_overlay_pdf(overlay, in_shape, ink)
+    assert result is None
