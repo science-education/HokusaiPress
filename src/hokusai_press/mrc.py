@@ -84,6 +84,15 @@ _TINT_POSTERIZE_MAE_MAX: float = 10.0
 _TINT_POSTERIZE_P95_MAX: float = 28.0
 _TINT_POSTERIZE_BAD_DELTA: int = 32
 _TINT_POSTERIZE_BAD_FRAC_MAX: float = 0.03
+# Text strokes (black ink AND white knockout) detected over a tint zone are
+# punched out of the posterized overlay as 255 "holes": the bilevel base layer
+# below already carries the glyph (black strokes / white paper), and a Multiply
+# overlay treats 255 as identity, so the base shows through unmodified.  Feeding
+# those glyph pixels -- and especially their anti-aliased edges -- into the k4
+# clustering instead pulls a stray light/dark cluster that speckles the tint
+# background around the text.  The dilation grabs the anti-aliased halo so the
+# background quantizer only ever sees clean tint.
+_TINT_TEXT_HOLE_DILATE_PX: int = 2
 
 # The PDF tint overlay is clipped to the exact contour, but the bilevel base
 # layer should be a little more forgiving at the OUTER tint boundary.  ADF/Otsu
@@ -112,6 +121,18 @@ _KNOCKOUT_NOISE_MAX_AREA: int = 512
 _KNOCKOUT_TEXT_BRIGHT_FRAC_MIN: float = 0.02
 _KNOCKOUT_TEXT_DARK_FRAC_MAX: float = 0.12
 _KNOCKOUT_TEXT_PAD_PX: int = 2
+
+# Phase 2 -- gray text that is neither clearly black ink nor bright knockout.
+# An OCR box whose strokes sit a clear distance from the box's own background
+# tone (but not down at ink black or up at knockout white) is mid-gray text.
+# Its strokes are punched out of the tint background quantizer like any other
+# text, but the hole is filled with the ESTIMATED stroke gray instead of paper
+# white, and the bilevel base under it is whitened so the gray overlay shows.
+# Detection is deliberately conservative: a real contrast (>= _DELTA) over a
+# text-like, not tone-patch-like, fraction of the box.
+_TINT_GRAY_TEXT_DELTA: int = 40
+_TINT_GRAY_TEXT_FRAC_MIN: float = 0.02
+_TINT_GRAY_TEXT_FRAC_MAX: float = 0.45
 
 # Hysteresis for tint-zone ink.  Weak pixels are kept only when connected to a
 # stronger core, which prevents ordinary tint grain from becoming a black
@@ -271,9 +292,19 @@ class MrcPageBuilder:
                 edge_dirt = _tint_overlay_edge_dirt_mask(crop_gray, outer_mask, hole_mask)
                 ink[edge_dirt] = 0
                 ink_in_shape = ink & in_shape
+                # Locate every text stroke (black ink / white knockout / mid-
+                # gray) so it can be punched out of the posterized overlay's
+                # background quantizer instead of speckling the tint around it.
+                text_hole, text_fill, gray_text = _tint_text_holes(
+                    crop_gray, lines, x0i, y0i, in_shape, ink_in_shape
+                )
                 region = binary[y0i:y1i, x0i:x1i]
                 region[base_shape & ~ink_in_shape] = 255  # tint bg / edge → white
                 region[ink_in_shape] = 0                  # text strokes → black
+                # Mid-gray glyphs are carried by the gray overlay fill, not the
+                # bilevel base: whiten the base so the Multiply overlay shows.
+                if gray_text.any():
+                    region[gray_text] = 255
                 if zone.page_contour is not None:
                     fx0, fy0, fringe = _base_edge_fringe_mask(
                         zone.page_contour, zone.hole_contours, h, w
@@ -308,7 +339,19 @@ class MrcPageBuilder:
                     (ov_ds.shape[1], ov_ds.shape[0]),
                     interpolation=cv2.INTER_NEAREST,
                 ) > 0
-                posterized = _try_posterized_tint_overlay_pdf(ov_ds, in_shape_ds, ink_ds)
+                hole_ds = cv2.resize(
+                    text_hole.astype(np.uint8),
+                    (ov_ds.shape[1], ov_ds.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                ) > 0
+                hole_fill_ds = cv2.resize(
+                    text_fill,
+                    (ov_ds.shape[1], ov_ds.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                posterized = _try_posterized_tint_overlay_pdf(
+                    ov_ds, in_shape_ds, ink_ds, hole_ds, hole_fill_ds
+                )
                 if posterized is not None:
                     overlay_pdf, poster_stats = posterized
                 else:
@@ -660,6 +703,109 @@ def _ocr_text_box_mask(
     return out
 
 
+def _tint_text_holes(
+    crop_gray: np.ndarray,
+    lines: list,
+    crop_x0: int,
+    crop_y0: int,
+    in_shape: np.ndarray,
+    ink: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Locate text strokes over a tint zone and the colour to render them.
+
+    The posterized tint overlay is Multiply-blended over the bilevel base, so a
+    text stroke must be *punched out* of the background quantizer rather than
+    clustered with it -- otherwise the stroke and its anti-aliased edge seed a
+    stray light/dark cluster that speckles the tint around the text.
+
+    Returns ``(hole_mask, hole_fill, gray_text_mask)`` at the crop resolution:
+
+    * ``hole_mask``  -- every stroke pixel (black ink, white knockout, mid-gray)
+      plus a small dilation for the anti-aliased halo.  Excluded from the k4
+      background clustering and overwritten in the overlay.
+    * ``hole_fill``  -- the overlay value to write at hole pixels.  255 (paper)
+      for black ink and white knockout, since the base layer already carries the
+      glyph; the estimated stroke gray for mid-gray text, which the overlay must
+      paint itself.
+    * ``gray_text_mask`` -- mid-gray strokes whose base must be whitened so the
+      gray overlay fill is visible through the Multiply blend.
+    """
+    h, w = crop_gray.shape[:2]
+    hole = np.zeros((h, w), dtype=bool)
+    gray_text = np.zeros((h, w), dtype=bool)
+    fill = np.full((h, w), 255, dtype=np.uint8)
+
+    dk = 2 * _TINT_TEXT_HOLE_DILATE_PX + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dk, dk))
+
+    # Black ink: holes filled with paper white -- the base layer draws the black
+    # stroke, and 255 is the Multiply identity, so it shows through unchanged.
+    # The dilation pulls the anti-aliased stroke edge out of the background too.
+    ink_in = ink & in_shape
+    if ink_in.any():
+        ink_halo = (cv2.dilate(ink_in.astype(np.uint8), kernel) > 0) & in_shape
+        hole |= ink_halo
+
+    pad = _KNOCKOUT_TEXT_PAD_PX
+    for line in lines:
+        box = line.get("box") if isinstance(line, dict) else None
+        if not box or len(box) < 4:
+            continue
+        x0f, y0f, x1f, y1f = (float(v) for v in box[:4])
+        x0 = max(0, int(np.floor(min(x0f, x1f))) - crop_x0 - pad)
+        y0 = max(0, int(np.floor(min(y0f, y1f))) - crop_y0 - pad)
+        x1 = min(w, int(np.ceil(max(x0f, x1f))) - crop_x0 + pad)
+        y1 = min(h, int(np.ceil(max(y0f, y1f))) - crop_y0 + pad)
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            continue
+        sub = crop_gray[y0:y1, x0:x1]
+        valid = in_shape[y0:y1, x0:x1]
+        valid_px = int(valid.sum())
+        if valid_px < 8:
+            continue
+        bright = (sub >= _KNOCKOUT_WHITE_MIN) & valid
+        darkabs = (sub <= _TINT_STRONG_ABS_MAX) & valid
+        bright_frac = float(bright.sum()) / valid_px
+        dark_frac = float(darkabs.sum()) / valid_px
+
+        # White knockout glyphs: stroke pixels filled with paper (base is white).
+        if (
+            bright_frac >= _KNOCKOUT_TEXT_BRIGHT_FRAC_MIN
+            and dark_frac <= _KNOCKOUT_TEXT_DARK_FRAC_MAX
+            and int(bright.sum()) >= 4
+        ):
+            strokes = cv2.dilate(bright.astype(np.uint8), kernel) > 0
+            hole[y0:y1, x0:x1] |= strokes & valid
+            continue
+
+        # Mid-gray text: strokes sit a clear distance from the box's own tint
+        # background but are neither ink-black nor knockout-white.  Estimate the
+        # stroke colour and render it directly from the overlay.
+        bg = float(np.median(sub[valid]))
+        gdark = (sub.astype(np.int16) <= bg - _TINT_GRAY_TEXT_DELTA) & valid & ~darkabs
+        gbright = (sub.astype(np.int16) >= bg + _TINT_GRAY_TEXT_DELTA) & valid & ~bright
+        gdark_frac = float(gdark.sum()) / valid_px
+        gbright_frac = float(gbright.sum()) / valid_px
+        if gdark_frac >= gbright_frac:
+            cand, cfrac = gdark, gdark_frac
+        else:
+            cand, cfrac = gbright, gbright_frac
+        if not (_TINT_GRAY_TEXT_FRAC_MIN <= cfrac <= _TINT_GRAY_TEXT_FRAC_MAX):
+            continue
+        if int(cand.sum()) < 4:
+            continue
+        color = int(round(float(np.median(sub[cand]))))
+        strokes = (cv2.dilate(cand.astype(np.uint8), kernel) > 0) & valid
+        # Do not override a black-ink hole that the dilation may reach into.
+        sub_hole = hole[y0:y1, x0:x1]
+        new_gray = strokes & ~sub_hole
+        fill[y0:y1, x0:x1][new_gray] = np.uint8(np.clip(color, 0, 255))
+        sub_hole |= strokes
+        gray_text[y0:y1, x0:x1] |= new_gray
+
+    return hole, fill, gray_text
+
+
 def _tint_ink_mask(
     crop_gray: np.ndarray,
     knockout_text_mask: np.ndarray | None = None,
@@ -750,14 +896,31 @@ def _try_posterized_tint_overlay_pdf(
     overlay_gray: np.ndarray,
     in_shape: np.ndarray,
     ink: np.ndarray,
+    text_hole: np.ndarray | None = None,
+    text_fill: np.ndarray | None = None,
 ) -> tuple[bytes, dict] | None:
-    """Return a k4+Flate tint-overlay PDF, or None for JPEG fallback."""
+    """Return a k4+Flate tint-overlay PDF, or None for JPEG fallback.
+
+    ``text_hole`` marks every text stroke (black ink, white knockout, mid-gray)
+    so it is kept out of the background k4 clustering; otherwise the strokes and
+    their anti-aliased edges seed a stray cluster that speckles the tint.  Hole
+    pixels are written from ``text_fill`` (paper 255 for black/white text, the
+    estimated stroke gray for mid-gray text) instead of being quantized.
+    """
     if overlay_gray.dtype != np.uint8 or overlay_gray.ndim != 2:
         return None
     if overlay_gray.shape != in_shape.shape or overlay_gray.shape != ink.shape:
         return None
+    if text_hole is None:
+        text_hole = np.zeros_like(in_shape)
+    elif text_hole.shape != overlay_gray.shape:
+        return None
+    if text_fill is None:
+        text_fill = np.full_like(overlay_gray, 255)
+    elif text_fill.shape != overlay_gray.shape or text_fill.dtype != np.uint8:
+        return None
 
-    valid = in_shape & ~ink & (overlay_gray < 255)
+    valid = in_shape & ~ink & ~text_hole & (overlay_gray < 255)
     valid_count = int(valid.sum())
     if valid_count < max(100, _TINT_POSTERIZE_K):
         return None
@@ -797,6 +960,12 @@ def _try_posterized_tint_overlay_pdf(
     quantized = np.full_like(overlay_gray, 255)
     quantized[valid] = quant_vals
     quantized[ink & in_shape] = overlay_gray[ink & in_shape]
+    # Punch text strokes out of the quantized field: paper white for black/white
+    # text (the base layer carries the glyph), the estimated gray for mid-gray
+    # text (the overlay carries it).  Done after the field so a hole always wins.
+    hole_in = text_hole & in_shape
+    if hole_in.any():
+        quantized[hole_in] = text_fill[hole_in]
 
     diff = np.abs(
         overlay_gray[valid].astype(np.int16) - quantized[valid].astype(np.int16)
@@ -819,6 +988,7 @@ def _try_posterized_tint_overlay_pdf(
         "p95": p95,
         "bad_frac": bad_frac,
         "valid_pixels": valid_count,
+        "hole_pixels": int(hole_in.sum()),
         "centers": [int(round(float(c))) for c in sorted(representative_vals)],
     }
 

@@ -21,6 +21,7 @@ from hokusai_press.mrc import (
     _rect_edge_dirt_mask,
     _tint_overlay_edge_dirt_mask,
     _tint_ink_mask,
+    _tint_text_holes,
     _try_posterized_tint_overlay_pdf,
 )
 import cv2
@@ -529,3 +530,80 @@ def test_tint_posterize_preserves_ink_and_paper_pixels():
 
     assert np.array_equal(decoded[92:106, 25:190], overlay[92:106, 25:190])
     assert int((decoded[35:65, 30:90] == 255).sum()) == 30 * 60
+
+
+def test_tint_text_holes_marks_black_ink_and_white_knockout():
+    h, w = 200, 300
+    crop = np.full((h, w), 160, dtype=np.uint8)
+    crop[60:100, 40:120] = 236            # white knockout glyph pixels in a box
+    ink = np.zeros((h, w), dtype=bool)
+    ink[140:170, 200:280] = True          # black ink strokes elsewhere
+    in_shape = np.ones((h, w), dtype=bool)
+    lines = [{"box": [30, 40, 130, 120]}, {"box": [200, 140, 280, 170]}]
+
+    hole, fill, gray = _tint_text_holes(crop, lines, 0, 0, in_shape, ink)
+
+    # White knockout strokes and black ink are both punched out, filled paper.
+    assert hole[70:90, 50:110].all()
+    assert hole[150:160, 210:270].all()
+    assert (fill[crop >= 225] == 255).all()
+    assert (fill[ink] == 255).all()
+    assert not gray.any()
+
+
+def test_tint_text_holes_estimates_mid_gray_text_color():
+    h, w = 200, 300
+    crop = np.full((h, w), 170, dtype=np.uint8)   # tint background
+    glyph = np.zeros((h, w), dtype=bool)
+    glyph[60:140, 60:80] = True
+    glyph[60:140, 120:140] = True
+    crop[glyph] = 118                              # mid-gray strokes (not ink, not knockout)
+    ink = np.zeros((h, w), dtype=bool)
+    in_shape = np.ones((h, w), dtype=bool)
+    lines = [{"box": [40, 50, 160, 150]}]
+
+    hole, fill, gray = _tint_text_holes(crop, lines, 0, 0, in_shape, ink)
+
+    assert gray[glyph].all()
+    assert hole[glyph].all()
+    # The hole is filled with the estimated stroke gray, not paper white.
+    assert 110 <= int(np.median(fill[glyph])) <= 125
+
+
+def test_tint_posterize_knockout_text_leaves_no_white_speckle():
+    rng = np.random.default_rng(7)
+    h, w = 240, 480
+    yy, xx = np.indices((h, w))
+    overlay = np.full((h, w), 162, dtype=np.int16)
+    overlay[:, w // 2:] = 150
+    grain = np.where((xx + yy) % 2 == 0, -4, 4)
+    overlay = np.clip(overlay + grain + rng.integers(-2, 3, size=(h, w)), 0, 255).astype(np.uint8)
+
+    glyph = np.zeros((h, w), dtype=bool)
+    glyph[40:200, 60:80] = True
+    glyph[40:200, 300:320] = True
+    glyph[100:120, 60:320] = True
+    overlay[glyph] = 236                            # bright knockout strokes
+
+    in_shape = np.ones((h, w), dtype=bool)
+    ink = np.zeros((h, w), dtype=bool)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    hole = cv2.dilate(glyph.astype(np.uint8), kernel) > 0
+    fill = np.full((h, w), 255, dtype=np.uint8)
+
+    result = _try_posterized_tint_overlay_pdf(overlay, in_shape, ink, hole, fill)
+    assert result is not None
+    flate_pdf, stats = result
+
+    # No bright cluster: every k4 centre stays inside the tint band.
+    assert max(stats["centers"]) <= 190
+    assert stats["hole_pixels"] >= int(glyph.sum())
+
+    with pikepdf.open(BytesIO(flate_pdf)) as pdf:
+        images = _image_streams(pdf)
+        decoded = np.frombuffer(images[0].read_bytes(), dtype=np.uint8).reshape(overlay.shape)
+
+    # Glyph holes are paper white; the tint background has no near-white speckle.
+    assert (decoded[glyph] == 255).all()
+    background = in_shape & ~hole
+    assert int((decoded[background] >= 220).sum()) == 0
