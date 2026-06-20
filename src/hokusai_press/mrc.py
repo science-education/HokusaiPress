@@ -325,8 +325,13 @@ class MrcPageBuilder:
                 ov_gray = _clean_tint_overlay_edge(ov_gray, edge_dirt, edge_fill_value)
                 ov_ds = cv2.resize(
                     ov_gray,
-                    (max(1, int((x1i - x0i) * self.tint_scale)),
-                     max(1, int((y1i - y0i) * self.tint_scale))),
+                    # pikepdf/img2pdf both reject PDF page sizes below 3 units,
+                    # and this 1px=1pt downsampled overlay becomes its own
+                    # mini-PDF page -- floor at 3, not 1, so a thin tint
+                    # strip (e.g. a hairline shadow band) can't crash either
+                    # codec path (k4_flate or the jpeg/img2pdf fallback).
+                    (max(3, int((x1i - x0i) * self.tint_scale)),
+                     max(3, int((y1i - y0i) * self.tint_scale))),
                     interpolation=cv2.INTER_AREA,
                 )
                 in_shape_ds = cv2.resize(
