@@ -165,3 +165,30 @@ def test_ink_threshold_book_valley_handles_showthrough():
     with_valley = ink_threshold(show, valley)
     # show-through Otsu is well above the book valley -> clamped to it
     assert with_valley <= valley + 1
+
+
+def test_flag_skew_outliers_flags_large_book_relative_outlier():
+    from hokusai_press.geometry.deskew import flag_skew_outliers
+    # a mostly-straight book (angles ~0) with two genuinely skewed pages
+    ds = [Deskew(angle_deg=a, confidence=5.0) for a in
+          ([0.0, 0.1, -0.1, 0.05, 0.0, 0.1, -0.05, 0.0, 0.1, -0.1] + [0.8, -0.9])]
+    flags = flag_skew_outliers(ds)
+    assert flags[-1] and flags[-2]              # the 0.8 / -0.9 pages flagged
+    assert not any(flags[:10])                  # the straight bulk not flagged
+
+
+def test_flag_skew_outliers_spares_consistent_small_skew():
+    from hokusai_press.geometry.deskew import flag_skew_outliers
+    # every page has a small ~0.3deg skew (consistent) -> none is an outlier,
+    # and all are below the absolute-review floor anyway
+    ds = [Deskew(angle_deg=0.3, confidence=1.0) for _ in range(12)]
+    assert not any(flag_skew_outliers(ds))
+
+
+def test_flag_skew_outliers_small_book_falls_back_to_confidence():
+    from hokusai_press.geometry.deskew import flag_skew_outliers, GOOD_CONFIDENCE
+    # < SKEW_MIN_PAGES -> per-page rule: a tilted low-confidence page is flagged
+    ds = [Deskew(angle_deg=1.0, confidence=GOOD_CONFIDENCE - 0.5)]
+    assert flag_skew_outliers(ds) == [True]
+    ds2 = [Deskew(angle_deg=0.0, confidence=0.0)]   # upright -> not flagged
+    assert flag_skew_outliers(ds2) == [False]

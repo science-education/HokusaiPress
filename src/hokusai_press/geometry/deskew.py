@@ -94,3 +94,36 @@ def is_confident(deskew: Deskew) -> bool:
     if abs(deskew.angle_deg) < NEGLIGIBLE_ANGLE:
         return True
     return deskew.confidence >= GOOD_CONFIDENCE
+
+
+# Document-level deskew review flagging. The per-page `confidence` is not
+# comparable across books -- its scale swings wildly (measured on tmp0613:
+# per-book mean 6.5..19.9, std up to 33, max 310), so a fixed threshold means
+# something different on every book and both over-flags (dense straight pages)
+# and under-flags (it flagged 0 pages on img20260427_0010 despite that book
+# having genuine deskew failures). The robust signal is the APPLIED ANGLE
+# relative to the book's own distribution: a page whose correction angle is
+# both large in absolute terms AND a statistical outlier from the book centre
+# is the one likely mis-deskewed. (Per-book angle is tight: std 0.15-0.29deg.)
+SKEW_REVIEW_MIN_ABS = 0.5   # below this an applied angle is visually negligible
+SKEW_OUTLIER_K = 2.0        # ... flag only beyond this many robust sigma, and
+SKEW_SIGMA_FLOOR = 0.10     # ... with a sigma floor (MAD collapses to 0 on a
+#                             book that is mostly perfectly straight)
+SKEW_MIN_PAGES = 8          # too few pages for a distribution -> per-page rule
+
+
+def flag_skew_outliers(deskews: "list[Deskew]") -> "list[bool]":
+    """Document-level: True for each page whose deskew should go to review.
+    A page is flagged when its applied angle is both >= SKEW_REVIEW_MIN_ABS
+    and an outlier (> K robust-sigma) from the book's median angle. Falls back
+    to the per-page is_confident rule when there are too few pages to form a
+    distribution."""
+    if len(deskews) < SKEW_MIN_PAGES:
+        return [not is_confident(d) for d in deskews]
+    ang = np.array([d.angle_deg for d in deskews], dtype=np.float64)
+    m = float(np.median(ang))
+    sigma = max(float(np.median(np.abs(ang - m))) * 1.4826, SKEW_SIGMA_FLOOR)
+    return [
+        (abs(a - m) > SKEW_OUTLIER_K * sigma) and (abs(a) >= SKEW_REVIEW_MIN_ABS)
+        for a in ang
+    ]

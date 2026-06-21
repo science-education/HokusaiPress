@@ -155,11 +155,19 @@ def analyze_document(
             source=source, dpi=dpi, deskew=sk, margin=mg, regions=regions,
             page_kind=PageKind.AUTO, flags=list(cflags), blank=blank,
         )
-        if not deskew_mod.is_confident(sk):
-            params.flags.append(Flag.DESKEW_LOW_CONF)
+        # deskew review is decided document-level below (book-relative angle
+        # outliers), not per-page -- the per-page confidence isn't comparable
+        # across books.
         doc.pages.append(params)
         originals.append(original)
         margins.append(mg)
+
+    # deskew review: flag pages whose applied angle is a book-relative outlier
+    for params, is_out in zip(
+        doc.pages, deskew_mod.flag_skew_outliers([p.deskew for p in doc.pages])
+    ):
+        if is_out:
+            params.flags.append(Flag.DESKEW_LOW_CONF)
 
     # 5. read page numbers from OCR and snap nombre to the real number (one
     # consistent band), so normalization anchors correctly and missing pages
