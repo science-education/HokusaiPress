@@ -163,6 +163,14 @@ class RenderSettings:
     bilevel_codec: str = "g4"       # g4 | jbig2
     jpeg_quality: int = 85
     despeckle: bool = True          # applied to the bilevel layer only
+    # Tint (halftone-background) overlays: k4-posterized Multiply layers that
+    # preserve a gray screened background behind text. Disabled for now by
+    # user direction (2026-06-21): defer tuning until deskew/margin/shadow are
+    # settled. While off, a tint background simply goes through the bilevel
+    # base layer (light screens threshold to white). The k4 code path is kept
+    # and unit-tested directly; only its automatic per-page extraction is
+    # gated here. Re-enable by setting this True.
+    tint_overlay: bool = False
 
 
 @dataclass

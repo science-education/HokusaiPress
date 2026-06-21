@@ -313,7 +313,10 @@ def build_pdf(
         )
         vecfills = _figure_vecfills(out_bgr, params, document.render, original.shape)
         text_boxes = [tuple(line["box"]) for line in lines]
-        tint_zones = _raster_tint_zones(out_bgr, vecfills, text_boxes)
+        tint_zones = (
+            _raster_tint_zones(out_bgr, vecfills, text_boxes)
+            if document.render.tint_overlay else []
+        )
         builder.add_page(out_bgr, lines, photo_boxes, mode, vecfills, tint_zones)
     builder.save(out_path)
     _set_physical_page_size(out_path, document.render.target_dpi)
