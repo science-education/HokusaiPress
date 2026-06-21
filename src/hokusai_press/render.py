@@ -246,17 +246,18 @@ def _raster_tint_zones(
     return build_tint_zones(gray, panels, text_boxes)
 
 
-def binarize_bw(bgr: np.ndarray) -> np.ndarray:
+def binarize_bw(bgr: np.ndarray, book_valley: "int | None" = None) -> np.ndarray:
     """{0,255} single-channel bw layer. Threshold is Otsu (the real ink/paper
-    valley, kept as is so light strokes survive); only on a degenerate near-blank
-    page -- high Otsu with no genuinely dark pixels -- does ink_threshold drop to a
-    floor so show-through / shadow penumbra stay white instead of turning black
-    (see geometry.margin.ink_threshold). HokusaiPress owns its output binarization
+    valley, kept as is so light strokes survive); on a degenerate near-blank page
+    -- high Otsu with no genuinely dark pixels -- ink_threshold drops to the
+    book's valley (2-pass, when book_valley is given) or a fixed floor so
+    show-through / shadow penumbra stay white instead of turning black (see
+    geometry.margin.ink_threshold). HokusaiPress owns its output binarization
     (the OCR side keeps its own global-Otsu binarize for recognition)."""
     from .geometry.margin import ink_threshold
 
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
-    return np.where(gray <= ink_threshold(gray), 0, 255).astype(np.uint8)
+    return np.where(gray <= ink_threshold(gray, book_valley), 0, 255).astype(np.uint8)
 
 
 def _binarize_for_preview(bgr: np.ndarray) -> np.ndarray:
@@ -312,6 +313,7 @@ def build_pdf(
         compress=document.render.bilevel_codec,
         target_dpi=document.render.target_dpi,
         jpeg_quality=document.render.jpeg_quality,
+        ink_valley=getattr(document.render, "ink_valley", None),
     )
     for params, original in zip(document.pages, originals):
         out_bgr, lines, mode, photo_boxes = render_page_image(

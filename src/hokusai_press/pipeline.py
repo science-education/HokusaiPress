@@ -86,6 +86,12 @@ def analyze_document(
         for (_s, o, _w, _d) in loaded
     )
     doc.render.shadow_bands = bands
+    # 2-pass binarization valley: robust book-wide Otsu (median), so a
+    # show-through page uses the book valley at render instead of a fixed floor.
+    doc.render.ink_valley = margin_mod.document_ink_valley(
+        cv2.cvtColor(o, cv2.COLOR_BGR2GRAY) if o.ndim == 3 else o
+        for (_s, o, _w, _d) in loaded
+    )
     prof["margin"] += perf_counter() - t
 
     # Phase B: per-page analysis.
@@ -314,6 +320,9 @@ def rebuild(doc_id: str, source_path: str, out_pdf: str,
     # the stored per-page params -- recompute it from the originals (same
     # document-level detector as analyze) so render applies the identical bands.
     doc.render.shadow_bands = margin_mod.detect_shadow_bands(
+        cv2.cvtColor(o, cv2.COLOR_BGR2GRAY) if o.ndim == 3 else o for o in originals
+    )
+    doc.render.ink_valley = margin_mod.document_ink_valley(
         cv2.cvtColor(o, cv2.COLOR_BGR2GRAY) if o.ndim == 3 else o for o in originals
     )
     build_pdf(doc, originals, out_pdf)

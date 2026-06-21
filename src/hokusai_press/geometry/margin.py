@@ -66,11 +66,41 @@ EXTREME_SIDE_FRAC = 0.12     # still need *some* length, to spare true speckle
 INK_VALLEY_MAX = 225        # Otsu above this *may* be a degenerate near-blank page
 INK_FLOOR = 110             # ... confirmed if <0.1% of pixels are this dark; then
 DARK_INK_MIN_FRAC = 0.001   #     only genuinely dark pixels count as ink
+# When a document-wide valley is known (2-pass), a show-through page is one
+# whose own Otsu sits well ABOVE the book's valley. The book's per-page Otsu is
+# very stable (measured on tmp0613: std 2-9 within a book), so the book median
+# is a robust valley and "own Otsu > book_valley + delta" is a cleaner
+# show-through test than the standalone darkfrac magic below.
+INK_SHOWTHROUGH_DELTA = 25
 
 
-def ink_threshold(gray: np.ndarray) -> int:
+def document_ink_valley(grays) -> "int | None":
+    """Robust per-document binarization valley: the median of each page's Otsu
+    over an iterable of page grays. Used by the 2-pass binarization so a
+    show-through page (no dark mode -> Otsu shoots high) can fall back to the
+    book's normal valley instead of a fixed floor. None if no pages."""
+    otsus = []
+    for g in grays:
+        if g is None or g.ndim != 2 or not g.size:
+            continue
+        o, _ = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        otsus.append(int(o))
+    if not otsus:
+        return None
+    return int(np.median(otsus))
+
+
+def ink_threshold(gray: np.ndarray, book_valley: "int | None" = None) -> int:
     otsu, _ = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     otsu = int(otsu)
+    if book_valley is not None:
+        # 2-pass: a page whose Otsu sits well above the book's stable valley has
+        # no real dark ink (show-through / blank) -> use the book valley so its
+        # bleed-through isn't turned black. Normal pages keep their own Otsu.
+        if otsu > book_valley + INK_SHOWTHROUGH_DELTA:
+            return book_valley
+        return otsu
+    # standalone fallback (no document context): the original two-signal test.
     if otsu > INK_VALLEY_MAX and float((gray <= INK_FLOOR).mean()) < DARK_INK_MIN_FRAC:
         return INK_FLOOR
     return otsu

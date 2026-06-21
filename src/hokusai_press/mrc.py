@@ -166,11 +166,13 @@ class MrcPageBuilder:
     """Accumulates pages and writes one searchable MRC PDF."""
 
     def __init__(self, compress: str = "g4", photo_dpi: int = 200,
-                 target_dpi: int = 600, jpeg_quality: int = 85):
+                 target_dpi: int = 600, jpeg_quality: int = 85,
+                 ink_valley: "int | None" = None):
         self.compress = compress
         self.scale = max(photo_dpi / target_dpi, 0.05)
         self.tint_scale = max(_TINT_OVERLAY_DPI / target_dpi, 0.05)
         self.jpeg_quality = jpeg_quality
+        self.ink_valley = ink_valley   # 2-pass book binarization valley (or None)
         self._pages: list[dict] = []
 
     def add_page(self, out_bgr: np.ndarray, lines: list,
@@ -191,7 +193,7 @@ class MrcPageBuilder:
             base_pdf = encode_page_pdf(out_bgr, mode, self.compress)
             overlays = []
         else:
-            binary = binarize_bw(out_bgr)         # {0,255}, clamped threshold
+            binary = binarize_bw(out_bgr, self.ink_valley)  # {0,255}, 2-pass valley
             overlays = []
             for box in photo_boxes_px:
                 x0, y0, x1, y1 = box[:4]

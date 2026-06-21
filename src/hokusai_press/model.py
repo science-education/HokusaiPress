@@ -171,6 +171,14 @@ class RenderSettings:
     # and unit-tested directly; only its automatic per-page extraction is
     # gated here. Re-enable by setting this True.
     tint_overlay: bool = False
+    # Document-level binding/ADF shadow bands, detected once across all pages
+    # (margin.detect_shadow_bands) and re-applied at render. Each entry is
+    # (axis, lo_frac, hi_frac); axis 0 = a vertical band at x in [lo,hi]*W.
+    shadow_bands: list = field(default_factory=list)
+    # Document-level binarization valley (median per-page Otsu). When set, the
+    # output binarization uses it so a show-through page falls back to the
+    # book's stable valley instead of a fixed floor (2-pass binarization).
+    ink_valley: "int | None" = None
 
 
 @dataclass

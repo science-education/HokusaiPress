@@ -147,3 +147,21 @@ def test_detect_shadow_bands_ignores_running_head():
 def test_detect_shadow_bands_needs_minimum_pages():
     pages = _book_pages(4, with_left_bar=True)
     assert detect_shadow_bands(pages) == []
+
+
+def test_ink_threshold_book_valley_handles_showthrough():
+    from hokusai_press.geometry.margin import ink_threshold, document_ink_valley
+    # a normal inked page: clear dark text on white -> Otsu valley in the middle
+    normal = np.full((200, 200), 255, dtype=np.uint8)
+    normal[40:160, 40:160] = 30
+    valley = document_ink_valley([normal] * 10)
+    assert valley is not None
+    # the same normal page keeps its own Otsu (not the floor)
+    assert ink_threshold(normal, valley) == ink_threshold(normal, None)
+    # a show-through page: only faint gray bleed, no real dark ink -> its own
+    # Otsu shoots high; with the book valley it must fall back to the valley
+    show = np.full((200, 200), 245, dtype=np.uint8)
+    show[::4, ::4] = 205     # faint bleed pattern, nothing genuinely dark
+    with_valley = ink_threshold(show, valley)
+    # show-through Otsu is well above the book valley -> clamped to it
+    assert with_valley <= valley + 1
