@@ -67,9 +67,24 @@ def compose_transform(
 
 
 def _map_box(box: Box, M: np.ndarray) -> Box:
-    pts = np.array([[box.x0, box.y0, 1], [box.x1, box.y1, 1]], dtype=np.float64).T
+    # All FOUR corners, not just the two diagonal ones: M can carry a deskew
+    # rotation, under which a rotated rectangle's true bounding box is not
+    # simply "transform the top-left and bottom-right corners" -- a corner
+    # far from the rotation center (e.g. a text line near the very top of a
+    # tall page) shifts sideways by several px more than the box's nominal
+    # opposite corner does. Mapping only 2 corners under-covered exactly that
+    # far corner, and the margin-fill step then whitened part of real text
+    # past the (wrongly short) computed edge -- seen on real corpus data
+    # (img20260427_0001 p11: deskew -0.4 deg clipped the right side of
+    # characters in a text line near the page top, far from the rotation
+    # center, while center-ish lines were unaffected).
+    pts = np.array([
+        [box.x0, box.y0, 1], [box.x1, box.y0, 1],
+        [box.x0, box.y1, 1], [box.x1, box.y1, 1],
+    ], dtype=np.float64).T
     out = M @ pts
-    return Box(float(out[0, 0]), float(out[1, 0]), float(out[0, 1]), float(out[1, 1]))
+    return Box(float(out[0].min()), float(out[1].min()),
+               float(out[0].max()), float(out[1].max()))
 
 
 def render_page_image(

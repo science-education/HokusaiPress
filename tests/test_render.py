@@ -1,3 +1,4 @@
+import cv2
 import numpy as np
 
 from hokusai_press.model import (
@@ -109,6 +110,28 @@ def test_compose_crops_and_scales_identity():
     mapped = _map_box(Box(50, 100, 250, 500), M)
     assert abs(mapped.x0) < 1e-6 and abs(mapped.y0) < 1e-6
     assert abs(mapped.x1 - 200) < 1e-6 and abs(mapped.y1 - 400) < 1e-6
+
+
+def test_map_box_under_rotation_covers_all_four_corners():
+    # Real-corpus finding (img20260427_0001 p11): with a deskew rotation in
+    # M, mapping only the box's top-left/bottom-right corners under-covers
+    # the box for a far corner (e.g. a text line near the very top of a
+    # tall page, distant from the rotation center) -- the margin-fill step
+    # then whitens part of real text past the wrongly-short edge it computes
+    # from those 2 corners. A small rotation must still produce a bounding
+    # box that fully contains all 4 transformed corners.
+    cx, cy = 100.0, 100.0
+    R = cv2.getRotationMatrix2D((cx, cy), -0.4, 1.0)
+    M = R.astype(np.float32)
+    box = Box(10, 10, 190, 190)
+    pts = np.array([[box.x0, box.y0, 1], [box.x1, box.y0, 1],
+                     [box.x0, box.y1, 1], [box.x1, box.y1, 1]], dtype=np.float64).T
+    true_corners = (M.astype(np.float64) @ pts)
+    mapped = _map_box(box, M)
+    assert mapped.x0 <= true_corners[0].min() + 1e-6
+    assert mapped.x1 >= true_corners[0].max() - 1e-6
+    assert mapped.y0 <= true_corners[1].min() + 1e-6
+    assert mapped.y1 >= true_corners[1].max() - 1e-6
 
 
 def test_compose_upscales_to_target_dpi():
