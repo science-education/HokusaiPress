@@ -312,23 +312,35 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     def confident(p):   # the OCR resolver only assigns a number it trusts
         return p.page_number is not None and p.margin.nombre_box is not None
 
-    # ONE size for the whole document (uniform judgment size). Detection
-    # FAILURE (confidence 0.0) falls back to the full raw page as "content"
-    # (find_content_box), which is not a real body-text extent -- a single
-    # near-blank front-matter page like that inflates max_w/max_h for the
-    # WHOLE document (measured: 1749px full-page width vs ~1300px median
-    # real content width), pushing every other page's centered x0 negative
-    # / x1 past the real image's right edge -- silent clipping on whichever
-    # side that lands on. Confident-detection pages set the uniform size;
-    # fall back to all pages only if none exist (degenerate doc).
+    # ONE size for the whole document (uniform judgment size). Two failure
+    # modes to avoid:
+    #  (a) detection FAILURE (confidence 0.0) falls back to the full raw page
+    #      as "content", which is not a real body-text extent -- exclude those.
+    #  (b) the raw MAX is pulled up by a single legitimate-but-large outlier
+    #      page (a fold-out, a detection that over-grew), bloating the crop for
+    #      the WHOLE document. Measured on tmp0613: e.g. img20260430_0002 width
+    #      max=2295px vs P97.5~1700px (one outlier inflating all 160 pages).
+    # So the uniform size is the P97.5 of reliable content extents -- robust to
+    # a few extreme pages without the instability of mean+2sigma (sigma is
+    # itself inflated by the very outliers we're discounting; on a tight book
+    # mean+2sigma can even exceed the max). The <=2.5% of pages whose own
+    # content exceeds the uniform size are NOT clipped: crop_size() floors each
+    # page at its own content+margin (see below), so an outlier gets a slightly
+    # larger page rather than losing content or enlarging every other page.
     reliable = [p for p in have if p.margin.confidence >= 0.2] or have
-    max_w = max(extent(p, p.margin.content.width) for p in reliable)
-    max_h = max(extent(p, p.margin.content.height) for p in reliable)
+    UNIFORM_PCT = 97.5
+    uni_w = float(np.percentile([extent(p, p.margin.content.width) for p in reliable], UNIFORM_PCT))
+    uni_h = float(np.percentile([extent(p, p.margin.content.height) for p in reliable], UNIFORM_PCT))
 
     def crop_size(p):
         dpi = p.dpi if use_dpi else 1.0
-        cw = (max_w + 2 * (output_margin_mm / 25.4)) * (dpi if use_dpi else 1)
-        ch = (max_h + 2 * (output_margin_mm / 25.4)) * (dpi if use_dpi else 1)
+        pad = 2 * (output_margin_mm / 25.4)
+        # uniform size, but never smaller than THIS page's own content+margin
+        # (so an outlier page is never clipped -- it just gets a larger crop)
+        w_in = max(uni_w, extent(p, p.margin.content.width)) + pad
+        h_in = max(uni_h, extent(p, p.margin.content.height)) + pad
+        cw = w_in * (dpi if use_dpi else 1)
+        ch = h_in * (dpi if use_dpi else 1)
         return cw, ch
 
     def baseline(p):  # this page's own content, centered in the uniform crop

@@ -11,22 +11,33 @@ def _page(idx, content, dpi=600, nombre=None):
     )
 
 
-def test_uniform_size_whole_document_and_no_clip():
-    # left (even) and right (odd) pages must end up the SAME size -- an ADF book
-    # has one uniform page size, not different sizes per parity.
-    pages = [
-        _page(0, Box(100, 120, 480, 700)),   # even
-        _page(1, Box(140, 110, 520, 690)),   # odd
-        _page(2, Box(90, 130, 470, 720)),    # even, tallest content
-        _page(3, Box(150, 100, 540, 680)),   # odd, widest content
+def test_uniform_size_for_the_bulk_outlier_gets_own_size_no_clip():
+    # The bulk of pages share ONE uniform size (an ADF book has one page size).
+    # The uniform size is the P97.5 of content extents, so a single large
+    # outlier page does NOT inflate every other page's crop; instead the
+    # outlier gets its own (content+margin) crop and is never clipped.
+    bulk = [
+        _page(0, Box(100, 120, 480, 700)),   # ~380 x 580
+        _page(1, Box(140, 110, 520, 690)),
+        _page(2, Box(90, 130, 470, 710)),
+        _page(3, Box(150, 100, 530, 680)),
+        _page(5, Box(110, 120, 490, 700)),
+        _page(7, Box(120, 110, 500, 690)),
     ]
+    outlier = _page(9, Box(60, 80, 700, 1100))   # much larger than the bulk
+    pages = bulk + [outlier]
     normalize_margins(pages, output_margin_mm=5.0)
 
-    w0 = pages[0].margin.crop.width
-    h0 = pages[0].margin.crop.height
-    for p in pages:                          # every page identical size
+    # the bulk pages all share one size
+    w0 = bulk[0].margin.crop.width
+    h0 = bulk[0].margin.crop.height
+    for p in bulk:
         assert abs(p.margin.crop.width - w0) < 1e-6
         assert abs(p.margin.crop.height - h0) < 1e-6
+
+    # the outlier is NOT clipped and is larger than the uniform size
+    assert outlier.margin.crop.width > w0
+    assert outlier.margin.crop.height > h0
 
     # no page's content is clipped by its crop
     for p in pages:
@@ -144,11 +155,8 @@ def test_margin_at_least_output_margin_on_all_sides():
         assert crop.x1 - c.x1 >= margin_px - 1e-6      # right
         assert c.y0 - crop.y0 >= margin_px - 1e-6      # top
         assert crop.y1 - c.y1 >= margin_px - 1e-6      # bottom
-    # both pages end up the same uniform crop size, each centered on its own
-    # (different-sized) content -- not a constant head margin from one edge
-    w0 = pages[0].margin.crop.width
-    w1 = pages[1].margin.crop.width
-    assert abs(w0 - w1) < 1e-6
+    # each page centered on its own content (the real per-page invariant;
+    # uniform-vs-outlier sizing is covered by the dedicated test above)
     for p in pages:
         crop, c = p.margin.crop, p.margin.content
         left_margin = c.x0 - crop.x0
