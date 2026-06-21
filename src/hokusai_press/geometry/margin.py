@@ -146,6 +146,18 @@ def remove_edge_shadows(img: np.ndarray) -> np.ndarray:
 # edge line -- which is whitened (whole column + halo). Gated on near-blank so dense
 # pages are never altered. (Validated on tmp0613: removes the binding lines on the
 # near-blank pages, leaves the 縦書き text column on 0005 p7 intact.)
+#
+# REVERTED 2026-06-21: tried removing the density gate to catch the same
+# fragmented pattern on dense pages too (img20260427_0001 p74/90/92/118) --
+# a 5-book diff-pixel sweep showed catastrophic over-triggering (up to
+# ~550,000 changed px/page on img20260427_0010, vs a true positive's few
+# hundred), so the gate must stay. On a dense page, a column's "ink spans
+# >=25% of height with gaps allowed" condition is satisfied constantly by
+# ordinary running text (many short ink runs spread down a column of body
+# text), not just by a binding line -- the density gate is what makes that
+# condition mean "binding line" instead of "any column with text in it".
+# Don't remove this gate without a per-column discriminator that works on
+# dense pages specifically (validated against a broad corpus sweep first).
 EDGE_LINE_TRIGGER_FRAC = 0.015   # only on pages with <=1.5% ink (near-blank)
 EDGE_LINE_BAND_FRAC = 0.07       # detect only in the outer 7% (extreme edge), so
 #                                  inner margin content is separated by position
