@@ -119,6 +119,21 @@ def remove_edge_shadows(img: np.ndarray) -> np.ndarray:
     return out
 
 
+# NOTE: a column/row-mean "bright, dark, recovers" profile rule was tried
+# here to catch shadows that touch (and connected-component-merge with) real
+# content on dense photo/diagram pages -- e.g. img20260427_0010, where the
+# shadow merges into the page's dominant ink blob and the component rule
+# above can't isolate it. It was reverted: real corpus content (sampled
+# across all 5 books, ~135 of ~150 pages) produces the same bright/dark/
+# bright column-mean shape often enough -- text blocks, photo edges, rules --
+# that a width-only discriminator still misclassified real content as shadow
+# on a book reported as having NO shadows (img20260525_0005). Don't re-add
+# this without a discriminator validated against that negative case and a
+# broad corpus sweep (diff-pixel count vs the unmodified image) showing no
+# large-area false positives; see this commit's history for the failed
+# attempt and the false-positive evidence.
+
+
 # A near-blank page (mostly empty leaf, part-title, show-through) can keep a thin
 # binding/ADF line along a side that the single-component shadow rule above misses
 # because the line is *fragmented* (broken into dashes with gaps too large for any
@@ -258,17 +273,20 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
 
     Positioning fuses two strategies under a hard ">= output margin on all four
     sides" guarantee (the crop never touches the content):
+    - the BASELINE for every page is centered on both axes: this page's own
+      content centered within the document-uniform crop. Averaged over the
+      whole book this already centers the body on the page, since it's each
+      page's actual content extent against the one shared crop size.
     - when a page's nombre is CONFIDENT (a page number was assigned by the OCR
-      sequence resolver), its position is nombre-anchored on BOTH axes to that
-      parity's common offset so the body -- and the nombre itself -- sits
-      consistently across the book (an unanchored axis lets the nombre's
-      pixel position drift page to page, e.g. horizontally if only the
-      vertical axis is anchored: each page's own content-box width/center
-      varies a little with how much ink it has, and "centered on content"
-      reintroduces exactly the per-page jitter nombre-anchoring was meant to
-      remove);
-    - otherwise (low-confidence / no OCR), it falls back to the deterministic
-      placement: horizontally centered with a constant head (top) margin.
+      sequence resolver), a small CORRECTION is added on top of that
+      baseline so the nombre lands at a common per-parity offset from the
+      baseline -- removing the residual per-page jitter from a varying
+      content box, without dragging the whole page off-center. (Anchoring
+      directly to "nombre offset from content's near edge" instead of to the
+      centered baseline was tried first and is wrong: the "slack" between
+      this page's content size and the document-wide uniform crop size then
+      lands entirely on the far side, biasing every page toward one corner
+      -- exactly what real-corpus review caught.)
     Either way the offset is clamped so every side keeps >= the output margin.
     """
     have = [p for p in pages if p.margin and p.margin.content]
@@ -286,18 +304,31 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     max_w = max(extent(p, p.margin.content.width) for p in have)
     max_h = max(extent(p, p.margin.content.height) for p in have)
 
-    # common nombre offset per parity (both axes), from CONFIDENT pages only
+    def crop_size(p):
+        dpi = p.dpi if use_dpi else 1.0
+        cw = (max_w + 2 * (output_margin_mm / 25.4)) * (dpi if use_dpi else 1)
+        ch = (max_h + 2 * (output_margin_mm / 25.4)) * (dpi if use_dpi else 1)
+        return cw, ch
+
+    def baseline(p):  # this page's own content, centered in the uniform crop
+        c = p.margin.content
+        cw, ch = crop_size(p)
+        return c.x0 + c.width / 2 - cw / 2, c.y0 + c.height / 2 - ch / 2
+
+    # common nombre CORRECTION per parity (both axes), from CONFIDENT pages
+    # only -- relative to the centered baseline, not to the content edge, so
+    # the correction's mean is ~0 and doesn't drag pages off-center.
     common_noff: dict[int, float] = {}
     common_noff_x: dict[int, float] = {}
     by_parity: dict[int, list] = {0: [], 1: []}
     for p in have:
         by_parity[p.source.page_index % 2].append(p)
     for parity, group in by_parity.items():
-        offs = [extent(p, p.margin.nombre_box.y0 - p.margin.content.y0)
+        offs = [extent(p, p.margin.nombre_box.y0 - baseline(p)[1])
                 for p in group if confident(p)]
         if offs:
             common_noff[parity] = float(np.median(offs))
-        offs_x = [extent(p, p.margin.nombre_box.x0 - p.margin.content.x0)
+        offs_x = [extent(p, p.margin.nombre_box.x0 - baseline(p)[0])
                   for p in group if confident(p)]
         if offs_x:
             common_noff_x[parity] = float(np.median(offs_x))
@@ -305,23 +336,20 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     for p in have:
         dpi = p.dpi if use_dpi else 1.0
         margin_px = output_margin_mm / 25.4 * (p.dpi if use_dpi else 96)
-        crop_w = (max_w + 2 * (output_margin_mm / 25.4)) * (dpi if use_dpi else 1)
-        crop_h = (max_h + 2 * (output_margin_mm / 25.4)) * (dpi if use_dpi else 1)
+        crop_w, crop_h = crop_size(p)
+        bx0, by0 = baseline(p)
         c = p.margin.content
         noff = common_noff.get(p.source.page_index % 2)
         noff_x = common_noff_x.get(p.source.page_index % 2)
         if confident(p) and noff_x is not None:
-            # place the body so this page's nombre sits at the common
-            # horizontal offset too, not just centered on this page's own
-            # (slightly varying) content-box width
-            x0 = p.margin.nombre_box.x0 - noff_x * (dpi if use_dpi else 1) - margin_px
+            # centered baseline + the common per-parity nombre correction
+            x0 = p.margin.nombre_box.x0 - noff_x * (dpi if use_dpi else 1)
         else:
-            x0 = c.x0 + c.width / 2 - crop_w / 2      # fallback: centered
+            x0 = bx0                                  # fallback: centered
         if confident(p) and noff is not None:
-            # place the body so this page's nombre sits at the common offset
-            y0 = p.margin.nombre_box.y0 - noff * (dpi if use_dpi else 1) - margin_px
+            y0 = p.margin.nombre_box.y0 - noff * (dpi if use_dpi else 1)
         else:
-            y0 = c.y0 - margin_px                      # fallback: constant head
+            y0 = by0                                   # fallback: centered
         # clamp so EVERY side keeps >= the output margin (never touches content);
         # always feasible since the uniform crop >= content + 2*margin
         x0 = max(min(x0, c.x0 - margin_px), c.x1 + margin_px - crop_w)
