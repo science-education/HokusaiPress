@@ -2,7 +2,9 @@ import cv2
 import numpy as np
 
 from hokusai_press.geometry.deskew import GOOD_CONFIDENCE, find_skew, is_confident
-from hokusai_press.geometry.margin import find_content_box, remove_edge_shadows
+from hokusai_press.geometry.margin import (
+    find_content_box, remove_edge_shadows, detect_shadow_bands, apply_shadow_bands,
+)
 from hokusai_press.model import Deskew
 
 
@@ -94,3 +96,54 @@ def test_remove_edge_shadows_keeps_text_dots():
     out = remove_edge_shadows(img)
     assert (out[::3, 20:40] == 0).any()     # text kept
     assert (out[:, 290:294] == 255).all()   # shadow removed
+
+
+def _book_pages(n, with_left_bar=True, bar_x=8, running_head=False, jitter=True):
+    """n synthetic yokogaki pages (HxW = 300x400). Optional fixed left shadow
+    bar (outer band), optional recurring running head, body ink that wanders."""
+    rng = np.random.default_rng(0)
+    pages = []
+    for i in range(n):
+        g = np.full((300, 400), 255, dtype=np.uint8)
+        bx = 60 + (rng.integers(-20, 20) if jitter else 0)   # body left edge wanders
+        for y in range(40, 270, 18):                          # body text lines
+            g[y:y+8, bx:bx+260] = 0
+        if with_left_bar:
+            g[:, bar_x:bar_x+3] = 40                          # fixed thin edge shadow
+        if running_head:
+            g[18:22, 70:330] = 0                              # wide line at constant y
+        pages.append(g)
+    return pages
+
+
+def test_detect_shadow_bands_finds_consistent_edge_line():
+    pages = _book_pages(12, with_left_bar=True, bar_x=8)
+    bands = detect_shadow_bands(pages)
+    vbands = [b for b in bands if b[0] == 0]
+    assert vbands, "should detect the fixed left edge bar"
+    # the band covers x=8 (=0.02 of W=400)
+    assert any(lo <= 8/400 <= hi for _, lo, hi in vbands)
+    # applying it whitens the bar but keeps body ink
+    out = apply_shadow_bands(pages[0].copy(), bands)
+    assert (out[:, 8:11] == 255).all()                # bar removed
+    assert (out[:, 60:320] < 128).any()               # body text kept
+
+
+def test_detect_shadow_bands_ignores_wandering_content():
+    # no fixed edge bar; body ink wanders -> no consistent column -> no band
+    pages = _book_pages(12, with_left_bar=False, jitter=True)
+    bands = detect_shadow_bands(pages)
+    assert [b for b in bands if b[0] == 0] == []
+
+
+def test_detect_shadow_bands_ignores_running_head():
+    # a recurring horizontal running head must NOT be detected (vertical-only),
+    # else it (and the nombre) would be whitened
+    pages = _book_pages(12, with_left_bar=False, running_head=True, jitter=True)
+    bands = detect_shadow_bands(pages)
+    assert bands == []
+
+
+def test_detect_shadow_bands_needs_minimum_pages():
+    pages = _book_pages(4, with_left_bar=True)
+    assert detect_shadow_bands(pages) == []

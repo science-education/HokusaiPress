@@ -134,6 +134,112 @@ def remove_edge_shadows(img: np.ndarray) -> np.ndarray:
 # attempt and the false-positive evidence.
 
 
+# --- Cross-page (document-level) shadow-band detection -----------------------
+# The per-page rules above cannot tell, on a single page, whether a dark column
+# hugging the edge is a binding/ADF shadow or real content -- which is why the
+# 2026-06-21 single-page attempt false-fired on dense text. The discriminating
+# signal is CROSS-PAGE CONSISTENCY: an ADF shadow sits at the SAME absolute
+# position on every sheet (fixed feed position), so it shows up as a dark column
+# at a near-constant x on a large fraction of the book's pages, whereas a body/
+# margin text column wanders page to page. Measured on tmp0613: the left shadow
+# of img20260427_0010 is a dark column at x=31 with std 0.0 across all sampled
+# pages. detect_shadow_bands() aggregates per-column dark frequency over the
+# whole document and keeps only thin, outer-edge columns that recur on enough
+# pages; apply_shadow_bands() whitens them. Positions are stored as fractions of
+# width/height so the model transfers across the work-raster / original scales.
+SHADOW_BAND_EDGE_FRAC = 0.07     # only consider the outer 7% of each side
+SHADOW_BAND_MIN_H = 0.10         # a "dark column" has ink over >=10% of its height
+SHADOW_BAND_PAGE_FRAC = 0.50     # ... and must recur on >=50% of pages to be a shadow
+SHADOW_BAND_MAX_W = 0.05         # safety: a shadow band is < 5% of the page wide
+SHADOW_BAND_MIN_PAGES = 8        # need at least this many pages to trust frequency
+SHADOW_BAND_HALO_FRAC = 0.004    # whiten this much beyond the band (penumbra)
+
+
+def _dark_columns(gray: np.ndarray, axis: int) -> np.ndarray:
+    """Boolean profile over `axis` (0=columns/x, 1=rows/y): True where the line
+    has ink (<= ink_threshold) spanning >= SHADOW_BAND_MIN_H of the cross extent,
+    restricted to the outer SHADOW_BAND_EDGE_FRAC at either end."""
+    binv = (gray <= ink_threshold(gray)).astype(np.uint8)
+    cross = binv.shape[0] if axis == 0 else binv.shape[1]
+    counts = binv.sum(axis=0 if axis == 0 else 1)
+    n = counts.size
+    dark = counts >= SHADOW_BAND_MIN_H * cross
+    ew = int(n * SHADOW_BAND_EDGE_FRAC)
+    mask = np.zeros(n, dtype=bool)
+    if ew > 0:
+        mask[:ew] = dark[:ew]
+        mask[n - ew:] = dark[n - ew:]
+    return mask
+
+
+def detect_shadow_bands(grays) -> "list[tuple]":
+    """Find binding/ADF shadow bands that recur at a consistent position across
+    the document. `grays` is any iterable of single-channel page images (a
+    generator is fine -- iterated once, one image held at a time, so a whole
+    book's pages need not be materialized). Returns a list of
+    (axis, lo_frac, hi_frac); axis 0 = a vertical band at x in [lo,hi]*W.
+    Empty when no consistent thin edge band exists (the common case).
+
+    VERTICAL bands only. ADF/binding shadows are left/right, and every shadow
+    reported on the real corpus is vertical. A horizontal cross-page band
+    almost always catches a RUNNING HEAD / footer instead -- e.g.
+    img20260525_0005's "059  第3章 ..." chapter line recurs at a constant y and
+    spans the text width, so horizontal detection would whiten it (and the
+    nombre). Restricting to vertical removes that whole false-positive class
+    while still catching every reported shadow.
+    """
+    BINS = 1000
+    freq = np.zeros(BINS, dtype=np.float64)
+    npages = 0
+    for g in grays:
+        if g is None or g.ndim != 2 or not g.size:
+            continue
+        mask = _dark_columns(g, 0)
+        if mask.size != BINS:
+            xs = np.linspace(0, 1, mask.size)
+            binned = np.interp(np.linspace(0, 1, BINS), xs, mask.astype(float)) >= 0.5
+        else:
+            binned = mask
+        freq += binned
+        npages += 1
+    if npages < SHADOW_BAND_MIN_PAGES:
+        return []
+    freq /= npages
+    shadow_bins = freq >= SHADOW_BAND_PAGE_FRAC
+    bands: "list[tuple]" = []
+    i = 0
+    while i < BINS:
+        if not shadow_bins[i]:
+            i += 1
+            continue
+        j = i
+        while j < BINS and shadow_bins[j]:
+            j += 1
+        lo_frac, hi_frac = i / BINS, j / BINS
+        if (hi_frac - lo_frac) <= SHADOW_BAND_MAX_W:
+            bands.append((0, lo_frac, hi_frac))
+        i = j
+    return bands
+
+
+def apply_shadow_bands(img: np.ndarray, bands: "list[tuple]") -> np.ndarray:
+    """Whiten the document-level shadow bands (with a small halo) on one image."""
+    if not bands:
+        return img
+    out = img.copy()
+    h, w = img.shape[:2]
+    for axis, lo, hi in bands:
+        if axis == 0:
+            halo = max(2, int(w * SHADOW_BAND_HALO_FRAC))
+            a = max(0, int(lo * w) - halo); b = min(w, int(hi * w) + halo)
+            out[:, a:b] = 255
+        else:
+            halo = max(2, int(h * SHADOW_BAND_HALO_FRAC))
+            a = max(0, int(lo * h) - halo); b = min(h, int(hi * h) + halo)
+            out[a:b, :] = 255
+    return out
+
+
 # A near-blank page (mostly empty leaf, part-title, show-through) can keep a thin
 # binding/ADF line along a side that the single-component shadow rule above misses
 # because the line is *fragmented* (broken into dashes with gaps too large for any

@@ -59,19 +59,39 @@ def analyze_document(
 ) -> AnalyzeResult:
     from .source import load_page
 
+    import cv2
+
     doc = Document(source_path=path)
     originals: list[np.ndarray] = []
     margins = []
     prof: dict = defaultdict(float)
 
-    page_iter = load_page(path, pages)
-    while True:
-        t = perf_counter()
-        try:
-            source, original, ocr_img, dpi = next(page_iter)
-        except StopIteration:
-            break
-        prof["raster"] += perf_counter() - t
+    # Phase A: load every page first. This is a true 2-pass design: a document-
+    # level binding/ADF shadow model can only be found by looking ACROSS pages
+    # (a shadow recurs at a fixed absolute x; content wanders), so all pages
+    # must be in hand before per-page analysis. originals are retained and
+    # returned anyway, so this adds no peak memory beyond the work rasters.
+    t = perf_counter()
+    loaded = list(load_page(path, pages))
+    prof["raster"] += perf_counter() - t
+
+    # Detect cross-page shadow bands once (generator -> one gray held at a
+    # time), store on the document so render re-applies the identical model,
+    # and clean every page up front so deskew / content / margin all see a
+    # shadow-free image -- this is what finally keeps a fragmented edge shadow
+    # out of the content box, which the per-page rule alone could not.
+    t = perf_counter()
+    bands = margin_mod.detect_shadow_bands(
+        cv2.cvtColor(o, cv2.COLOR_BGR2GRAY) if o.ndim == 3 else o
+        for (_s, o, _w, _d) in loaded
+    )
+    doc.render.shadow_bands = bands
+    prof["margin"] += perf_counter() - t
+
+    # Phase B: per-page analysis.
+    for source, original, ocr_img, dpi in loaded:
+        original = margin_mod.apply_shadow_bands(original, bands)
+        ocr_img = margin_mod.apply_shadow_bands(ocr_img, bands)
 
         # 1-2. deskew on the work raster (angle is scale-free), then upright it
         t = perf_counter()
@@ -282,12 +302,20 @@ def rebuild(doc_id: str, source_path: str, out_pdf: str,
     if not rows:
         raise ValueError(f"no stored pages for doc_id={doc_id}")
 
+    import cv2
+
     doc = Document(source_path=source_path)
     originals = []
     for row in rows:
         doc.pages.append(row.params)
         original, _ = load_single(source_path, row.params.source.page_index)
         originals.append(original)
+    # rebuild makes a fresh Document, so the shadow-band model isn't carried in
+    # the stored per-page params -- recompute it from the originals (same
+    # document-level detector as analyze) so render applies the identical bands.
+    doc.render.shadow_bands = margin_mod.detect_shadow_bands(
+        cv2.cvtColor(o, cv2.COLOR_BGR2GRAY) if o.ndim == 3 else o for o in originals
+    )
     build_pdf(doc, originals, out_pdf)
     return {"doc_id": doc_id, "pages": len(rows), "out_pdf": out_pdf}
 
