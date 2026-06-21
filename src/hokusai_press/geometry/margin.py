@@ -324,23 +324,30 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
         cw, ch = crop_size(p)
         return c.x0 + c.width / 2 - cw / 2, c.y0 + c.height / 2 - ch / 2
 
-    # common nombre CORRECTION per parity (both axes), from CONFIDENT pages
-    # only -- relative to the centered baseline, not to the content edge, so
-    # the correction's mean is ~0 and doesn't drag pages off-center.
-    common_noff: dict[int, float] = {}
+    # Common nombre CORRECTION, relative to the centered baseline (not to
+    # content's edge, so the correction's mean is ~0 and doesn't drag pages
+    # off-center). Horizontal is computed PER PARITY: recto/verso legitimately
+    # place the nombre on opposite sides. Vertical is computed ACROSS BOTH
+    # PARITIES TOGETHER: a real book prints the nombre at the SAME height
+    # regardless of recto/verso -- measured on real corpus data, raw-scan
+    # nombre.y0 is ~2371 for both odd and even pages (no parity-dependent
+    # offset at all). Splitting the vertical anchor by parity (as it was
+    # first written, by analogy with the horizontal one) let the two
+    # parities' baselines drift apart and reintroduced an ~80px recto/verso
+    # height mismatch that doesn't exist in the source.
     common_noff_x: dict[int, float] = {}
     by_parity: dict[int, list] = {0: [], 1: []}
     for p in have:
         by_parity[p.source.page_index % 2].append(p)
     for parity, group in by_parity.items():
-        offs = [extent(p, p.margin.nombre_box.y0 - baseline(p)[1])
-                for p in group if confident(p)]
-        if offs:
-            common_noff[parity] = float(np.median(offs))
         offs_x = [extent(p, p.margin.nombre_box.x0 - baseline(p)[0])
                   for p in group if confident(p)]
         if offs_x:
             common_noff_x[parity] = float(np.median(offs_x))
+
+    offs_y = [extent(p, p.margin.nombre_box.y0 - baseline(p)[1])
+              for p in have if confident(p)]
+    common_noff = float(np.median(offs_y)) if offs_y else None
 
     for p in have:
         dpi = p.dpi if use_dpi else 1.0
@@ -348,15 +355,14 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
         crop_w, crop_h = crop_size(p)
         bx0, by0 = baseline(p)
         c = p.margin.content
-        noff = common_noff.get(p.source.page_index % 2)
         noff_x = common_noff_x.get(p.source.page_index % 2)
         if confident(p) and noff_x is not None:
             # centered baseline + the common per-parity nombre correction
             x0 = p.margin.nombre_box.x0 - noff_x * (dpi if use_dpi else 1)
         else:
             x0 = bx0                                  # fallback: centered
-        if confident(p) and noff is not None:
-            y0 = p.margin.nombre_box.y0 - noff * (dpi if use_dpi else 1)
+        if confident(p) and common_noff is not None:
+            y0 = p.margin.nombre_box.y0 - common_noff * (dpi if use_dpi else 1)
         else:
             y0 = by0                                   # fallback: centered
         # clamp so EVERY side keeps >= the output margin (never touches content);

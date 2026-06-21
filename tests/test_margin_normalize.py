@@ -101,6 +101,33 @@ def test_confident_nombre_anchored_horizontally_too():
     assert abs(x0 - x1) < 8.0
 
 
+def test_nombre_vertical_anchor_is_shared_across_parity():
+    # Real corpus finding: nombre.y0 in the RAW scan is ~identical for odd
+    # and even pages (a real book prints the nombre at the same height on
+    # recto and verso) -- only the horizontal side differs by parity. An
+    # earlier version computed the vertical anchor PER PARITY (by analogy
+    # with the horizontal one), which let the two parities' centered
+    # baselines drift apart and reintroduced an ~80px recto/verso height
+    # mismatch that doesn't exist in the source. The vertical anchor must
+    # be shared across both parities.
+    def conf(idx, content, nombre):
+        p = _page(idx, content, dpi=600, nombre=nombre)
+        p.page_number = 10 + idx
+        return p
+
+    pages = [
+        conf(0, Box(200, 300, 600, 900), Box(220, 930, 260, 960)),
+        conf(1, Box(250, 280, 650, 920), Box(610, 930, 650, 960)),
+        conf(2, Box(200, 300, 600, 900), Box(220, 930, 260, 960)),
+        conf(3, Box(250, 280, 650, 920), Box(610, 930, 650, 960)),
+    ]
+    normalize_margins(pages, output_margin_mm=5.0)
+
+    y0_even = pages[0].margin.nombre_box.y0 - pages[0].margin.crop.y0
+    y0_odd = pages[1].margin.nombre_box.y0 - pages[1].margin.crop.y0
+    assert abs(y0_even - y0_odd) < 1.0
+
+
 def test_margin_at_least_output_margin_on_all_sides():
     # the crop must sit >= output margin outside the content on every side
     # (never touching it) -- deterministic centered placement (both axes).
