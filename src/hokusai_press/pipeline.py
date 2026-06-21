@@ -66,39 +66,26 @@ def analyze_document(
     margins = []
     prof: dict = defaultdict(float)
 
-    # Phase A: load every page first. This is a true 2-pass design: a document-
-    # level binding/ADF shadow model can only be found by looking ACROSS pages
-    # (a shadow recurs at a fixed absolute x; content wanders), so all pages
-    # must be in hand before per-page analysis. originals are retained and
-    # returned anyway, so this adds no peak memory beyond the work rasters.
+    # Phase A: load every page first. A document-level binarization valley needs
+    # all pages in hand; originals are retained and returned anyway, so this adds
+    # no peak memory beyond the work rasters.
     t = perf_counter()
     loaded = list(load_page(path, pages))
     prof["raster"] += perf_counter() - t
 
-    # Detect cross-page shadow bands once (generator -> one gray held at a
-    # time), store on the document so render re-applies the identical model,
-    # and clean every page up front so deskew / content / margin all see a
-    # shadow-free image -- this is what finally keeps a fragmented edge shadow
-    # out of the content box, which the per-page rule alone could not.
-    t = perf_counter()
-    bands = margin_mod.detect_shadow_bands(
-        cv2.cvtColor(o, cv2.COLOR_BGR2GRAY) if o.ndim == 3 else o
-        for (_s, o, _w, _d) in loaded
-    )
-    doc.render.shadow_bands = bands
     # 2-pass binarization valley: robust book-wide Otsu (median), so a
     # show-through page uses the book valley at render instead of a fixed floor.
+    t = perf_counter()
     doc.render.ink_valley = margin_mod.document_ink_valley(
         cv2.cvtColor(o, cv2.COLOR_BGR2GRAY) if o.ndim == 3 else o
         for (_s, o, _w, _d) in loaded
     )
     prof["margin"] += perf_counter() - t
 
-    # Phase B: per-page analysis.
+    # Phase B: per-page analysis. Binding/ADF edge shadows are removed per page
+    # AFTER OCR, using the text region as the boundary (margin.remove_region_
+    # shadows) -- a region-derived rule with no fixed-position constant.
     for source, original, ocr_img, dpi in loaded:
-        original = margin_mod.apply_shadow_bands(original, bands)
-        ocr_img = margin_mod.apply_shadow_bands(ocr_img, bands)
-
         # 1-2. deskew on the work raster (angle is scale-free), then upright it
         t = perf_counter()
         sk = deskew_mod.find_skew(ocr_img)
@@ -113,6 +100,15 @@ def analyze_document(
             openvino_cache_dir=openvino_cache_dir,
         )
         prof["ocr"] += perf_counter() - t
+
+        # 3b. region-based edge-shadow removal: now that OCR text/figure regions
+        # are known, whiten thin near-full-height dark lines in the margins
+        # OUTSIDE the text box (figures subtracted, so they're never touched).
+        # Done before find_content_box so the shadow is kept out of the box, and
+        # the cleaned original is what gets stored/rendered.
+        t = perf_counter()
+        original = margin_mod.remove_region_shadows(original, regions)
+        prof["margin"] += perf_counter() - t
 
         # 4. margin / nombre on the deskewed original; expand the content box to
         # include detected regions so a figure/photo is never cropped out (the

@@ -100,7 +100,7 @@ def render_page_image(
     (auto gray/color), "gray", or "color" — the per-region override that lets a
     grayscale picture live inside an otherwise bilevel page.
     """
-    from .geometry.margin import remove_edge_shadows, apply_shadow_bands
+    from .geometry.margin import remove_edge_shadows, remove_region_shadows
 
     # whiten binding/ADF edge shadows on the FULL original first (robust, the
     # validated location) -- then warp the clean image, so no shadow survives
@@ -112,12 +112,12 @@ def render_page_image(
         white = np.full((out_size[1], out_size[0], 3), 255, dtype=np.uint8)
         return white, [], "bw", []
 
-    # document-level cross-page shadow bands first (handles the fragmented edge
-    # shadows the per-page component rule misses), then the per-page rule. On
-    # the production run path the original is already band-cleaned (no-op here);
-    # on the rebuild path the original is freshly loaded, so this is where the
-    # stored band model is applied.
-    clean = apply_shadow_bands(original_bgr, getattr(settings, "shadow_bands", []))
+    # region-based margin shadow removal first (uses this page's OCR text/figure
+    # regions: thin near-full-height dark line outside the text box, figures
+    # protected), then the per-page component rule for wider shadows. On the
+    # production run path the original is already region-cleaned (no-op here); on
+    # the rebuild path the original is freshly loaded, so this is where it applies.
+    clean = remove_region_shadows(original_bgr, params.regions)
     clean = remove_edge_shadows(clean)
     out = cv2.warpAffine(clean, M, out_size, flags=cv2.INTER_AREA,
                          borderValue=(255, 255, 255))

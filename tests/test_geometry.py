@@ -4,8 +4,9 @@ import numpy as np
 from hokusai_press.geometry.deskew import GOOD_CONFIDENCE, find_skew, is_confident
 from hokusai_press.geometry.margin import (
     find_content_box, remove_edge_shadows, detect_shadow_bands, apply_shadow_bands,
+    region_shadow_mask, remove_region_shadows,
 )
-from hokusai_press.model import Deskew
+from hokusai_press.model import Deskew, Region, RegionKind, Box
 
 
 def _text_page(rotate_deg=0.0):
@@ -192,3 +193,49 @@ def test_flag_skew_outliers_small_book_falls_back_to_confidence():
     assert flag_skew_outliers(ds) == [True]
     ds2 = [Deskew(angle_deg=0.0, confidence=0.0)]   # upright -> not flagged
     assert flag_skew_outliers(ds2) == [False]
+
+
+def _txt(x0, y0, x1, y1):
+    return Region(kind=RegionKind.TEXT, box=Box(x0, y0, x1, y1))
+
+
+def test_region_shadow_removed_outside_text_box():
+    # A thin near-full-height dark line in the left margin (outside the text box)
+    # is a binding/ADF shadow -> removed. The body text is kept.
+    g = np.full((400, 300), 255, dtype=np.uint8)
+    g[:, 8:10] = 30                       # thin tall shadow line at x=8 (margin)
+    for y in range(40, 360, 20):          # body text lines, left edge at x=80
+        g[y:y+8, 80:250] = 0
+    regions = [_txt(80, 40, 250, 360)]
+    out = remove_region_shadows(g, regions)
+    assert (out[:, 8:10] == 255).all()    # shadow line removed
+    assert (out[:, 80:250] < 128).any()   # body text kept
+
+
+def test_region_shadow_does_not_touch_figure():
+    # A figure that bleeds into the left margin must be protected: a dark line
+    # inside the figure's box is NOT whitened, even though it is left of the text.
+    g = np.full((400, 300), 255, dtype=np.uint8)
+    g[50:350, 5:120] = 60                 # a figure block reaching the left edge
+    for y in range(40, 360, 20):
+        g[y:y+8, 150:260] = 0             # text to the right of the figure
+    regions = [
+        _txt(150, 40, 260, 360),
+        Region(kind=RegionKind.PHOTO, box=Box(5, 50, 120, 350)),
+    ]
+    out = remove_region_shadows(g, regions)
+    # the figure interior is untouched (not whitened to 255)
+    assert (out[60:340, 10:110] < 255).any()
+
+
+def test_region_shadow_keeps_margin_text():
+    # Sparse marginal text (no >=25%-tall consecutive run) in the margin must NOT
+    # be removed -- only a solid tall line qualifies as a shadow.
+    g = np.full((400, 300), 255, dtype=np.uint8)
+    for y in range(40, 360, 40):          # sparse dots in the left margin
+        g[y:y+6, 12:20] = 0
+    for y in range(40, 360, 20):
+        g[y:y+8, 80:250] = 0
+    regions = [_txt(80, 40, 250, 360)]
+    out = remove_region_shadows(g, regions)
+    assert (out[:, 12:20] < 128).any()    # sparse margin marks kept (not a line)

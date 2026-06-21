@@ -24,7 +24,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from ..model import Box, Deskew, Flag, Margin
+from ..model import Box, Deskew, Flag, Margin, RegionKind
 
 SPECKLE_AREA_FRAC = 1e-5     # components smaller than this fraction are noise
 NOMBRE_BAND_FRAC = 0.08      # top/bottom 8% of the page is the nombre band
@@ -267,6 +267,75 @@ def apply_shadow_bands(img: np.ndarray, bands: "list[tuple]") -> np.ndarray:
             halo = max(2, int(h * SHADOW_BAND_HALO_FRAC))
             a = max(0, int(lo * h) - halo); b = min(h, int(hi * h) + halo)
             out[a:b, :] = 255
+    return out
+
+
+# --- Region-based (per-page) shadow removal -----------------------------------
+# Replaces the position-magic "outer 7%" band: the boundary of where a shadow
+# can be is derived from the page's own OCR text region, not a fixed fraction.
+# A binding/ADF shadow is a thin, near-full-height dark vertical line in the
+# LEFT/RIGHT margin -- i.e. OUTSIDE the text bounding box. We scan those margins
+# for such a line (1px-seed opening requiring a >=SHADOW_RUN_FRAC-tall CONSECUTIVE
+# dark run, which text/tategaki columns with inter-character gaps never satisfy)
+# and whiten its column + halo. Detected figure/photo regions are SUBTRACTED from
+# the result so a figure that bleeds to the edge is never whitened, while a
+# shadow in the margin beside it still is. Validated on tmp0613 (all 5 books):
+# catches every reported shadow page, zero pixels whitened inside any text or
+# figure/photo region. No cross-page pass, no fixed-position constant.
+SHADOW_RUN_FRAC = 0.25       # a shadow line spans >= this fraction of page height
+SHADOW_COL_HALO_PX = 3       # whiten this many px around the detected line
+
+
+def _text_bbox(regions):
+    xs0, ys0, xs1, ys1 = [], [], [], []
+    for r in regions or []:
+        if r.kind != RegionKind.TEXT or r.box is None:
+            continue
+        xs0.append(r.box.x0); ys0.append(r.box.y0)
+        xs1.append(r.box.x1); ys1.append(r.box.y1)
+    if not xs0:
+        return None
+    return Box(min(xs0), min(ys0), max(xs1), max(ys1))
+
+
+def region_shadow_mask(gray: np.ndarray, regions) -> np.ndarray:
+    """Boolean mask of binding/ADF shadow pixels in the left/right margins
+    (outside the OCR text box, excluding figure/photo regions)."""
+    h, w = gray.shape
+    tb = _text_bbox(regions)
+    out = np.zeros((h, w), dtype=bool)
+    if tb is None:
+        return out
+    dark = (gray <= ink_threshold(gray)).astype(np.uint8)
+    run = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(20, int(SHADOW_RUN_FRAC * h))))
+    halo = SHADOW_COL_HALO_PX
+    for a, b in ((0, max(0, int(tb.x0))), (min(w, int(tb.x1)), w)):
+        if b - a < 1:
+            continue
+        seed = cv2.morphologyEx(dark[:, a:b], cv2.MORPH_OPEN, run) > 0
+        for c in np.flatnonzero(seed.any(axis=0)):
+            x = a + c
+            out[:, max(a, x - halo):min(b, x + halo + 1)] = True
+    # protect figures/photos: never whiten inside a non-text region
+    for r in regions or []:
+        if r.kind == RegionKind.TEXT or r.box is None:
+            continue
+        bx0 = max(0, int(r.box.x0)); by0 = max(0, int(r.box.y0))
+        bx1 = min(w, int(r.box.x1)); by1 = min(h, int(r.box.y1))
+        out[by0:by1, bx0:bx1] = False
+    return out
+
+
+def remove_region_shadows(img: np.ndarray, regions) -> np.ndarray:
+    """Whiten region-based margin shadows on a gray or BGR image."""
+    if not regions:
+        return img
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    mask = region_shadow_mask(gray, regions)
+    if not mask.any():
+        return img
+    out = img.copy()
+    out[mask] = 255
     return out
 
 
