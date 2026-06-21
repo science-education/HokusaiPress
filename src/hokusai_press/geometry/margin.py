@@ -300,9 +300,18 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     def confident(p):   # the OCR resolver only assigns a number it trusts
         return p.page_number is not None and p.margin.nombre_box is not None
 
-    # ONE size for the whole document (uniform judgment size)
-    max_w = max(extent(p, p.margin.content.width) for p in have)
-    max_h = max(extent(p, p.margin.content.height) for p in have)
+    # ONE size for the whole document (uniform judgment size). Detection
+    # FAILURE (confidence 0.0) falls back to the full raw page as "content"
+    # (find_content_box), which is not a real body-text extent -- a single
+    # near-blank front-matter page like that inflates max_w/max_h for the
+    # WHOLE document (measured: 1749px full-page width vs ~1300px median
+    # real content width), pushing every other page's centered x0 negative
+    # / x1 past the real image's right edge -- silent clipping on whichever
+    # side that lands on. Confident-detection pages set the uniform size;
+    # fall back to all pages only if none exist (degenerate doc).
+    reliable = [p for p in have if p.margin.confidence >= 0.2] or have
+    max_w = max(extent(p, p.margin.content.width) for p in reliable)
+    max_h = max(extent(p, p.margin.content.height) for p in reliable)
 
     def crop_size(p):
         dpi = p.dpi if use_dpi else 1.0
