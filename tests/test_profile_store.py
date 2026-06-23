@@ -43,6 +43,10 @@ def test_store_roundtrip_features():
 def test_run_populates_profile(tmp_path):
     import cv2
     import numpy as np
+    import pytest
+
+    pytest.importorskip("hybrid_ocr")  # pipeline.run -> build_pdf needs it
+    pytest.importorskip("pikepdf")
 
     from hokusai_press import pipeline
 
