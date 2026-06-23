@@ -119,6 +119,13 @@ def load_single(path: str, page_index: int) -> tuple[np.ndarray, float | None]:
     return original, dpi
 
 
+_ROTATE_CV2 = {
+    90: cv2.ROTATE_90_CLOCKWISE,
+    180: cv2.ROTATE_180,
+    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+}
+
+
 def _extract_original(page, doc, index: int) -> tuple[np.ndarray, float | None, str | None]:
     """Prefer the single embedded full-page image (lossless original). Fall
     back to a 300 dpi rasterization when a page is not a simple scan."""
@@ -127,7 +134,16 @@ def _extract_original(page, doc, index: int) -> tuple[np.ndarray, float | None, 
 
     images = [obj for obj in page.get_objects()
               if obj.type == pdfium_c.FPDF_PAGEOBJ_IMAGE]
+    # get_size() already reflects /Rotate (it's the page's DISPLAY size), but
+    # the embedded image bytes are in the page's own unrotated frame -- e.g. a
+    # wide table scanned sideways and tagged /Rotate=270 so it displays as a
+    # tall page (the reader turns the BOOK, not the table). Apply that same
+    # rotation to the extracted bitmap (a lossless 90 deg permutation, not a
+    # resample) so the original matches what every viewer/the rest of the
+    # pipeline treats as "this page", instead of staying landscape while
+    # every other page in the book is portrait.
     page_w_pt, page_h_pt = page.get_size()
+    rotation = page.get_rotation() % 360
 
     if len(images) == 1:
         img_obj = images[0]
@@ -135,7 +151,11 @@ def _extract_original(page, doc, index: int) -> tuple[np.ndarray, float | None, 
             pil = img_obj.get_bitmap(render=False).to_pil()
             arr = np.array(pil.convert("RGB"))
             bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-            # dpi from embedded pixel size vs page point size
+            cv2_rot = _ROTATE_CV2.get(rotation)
+            if cv2_rot is not None:
+                bgr = cv2.rotate(bgr, cv2_rot)
+            # dpi from embedded pixel size vs page point size (both now in
+            # the same, rotation-applied orientation)
             dpi = bgr.shape[1] / (page_w_pt / 72.0) if page_w_pt else None
             return bgr, dpi, "img0"
         except Exception:
