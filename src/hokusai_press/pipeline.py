@@ -437,12 +437,17 @@ def _save_profile(store, doc_id: str, result) -> None:
 
 
 def rebuild(doc_id: str, source_path: str, out_pdf: str,
-            db_path: str = "hokusai.db") -> dict:
+            db_path: str = "hokusai.db", max_workers: int = 1,
+            use_processes: bool = False) -> dict:
     """Regenerate the PDF purely from stored (possibly corrected) parameters.
 
     The output is a pure function of the parameters + the original image, so a
     review correction is realized simply by re-rendering — no image was ever
     destructively edited. This is the non-destructive model paying off.
+
+    max_workers > 1 parallelizes both the per-page original-image load (see
+    recompute_shadows_and_margins) and build_pdf's render+encode (the
+    dominant cost -- see build_pdf).
     """
     from .render import build_pdf
     from .source import load_single
@@ -458,11 +463,16 @@ def rebuild(doc_id: str, source_path: str, out_pdf: str,
     import cv2
 
     doc = Document(source_path=source_path)
-    originals = []
-    for row in rows:
-        doc.pages.append(row.params)
-        original, _ = load_single(source_path, row.params.source.page_index)
-        originals.append(original)
+    doc.pages = [row.params for row in rows]
+    load_args = [(source_path, row.params.source.page_index) for row in rows]
+    if max_workers > 1 and len(load_args) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            originals = [o for o, _ in ex.map(
+                lambda a: load_single(*a), load_args)]
+    else:
+        originals = [load_single(*a)[0] for a in load_args]
     # rebuild makes a fresh Document, so the shadow-band model isn't carried in
     # the stored per-page params -- recompute it from the originals (same
     # document-level detector as analyze) so render applies the identical bands.
@@ -472,7 +482,8 @@ def rebuild(doc_id: str, source_path: str, out_pdf: str,
     doc.render.ink_valley = margin_mod.document_ink_valley(
         cv2.cvtColor(o, cv2.COLOR_BGR2GRAY) if o.ndim == 3 else o for o in originals
     )
-    build_pdf(doc, originals, out_pdf)
+    build_pdf(doc, originals, out_pdf, max_workers=max_workers,
+              use_processes=use_processes)
     return {"doc_id": doc_id, "pages": len(rows), "out_pdf": out_pdf}
 
 
@@ -495,8 +506,17 @@ def recompute_margins(store: Store, doc_id: str,
     return len(pages)
 
 
+def _load_and_compute_margin(args):
+    source_path, p = args
+    from .source import load_single
+
+    original, _ = load_single(source_path, p.source.page_index)
+    return compute_margin(original, p.deskew, p.regions)
+
+
 def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
-                                  output_margin_mm: float = 5.0) -> int:
+                                  output_margin_mm: float = 5.0,
+                                  max_workers: int = 1) -> int:
     """Re-run shadow removal + content-box detection from STORED regions, with
     no OCR / layout re-run. Returns the number of pages.
 
@@ -507,15 +527,25 @@ def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
     analyze_document() run, and this path skips it entirely. Follow with
     rebuild() to render the result; that already recomputes ink_valley/
     shadow_bands from the (now re-cleaned) originals.
-    """
-    from .source import load_single
 
+    max_workers > 1 runs load_single + compute_margin for each page on a
+    thread pool: pdfium extraction is already serialized process-wide (see
+    source._PDFIUM_LOCK), and compute_margin's cv2 work releases the GIL, so
+    pages still overlap profitably even though every load_single call shares
+    that one lock.
+    """
     rows = store.list_pages(doc_id)
     pages = [r.params for r in rows]
+    worker_args = [(source_path, p) for p in pages]
+    if max_workers > 1 and len(worker_args) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            results = list(ex.map(_load_and_compute_margin, worker_args))
+    else:
+        results = [_load_and_compute_margin(a) for a in worker_args]
     originals = []
-    for p in pages:
-        original, _ = load_single(source_path, p.source.page_index)
-        original, mg = compute_margin(original, p.deskew, p.regions)
+    for p, (original, mg) in zip(pages, results):
         p.margin = mg
         originals.append(original)
 

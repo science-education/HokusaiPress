@@ -8,6 +8,41 @@ from hokusai_press.cli import (
 )
 
 
+def test_remargin_skips_ocr(tmp_path, monkeypatch):
+    """remargin must rebuild from stored regions without calling OCR again --
+    that's the whole point (margin/figure tweaks are cheap to re-verify)."""
+    import cv2
+    import numpy as np
+    import pytest
+
+    pytest.importorskip("hybrid_ocr")  # pipeline.run -> build_pdf needs it
+    pytest.importorskip("pikepdf")
+
+    from hokusai_press import pipeline
+    from hokusai_press.cli import main
+
+    img = np.full((1000, 700, 3), 255, np.uint8)
+    cv2.rectangle(img, (100, 120), (600, 880), (0, 0, 0), 2)
+    for y in range(160, 840, 40):
+        cv2.rectangle(img, (120, y), (580, y + 16), (0, 0, 0), -1)
+    src = str(tmp_path / "pg.png")
+    cv2.imwrite(src, img)
+
+    db = str(tmp_path / "j.db")
+    pipeline.run(src, str(tmp_path / "o.pdf"), db_path=db, use_ocr=False)
+
+    calls = []
+    import hokusai_press.content as content_mod
+    monkeypatch.setattr(content_mod, "analyze",
+                        lambda *a, **k: calls.append(1) or (None, None))
+
+    out = str(tmp_path / "remargin.pdf")
+    rc = main(["remargin", src, "--out", out, "--db", db])
+    assert rc == 0
+    assert os.path.exists(out)
+    assert calls == []  # content.analyze (OCR) was never invoked
+
+
 def test_parse_pages():
     assert _parse_pages(None) is None
     assert _parse_pages("") is None

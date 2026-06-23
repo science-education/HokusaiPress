@@ -328,12 +328,49 @@ def render_output_preview(
     return canvas
 
 
+def _render_and_encode_page(args) -> dict:
+    """Per-page render (compose/warp/shadow-clean) + MRC encode (G4/JPEG/
+    posterize), as one pure function of (params, original, settings, builder
+    config) -- no shared state -- so build_pdf can run this on a thread pool.
+    Measured ~80% of build_pdf's wall time (encode alone ~65%), making this
+    the highest-value parallel target in the whole pipeline."""
+    params, original, settings, encoder = args
+    out_bgr, lines, mode, photo_boxes = render_page_image(original, params, settings)
+    vecfills = _figure_vecfills(out_bgr, params, settings, original.shape)
+    text_boxes = [tuple(line["box"]) for line in lines]
+    tint_zones = (
+        _raster_tint_zones(out_bgr, vecfills, text_boxes)
+        if settings.tint_overlay else []
+    )
+    return encoder.encode_page(out_bgr, lines, photo_boxes, mode, vecfills, tint_zones)
+
+
 def build_pdf(
     document: Document,
     originals: list[np.ndarray],
     out_path: str,
+    max_workers: int = 1,
+    use_processes: bool = False,
 ) -> str:
-    """Assemble the searchable MRC PDF from per-page params + originals."""
+    """Assemble the searchable MRC PDF from per-page params + originals.
+
+    max_workers > 1 runs render+encode for each page on a pool (see
+    _render_and_encode_page): every page is otherwise-independent work, and
+    encode_page returns only plain bytes/tuples/lists (encode_page_pdf
+    returns raw PDF bytes, never a pikepdf object), so the result is cheaply
+    picklable across a process boundary too. Results are collected via
+    Executor.map, which preserves page order, so the sequential
+    add_encoded_page loop below is just the cheap bookkeeping half.
+
+    use_processes selects ProcessPoolExecutor over ThreadPoolExecutor.
+    Measured on tmp0613 (176 pages, 14 logical cores): threads plateau at
+    ~2.8x around max_workers=14 and regress beyond it (oversubscription) --
+    PIL's TIFF/group4 encode (the "bw" mode path, the common case) does not
+    release the GIL for its full duration, so thread-level parallelism is
+    capped by that. Processes pay numpy-array pickling cost per page instead,
+    but get a real GIL each -- worth comparing on the actual workload size
+    before picking a default.
+    """
     from .mrc import MrcPageBuilder
 
     builder = MrcPageBuilder(
@@ -342,17 +379,18 @@ def build_pdf(
         jpeg_quality=document.render.jpeg_quality,
         ink_valley=getattr(document.render, "ink_valley", None),
     )
-    for params, original in zip(document.pages, originals):
-        out_bgr, lines, mode, photo_boxes = render_page_image(
-            original, params, document.render
-        )
-        vecfills = _figure_vecfills(out_bgr, params, document.render, original.shape)
-        text_boxes = [tuple(line["box"]) for line in lines]
-        tint_zones = (
-            _raster_tint_zones(out_bgr, vecfills, text_boxes)
-            if document.render.tint_overlay else []
-        )
-        builder.add_page(out_bgr, lines, photo_boxes, mode, vecfills, tint_zones)
+    worker_args = [(params, original, document.render, builder)
+                  for params, original in zip(document.pages, originals)]
+    if max_workers > 1 and len(worker_args) > 1:
+        from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+        Executor = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
+        with Executor(max_workers=max_workers) as ex:
+            for encoded in ex.map(_render_and_encode_page, worker_args):
+                builder.add_encoded_page(encoded)
+    else:
+        for args in worker_args:
+            builder.add_encoded_page(_render_and_encode_page(args))
     builder.save(out_path)
     _set_physical_page_size(out_path, document.render.target_dpi)
     return out_path

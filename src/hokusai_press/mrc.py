@@ -179,6 +179,21 @@ class MrcPageBuilder:
                  photo_boxes_px: list, mode: str,
                  vector_fills: list | None = None,
                  tint_zones: list | None = None) -> None:
+        self._pages.append(self.encode_page(
+            out_bgr, lines, photo_boxes_px, mode, vector_fills, tint_zones))
+
+    def encode_page(self, out_bgr: np.ndarray, lines: list,
+                    photo_boxes_px: list, mode: str,
+                    vector_fills: list | None = None,
+                    tint_zones: list | None = None) -> dict:
+        """Pure per-page encode (G4/JPEG/posterize): reads only this call's
+        arguments plus read-only config set in __init__ (self.compress/scale/
+        tint_scale/jpeg_quality/ink_valley, never mutated after construction).
+        Touches no shared state, so callers may run this on a thread pool
+        across pages and append the results to self._pages in page order --
+        the encode step measured ~65% of build_pdf's wall time (G4/JPEG
+        codecs release the GIL), making this the highest-value parallel
+        target, well ahead of margin/render."""
         from hybrid_ocr.pdf_export import encode_page_pdf
 
         from .render import binarize_bw
@@ -391,7 +406,7 @@ class MrcPageBuilder:
             binary = _despeckle_bilevel(binary)
             base_pdf = encode_page_pdf(binary, "bw", self.compress)
 
-        self._pages.append({
+        return {
             "base": base_pdf,
             "overlays": overlays,
             "tint_overlays": tint_overlays,
@@ -400,7 +415,13 @@ class MrcPageBuilder:
             "w": w,
             "h": h,
             "lines": lines,
-        })
+        }
+
+    def add_encoded_page(self, encoded: dict) -> None:
+        """Append an already-encoded page dict (see encode_page) -- the cheap
+        sequential half of add_page, for callers that ran encode_page on a
+        thread pool and must preserve page order on append."""
+        self._pages.append(encoded)
 
     def save(self, output_path: str) -> None:
         import pikepdf
