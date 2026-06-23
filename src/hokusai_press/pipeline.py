@@ -21,8 +21,10 @@ from . import content as content_mod
 from .geometry import deskew as deskew_mod
 from .geometry import margin as margin_mod
 from .model import (
+    Box,
     Document,
     Flag,
+    Margin,
     PageKind,
     PageParams,
     ReviewStatus,
@@ -33,6 +35,54 @@ MIN_CONTENT_AREA_FRAC = 0.12   # content smaller than this share of the page =
 #                                detection failed -> use the whole page + flag
 BLANK_INK_FRAC = 0.001         # below this ink fraction (with no OCR content) =
 #                                a blank / show-through page -> render white
+
+
+def compute_margin(original: np.ndarray, sk, regions) -> tuple[np.ndarray, Margin]:
+    """Region-based shadow removal + content box for one page.
+
+    Shared by analyze_document (OCR path) and recompute_shadows_and_margins
+    (OCR-free fast path) so a margin/shadow-detection fix never needs OCR
+    re-run to take effect -- regions are already known in both cases.
+
+    find_content_box's ink bounding box is used only for its confidence
+    signal and nombre-band detection; the box geometry itself is region-
+    derived (text/figure/photo only). The ink scan picks up whatever the
+    shadow-removal pass above missed (a stray disconnected speck, a tapering
+    line tip, ...), and any such leftover would otherwise widen the content
+    box to include it -- defeating the margin-fill step at render time,
+    which can only whiten what's OUTSIDE the content box. Regions are
+    always OCR/layout-detected real content, so they carry no such risk.
+    """
+    original = margin_mod.remove_region_shadows(original, regions)
+    mg = margin_mod.find_content_box(original, sk)
+    if regions:
+        xs0 = [r.box.x0 for r in regions]
+        ys0 = [r.box.y0 for r in regions]
+        xs1 = [r.box.x1 for r in regions]
+        ys1 = [r.box.y1 for r in regions]
+        mg.content = Box(min(xs0), min(ys0), max(xs1), max(ys1))
+        # A region is always real OCR/layout-detected content -- trust it
+        # outright, however small (e.g. a single short part-title line on an
+        # otherwise blank divider page is GENUINE, deliberate content, not a
+        # missed detection). The full-page/confidence=0 fallback below is for
+        # when regions is empty and we truly have no signal; applying it here
+        # too would discard this real box in favor of a page-centered crop --
+        # which, for an asymmetrically-placed title (e.g. tategaki runs along
+        # an outer edge, far from page center), crops the real text OUT of
+        # frame entirely while still claiming "found, just not confident".
+        mg.confidence = max(mg.confidence, 1.0)
+    # detection-failed safety: if there's no region AND the page covers too
+    # little of the page (near-blank page, or detection missed an undetected
+    # figure that no region model classified), a sliver crop would drop real
+    # content. Fall back to the whole (shadow-removed) page and flag it, so
+    # nothing is cut and a human can check.
+    ph, pw = original.shape[:2]
+    c = mg.content
+    if not regions and (not c or c.width * c.height < MIN_CONTENT_AREA_FRAC * pw * ph):
+        mg.content = Box(0.0, 0.0, float(pw), float(ph))
+        mg.confidence = 0.0           # -> MARGIN_NOT_FOUND via align_margins
+    mg.page_w, mg.page_h = float(pw), float(ph)
+    return original, mg
 
 
 @dataclass
@@ -47,6 +97,96 @@ class AnalyzeResult:
             self.warnings = []
 
 
+def _prep_page(args):
+    """CPU-only half of Phase B: deskew detection + upright (~0.24s, measured
+    on tmp0613). Split out from _finish_page so the NPU pipeline (see
+    _analyze_pages_npu_pipelined) can run this for the NEXT page on a
+    background thread while the CURRENT page's OCR call -- the only part
+    that touches the NPU -- is in flight, instead of the NPU sitting idle
+    while the main thread deskews."""
+    source, original, ocr_img, dpi = args[0], args[1], args[2], args[3]
+    sk = deskew_mod.find_skew(ocr_img)
+    ocr_up = _apply_deskew(ocr_img, sk.angle_deg)
+    return sk, ocr_up
+
+
+def _finish_page(args, sk, ocr_up) -> tuple[PageParams, np.ndarray, Margin]:
+    """OCR + region-based shadow removal/content box/blank check, given this
+    page's already-computed deskew (see _prep_page). The OCR engine call
+    inside content_mod.analyze is the one step that must never overlap
+    another in-flight call on an NPU-class device (concurrent NPU inference
+    requests crash the Intel NPU driver -- see analyze_document)."""
+    (source, original, ocr_img, dpi, reoriented, model_dir, device, use_ocr,
+     layout_provider, openvino_cache_dir) = args
+
+    regions, cflags = content_mod.analyze(
+        original, ocr_up, source, model_dir=model_dir,
+        device=device, use_ocr=use_ocr, layout_provider=layout_provider,
+        openvino_cache_dir=openvino_cache_dir,
+    )
+
+    original, mg = compute_margin(original, sk, regions)
+
+    blank = False
+    if use_ocr and not regions:
+        import cv2
+        from .geometry.margin import ink_threshold, remove_edge_shadows
+        gg = cv2.cvtColor(remove_edge_shadows(ocr_img), cv2.COLOR_BGR2GRAY)
+        blank = float((gg <= ink_threshold(gg)).mean()) < BLANK_INK_FRAC
+
+    page_flags = [f for f in cflags if not (blank and f == Flag.NO_TEXT)]
+    if source.page_index in reoriented:
+        page_flags.append(Flag.PAGE_REORIENTED)
+    params = PageParams(
+        source=source, dpi=dpi, deskew=sk, margin=mg, regions=regions,
+        page_kind=PageKind.AUTO, flags=page_flags, blank=blank,
+    )
+    return params, original, mg
+
+
+def _analyze_one_page(args) -> tuple[PageParams, np.ndarray, Margin]:
+    """Per-page Phase B body (steps 1-4 + blank check). Pure function of its
+    arguments (no shared mutable state) so it can run on a thread pool --
+    the OCR engine is documented thread-safe (one shared session, lazily
+    built once under a lock; HybridOCR.__call__ only reads + ORT run()), and
+    everything else here works on this page's own local arrays."""
+    sk, ocr_up = _prep_page(args)
+    return _finish_page(args, sk, ocr_up)
+
+
+def _analyze_pages_npu_pipelined(worker_args):
+    """Deskew-prefetch pipeline for an NPU-class device: exactly ONE OCR call
+    is ever in flight (the NPU driver crashes under concurrent inference
+    requests -- see analyze_document), but a background thread runs the NEXT
+    page's deskew (CPU-only) while the CURRENT page's OCR call (NPU-bound,
+    ~13x longer than deskew on tmp0613) is running, so the NPU is never
+    sitting idle waiting on deskew once it's ready for the next page."""
+    import queue
+    import threading
+
+    prep_q: "queue.Queue" = queue.Queue(maxsize=2)
+    SENTINEL = object()
+
+    def producer():
+        for args in worker_args:
+            prep_q.put((args, *_prep_page(args)))
+        prep_q.put(SENTINEL)
+
+    th = threading.Thread(target=producer, daemon=True)
+    th.start()
+    try:
+        results = []
+        while True:
+            item = prep_q.get()
+            if item is SENTINEL:
+                break
+            args, sk, ocr_up = item
+            results.append(_finish_page(args, sk, ocr_up))
+        return results
+    finally:
+        th.join()
+
+
 def analyze_document(
     path: str,
     model_dir: str = "models",
@@ -56,6 +196,7 @@ def analyze_document(
     layout_provider=None,
     openvino_cache_dir: Optional[str] = None,
     pages: "set[int] | None" = None,
+    max_workers: int = 4,
 ) -> AnalyzeResult:
     from .source import load_page
 
@@ -73,6 +214,26 @@ def analyze_document(
     loaded = list(load_page(path, pages))
     prof["raster"] += perf_counter() - t
 
+    # Safety net: an ADF-scanned book has ONE page orientation (a uniform crop
+    # is meaningless across mixed portrait/landscape pages). A genuinely
+    # landscape source page (a wide table/chart, not a rotation-metadata bug --
+    # see source.py's rotation handling) still needs to fit a portrait book, so
+    # force it to the book's dominant orientation and flag it for a human to
+    # confirm the forced rotation direction looks right (rotating a wide table
+    # 90 deg CW vs CCW both "fit", but only one reads correctly).
+    reoriented: set[int] = set()
+    if len(loaded) >= 3:
+        is_landscape = [o.shape[1] > o.shape[0] for (_s, o, _w, _d) in loaded]
+        dominant_landscape = sum(is_landscape) * 2 > len(loaded)
+        fixed = []
+        for (s, o, w, d), landscape in zip(loaded, is_landscape):
+            if landscape != dominant_landscape:
+                o = cv2.rotate(o, cv2.ROTATE_90_CLOCKWISE)
+                w = cv2.rotate(w, cv2.ROTATE_90_CLOCKWISE)
+                reoriented.add(s.page_index)
+            fixed.append((s, o, w, d))
+        loaded = fixed
+
     # 2-pass binarization valley: robust book-wide Otsu (median), so a
     # show-through page uses the book valley at render instead of a fixed floor.
     t = perf_counter()
@@ -82,75 +243,53 @@ def analyze_document(
     )
     prof["margin"] += perf_counter() - t
 
-    # Phase B: per-page analysis. Binding/ADF edge shadows are removed per page
-    # AFTER OCR, using the text region as the boundary (margin.remove_region_
-    # shadows) -- a region-derived rule with no fixed-position constant.
-    for source, original, ocr_img, dpi in loaded:
-        # 1-2. deskew on the work raster (angle is scale-free), then upright it
-        t = perf_counter()
-        sk = deskew_mod.find_skew(ocr_img)
-        ocr_up = _apply_deskew(ocr_img, sk.angle_deg)
-        prof["deskew"] += perf_counter() - t
+    # Phase B: per-page analysis (deskew, OCR/content, region-based shadow
+    # removal, content box, blank check -- see _analyze_one_page). Binding/ADF
+    # edge shadows are removed per page AFTER OCR, using the text region as
+    # the boundary (margin.remove_region_shadows) -- a region-derived rule
+    # with no fixed-position constant.
+    #
+    # Run on a thread pool: each page is otherwise-independent work, and the
+    # OCR engine is the bottleneck (NPU/CPU inference dominates wall time --
+    # see content.py's _get_ocr_engine) but leaves it under-saturated when
+    # called one page at a time (measured ~1.7x throughput with 4 workers on
+    # tmp0613, CPU device). max_workers=1 falls back to plain sequential
+    # iteration (no thread pool at all) for an easy escape hatch / debugging.
+    #
+    # NPU-class devices never get a page-level thread pool, regardless of the
+    # caller's request: concurrent OCR (inference) requests crashed the
+    # Intel NPU driver outright (ZE_RESULT_ERROR_DEVICE_LOST, "device hung,
+    # reset, was removed") under sustained multi-threaded load on tmp0613 --
+    # every page after the crash then fails (each one safely flagged
+    # OCR_FAILED, never silently fabricated, so no data corruption -- but the
+    # whole rest of the run is wasted). A fresh process recovers fine (the
+    # NPU itself wasn't permanently damaged), so this is a real driver
+    # concurrency limitation, not a one-off fluke worth retrying around.
+    # Instead they get the deskew-prefetch pipeline (_analyze_pages_npu_
+    # pipelined): still exactly one OCR call in flight, but the NPU is kept
+    # fed back-to-back instead of idling on the next page's CPU-only deskew
+    # (measured ~0.24s deskew vs ~3.3s OCR on tmp0613 -- recovers most of
+    # that gap "for free", with no risk to the NPU driver).
+    npu_class = {"qnn", "npu", "openvino-auto"}
+    is_npu = device.lower() in npu_class
+    effective_workers = 1 if is_npu else max_workers
+    t = perf_counter()
+    worker_args = [
+        (source, original, ocr_img, dpi, reoriented, model_dir, device,
+         use_ocr, layout_provider, openvino_cache_dir)
+        for source, original, ocr_img, dpi in loaded
+    ]
+    if is_npu and len(worker_args) > 1:
+        results = _analyze_pages_npu_pipelined(worker_args)
+    elif effective_workers > 1 and len(worker_args) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=effective_workers) as ex:
+            results = list(ex.map(_analyze_one_page, worker_args))
+    else:
+        results = [_analyze_one_page(a) for a in worker_args]
+    prof["phase_b"] += perf_counter() - t
 
-        # 3. content separation (text/figure/photo) + OCR text
-        t = perf_counter()
-        regions, cflags = content_mod.analyze(
-            original, ocr_up, source, model_dir=model_dir,
-            device=device, use_ocr=use_ocr, layout_provider=layout_provider,
-            openvino_cache_dir=openvino_cache_dir,
-        )
-        prof["ocr"] += perf_counter() - t
-
-        # 3b. region-based edge-shadow removal: now that OCR text/figure regions
-        # are known, whiten thin near-full-height dark lines in the margins
-        # OUTSIDE the text box (figures subtracted, so they're never touched).
-        # Done before find_content_box so the shadow is kept out of the box, and
-        # the cleaned original is what gets stored/rendered.
-        t = perf_counter()
-        original = margin_mod.remove_region_shadows(original, regions)
-        prof["margin"] += perf_counter() - t
-
-        # 4. margin / nombre on the deskewed original; expand the content box to
-        # include detected regions so a figure/photo is never cropped out (the
-        # ink box alone can be smaller than a photo). Shadows are not regions and
-        # were already dropped from the ink box, so they stay excluded.
-        t = perf_counter()
-        mg = margin_mod.find_content_box(original, sk)
-        from .model import Box
-        if regions and mg.content:
-            c = mg.content
-            xs0 = [c.x0] + [r.box.x0 for r in regions]
-            ys0 = [c.y0] + [r.box.y0 for r in regions]
-            xs1 = [c.x1] + [r.box.x1 for r in regions]
-            ys1 = [c.y1] + [r.box.y1 for r in regions]
-            mg.content = Box(min(xs0), min(ys0), max(xs1), max(ys1))
-        # detection-failed safety: if the content covers too little of the page
-        # (near-blank page, or detection missed an undetected figure), a sliver
-        # crop would drop real content. Fall back to the whole (shadow-removed)
-        # page and flag it, so nothing is cut and a human can check.
-        ph, pw = original.shape[:2]
-        c = mg.content
-        if not c or c.width * c.height < MIN_CONTENT_AREA_FRAC * pw * ph:
-            mg.content = Box(0.0, 0.0, float(pw), float(ph))
-            mg.confidence = 0.0           # -> MARGIN_NOT_FOUND via align_margins
-
-        # OCR-confident blank: OCR ran, found NO content region (text/figure/
-        # photo), and the (shadow-removed, clamp-thresholded) page has no real
-        # ink -> it is genuinely empty (a blank leaf, or pure show-through), so
-        # render it white. Gated by use_ocr so it can never erase real text, and
-        # cross-checked against ink so an OCR-missed text page is NOT blanked.
-        blank = False
-        if use_ocr and not regions:
-            import cv2
-            from .geometry.margin import ink_threshold, remove_edge_shadows
-            gg = cv2.cvtColor(remove_edge_shadows(ocr_img), cv2.COLOR_BGR2GRAY)
-            blank = float((gg <= ink_threshold(gg)).mean()) < BLANK_INK_FRAC
-        prof["margin"] += perf_counter() - t
-
-        params = PageParams(
-            source=source, dpi=dpi, deskew=sk, margin=mg, regions=regions,
-            page_kind=PageKind.AUTO, flags=list(cflags), blank=blank,
-        )
+    for params, original, mg in results:
         # deskew review is decided document-level below (book-relative angle
         # outliers), not per-page -- the per-page confidence isn't comparable
         # across books.
@@ -175,9 +314,13 @@ def analyze_document(
     widths = [o.shape[1] for o in originals]
     warnings = nombre_mod.resolve(doc.pages, heights, widths)
 
-    # 6. cross-page margin consistency + nombre-anchored normalization
+    # 6. cross-page margin consistency + nombre-anchored normalization.
+    # A confirmed-blank page (rendered as pure white regardless of margin/
+    # content -- see render_page_image's blank short-circuit) has nothing to
+    # review: confidence=0.0 there just means "no ink to anchor on", not a
+    # detection failure, so MARGIN_NOT_FOUND would only add noise to the queue.
     for params, flag in zip(doc.pages, margin_mod.align_margins(margins)):
-        if flag is not None:
+        if flag is not None and not params.blank:
             params.flags.append(flag)
     margin_mod.normalize_margins(doc.pages, doc.render.output_margin_mm)
     prof["nombre+normalize"] += perf_counter() - t
@@ -347,6 +490,45 @@ def recompute_margins(store: Store, doc_id: str,
     rows = store.list_pages(doc_id)
     pages = [r.params for r in rows]
     margin_mod.normalize_margins(pages, output_margin_mm)
+    for p in pages:
+        store.upsert_page(doc_id, p.source.page_index, p)
+    return len(pages)
+
+
+def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
+                                  output_margin_mm: float = 5.0) -> int:
+    """Re-run shadow removal + content-box detection from STORED regions, with
+    no OCR / layout re-run. Returns the number of pages.
+
+    For iterating on margin.py's shadow/content-box logic (the usual reason to
+    touch this code): regions (OCR text/figure/photo boxes) don't depend on
+    that logic, so re-deriving the margin from already-stored regions + a
+    freshly loaded original is enough -- OCR is the expensive 90%+ of a full
+    analyze_document() run, and this path skips it entirely. Follow with
+    rebuild() to render the result; that already recomputes ink_valley/
+    shadow_bands from the (now re-cleaned) originals.
+    """
+    from .source import load_single
+
+    rows = store.list_pages(doc_id)
+    pages = [r.params for r in rows]
+    originals = []
+    for p in pages:
+        original, _ = load_single(source_path, p.source.page_index)
+        original, mg = compute_margin(original, p.deskew, p.regions)
+        p.margin = mg
+        originals.append(original)
+
+    from . import nombre as nombre_mod
+
+    heights = [o.shape[0] for o in originals]
+    widths = [o.shape[1] for o in originals]
+    nombre_mod.resolve(pages, heights, widths)
+    for p, flag in zip(pages, margin_mod.align_margins([p.margin for p in pages])):
+        if flag is not None and not p.blank and flag not in p.flags:
+            p.flags.append(flag)
+    margin_mod.normalize_margins(pages, output_margin_mm)
+
     for p in pages:
         store.upsert_page(doc_id, p.source.page_index, p)
     return len(pages)
