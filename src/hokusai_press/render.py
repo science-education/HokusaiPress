@@ -45,9 +45,11 @@ def compose_transform(
     # crop box in deskewed frame. Prefer the normalized crop (uniform size,
     # nombre-anchored) when margin normalization has run; otherwise fall back
     # to the raw content box padded by the output margin.
+    target_w = target_h = None
     if params.margin and params.margin.crop:
         crop = params.margin.crop
         cx0, cy0, crop_w, crop_h = crop.x0, crop.y0, crop.width, crop.height
+        target_w, target_h = params.margin.target_w, params.margin.target_h
     elif params.margin and params.margin.content:
         c = params.margin.content
         margin_px = settings.output_margin_mm / 25.4 * dpi
@@ -56,13 +58,33 @@ def compose_transform(
     else:
         cx0, cy0, crop_w, crop_h = 0, 0, w, h
 
-    scale = settings.target_dpi / dpi if dpi else 1.0
-    # scale + translate so (cx0,cy0) -> (0,0) and then upscale to target dpi
-    A = np.array([[scale, 0, -scale * cx0],
-                  [0, scale, -scale * cy0],
+    base_scale = settings.target_dpi / dpi if dpi else 1.0
+    # Page-format uniformity is non-negotiable: every page in the book must
+    # render at the SAME output size (target_w/target_h, set by
+    # normalize_margins). crop_w/crop_h CAN be larger than that for an
+    # outlier page (its own real content didn't fit the uniform size, so
+    # crop_size() floored the SOURCE region at its own content rather than
+    # clip it -- see margin.py). Shrink (never enlarge) the scale so that
+    # larger source region still maps into the fixed target_w x target_h
+    # canvas, and center the result there (extra space lands evenly on
+    # both sides, not all on one edge).
+    extra_x = extra_y = 0.0
+    if target_w and target_h:
+        shrink = min(1.0, target_w / crop_w, target_h / crop_h)
+        scale = base_scale * shrink
+        out_w, out_h = max(1, round(target_w * base_scale)), max(1, round(target_h * base_scale))
+        extra_x = (out_w - crop_w * scale) / 2.0
+        extra_y = (out_h - crop_h * scale) / 2.0
+    else:
+        scale = base_scale
+        out_w, out_h = max(1, round(crop_w * scale)), max(1, round(crop_h * scale))
+
+    # scale + translate so (cx0,cy0) -> (extra_x,extra_y) and upscale to target dpi
+    A = np.array([[scale, 0, -scale * cx0 + extra_x],
+                  [0, scale, -scale * cy0 + extra_y],
                   [0, 0, 1]], dtype=np.float64)
     M = (A @ R_h)[:2, :]
-    out_size = (max(1, round(crop_w * scale)), max(1, round(crop_h * scale)))
+    out_size = (out_w, out_h)
     return M.astype(np.float32), out_size, scale
 
 
@@ -142,10 +164,15 @@ def render_page_image(
 
     lines = []
     photo_boxes: list[tuple] = []
+    ow, oh = out_size
     for r in params.regions:
         if r.kind == RegionKind.PHOTO:
             b = _map_box(r.box, M)
-            photo_boxes.append((b.x0, b.y0, b.x1, b.y1, r.tone))
+            x0, y0 = max(0.0, b.x0), max(0.0, b.y0)
+            x1, y1 = min(float(ow), b.x1), min(float(oh), b.y1)
+            if x1 - x0 < 1 or y1 - y0 < 1:
+                continue   # clipped to nothing (box mapped outside the page)
+            photo_boxes.append((x0, y0, x1, y1, r.tone))
         if r.ocr_text:
             b = _map_box(r.box, M)
             lines.append({

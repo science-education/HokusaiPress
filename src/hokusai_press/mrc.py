@@ -200,16 +200,16 @@ class MrcPageBuilder:
                 tone = box[4] if len(box) > 4 else None  # None|"gray"|"color"
                 x0i, y0i = max(0, int(x0)), max(0, int(y0))
                 x1i, y1i = min(w, int(x1)), min(h, int(y1))
-                if x1i - x0i < 4 or y1i - y0i < 4:
+                # guard on the SCALED size: a region that's wide enough at full
+                # res can still downsample to a 1px sliver, which img2pdf/pikepdf
+                # rejects as a degenerate page (< 3 PDF units at assumed DPI).
+                ds_w = max(1, int((x1i - x0i) * self.scale))
+                ds_h = max(1, int((y1i - y0i) * self.scale))
+                if x1i - x0i < 4 or y1i - y0i < 4 or ds_w < 4 or ds_h < 4:
                     continue
                 binary[y0i:y1i, x0i:x1i] = 255   # erase photo from bilevel
                 crop = out_bgr[y0i:y1i, x0i:x1i]
-                ds = cv2.resize(
-                    crop,
-                    (max(1, int((x1i - x0i) * self.scale)),
-                     max(1, int((y1i - y0i) * self.scale))),
-                    interpolation=cv2.INTER_AREA,
-                )
+                ds = cv2.resize(crop, (ds_w, ds_h), interpolation=cv2.INTER_AREA)
                 # explicit per-region override wins; else decide from chroma
                 cmode = tone or ("gray" if _is_grayish(crop) else "color")
                 overlays.append({
