@@ -273,17 +273,26 @@ def apply_shadow_bands(img: np.ndarray, bands: "list[tuple]") -> np.ndarray:
 # --- Region-based (per-page) shadow removal -----------------------------------
 # Replaces the position-magic "outer 7%" band: the boundary of where a shadow
 # can be is derived from the page's own OCR text region, not a fixed fraction.
-# A binding/ADF shadow is a thin, near-full-height dark vertical line in the
-# LEFT/RIGHT margin -- i.e. OUTSIDE the text bounding box. We scan those margins
-# for such a line (1px-seed opening requiring a >=SHADOW_RUN_FRAC-tall CONSECUTIVE
-# dark run, which text/tategaki columns with inter-character gaps never satisfy)
-# and whiten its column + halo. Detected figure/photo regions are SUBTRACTED from
-# the result so a figure that bleeds to the edge is never whitened, while a
-# shadow in the margin beside it still is. Validated on tmp0613 (all 5 books):
-# catches every reported shadow page, zero pixels whitened inside any text or
-# figure/photo region. No cross-page pass, no fixed-position constant.
-SHADOW_RUN_FRAC = 0.25       # a shadow line spans >= this fraction of page height
-SHADOW_COL_HALO_PX = 3       # whiten this many px around the detected line
+# A binding/ADF shadow is a thin, elongated dark STROKE in the LEFT/RIGHT margin
+# -- i.e. OUTSIDE the text bounding box. Classified by SHAPE (tall and thin: a
+# line segment), not by an absolute run-length: a long-run-length gate misses a
+# shadow that's short, tapering, or fragmented into dashes by scan dust/a worn
+# ADF roller (each dash individually still a thin elongated stroke, just not
+# long enough on its own, and too far from its neighbors to bridge a gap into
+# one run). Sparse marginal text -- isolated, roughly dot-shaped glyphs -- has a
+# low height/width ratio and is kept. Detected figure/photo regions are
+# SUBTRACTED from the result so a figure that bleeds to the edge is never
+# whitened, while a shadow in the margin beside it still is. Validated on
+# tmp0613 (all 5 books): catches every reported shadow page, zero pixels
+# whitened inside any text or figure/photo region. No cross-page pass, no
+# fixed-position constant.
+SHADOW_MIN_HEIGHT_PX = 15    # below this height, a mark is noise/a text dot
+SHADOW_ASPECT_MIN = 6        # height / width >= this to count as a "line"
+# A binding/ADF shadow line is rarely perfectly straight -- it wobbles a few px
+# side to side along its length (scan skew, a slightly bent original). A small
+# halo leaves the wobble's far excursions as their own short, separate "line"-
+# shaped slivers just outside the cleaned band (same physical line, missed).
+SHADOW_COL_HALO_PX = 8       # whiten this many px around the detected line
 
 
 def _text_bbox(regions):
@@ -304,18 +313,41 @@ def region_shadow_mask(gray: np.ndarray, regions) -> np.ndarray:
     h, w = gray.shape
     tb = _text_bbox(regions)
     out = np.zeros((h, w), dtype=bool)
-    if tb is None:
-        return out
+    # No TEXT region at all (a blank/near-blank leaf, or a page OCR found
+    # nothing on) means there's no text box to scan OUTSIDE of -- but it also
+    # means there's no real text to accidentally erase, so the whole page is
+    # fair game. Returning empty here (the old behavior) left exactly these
+    # pages' binding/ADF shadow lines undetected, which then leaked into
+    # find_content_box's ink bbox (nothing else constrains it) and inflated
+    # that page's crop -- the "page sizes aren't uniform" symptom.
+    bands = ([(0, w)] if tb is None else
+             ((0, max(0, int(tb.x0))), (min(w, int(tb.x1)), w)))
     dark = (gray <= ink_threshold(gray)).astype(np.uint8)
-    run = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(20, int(SHADOW_RUN_FRAC * h))))
     halo = SHADOW_COL_HALO_PX
-    for a, b in ((0, max(0, int(tb.x0))), (min(w, int(tb.x1)), w)):
+    # Bridge tiny (a few px) vertical gaps before labeling components: a scan-
+    # dust speck or anti-aliasing dip can break one physical stroke into 2-3
+    # fragments a couple pixels apart. DILATE only (not a full close): closing's
+    # erode half can eat into the genuine top/bottom tip of a long run (an
+    # asymmetric-kernel artifact). Dilate is monotonic -- it only ever adds
+    # coverage, never erodes a real pixel. The gap bridged here (10px) is far
+    # smaller than the spacing between genuinely separate marginal marks (e.g.
+    # sparse text dots, tens of px apart), so it never merges unrelated content.
+    gap_kernel = np.ones((10, 1), np.uint8)
+    for a, b in bands:
         if b - a < 1:
             continue
-        seed = cv2.morphologyEx(dark[:, a:b], cv2.MORPH_OPEN, run) > 0
-        for c in np.flatnonzero(seed.any(axis=0)):
-            x = a + c
-            out[:, max(a, x - halo):min(b, x + halo + 1)] = True
+        band = cv2.dilate(dark[:, a:b], gap_kernel)
+        n, lbl, stats, _ = cv2.connectedComponentsWithStats(band, connectivity=8)
+        line_labels = [
+            i for i in range(1, n)
+            if stats[i, 3] >= SHADOW_MIN_HEIGHT_PX
+            and stats[i, 3] >= SHADOW_ASPECT_MIN * stats[i, 2]
+        ]
+        if not line_labels:
+            continue
+        comp = np.isin(lbl, line_labels)
+        comp = cv2.dilate(comp.astype(np.uint8), np.ones((1, 2 * halo + 1), np.uint8)) > 0
+        out[:, a:b] |= comp
     # protect figures/photos: never whiten inside a non-text region
     for r in regions or []:
         if r.kind == RegionKind.TEXT or r.box is None:
@@ -425,7 +457,14 @@ def _deskewed_binary(img_bgr: np.ndarray, deskew: Deskew) -> np.ndarray:
         m = cv2.getRotationMatrix2D((w / 2, h / 2), deskew.angle_deg, 1.0)
         gray = cv2.warpAffine(gray, m, (w, h), flags=cv2.INTER_LINEAR,
                               borderValue=255)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # A raw per-page Otsu degenerates on a near-blank page: with almost no real
+    # ink, Otsu finds its split point in the high-200s (splitting noise from
+    # background, not ink from background), so faint anti-aliasing/scan noise
+    # gets classified as content. ink_threshold's standalone fallback guards
+    # exactly against this (falls back to a fixed safe floor when Otsu sits
+    # high AND genuinely dark pixels are vanishingly rare).
+    th = ink_threshold(gray)
+    binary = np.where(gray <= th, 255, 0).astype(np.uint8)
     return binary
 
 
@@ -514,44 +553,88 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     def extent(p, px):  # content size in inches (if dpi) else pixels
         return px / p.dpi if use_dpi else px
 
-    def confident(p):   # the OCR resolver only assigns a number it trusts
-        return p.page_number is not None and p.margin.nombre_box is not None
+    def confident(p):
+        # nombre_box alone is enough to anchor on: nombre.resolve sets it
+        # either when the digit VALUE is trusted (page_number is also set) or,
+        # for a page whose own numbering run is too short to be trusted by
+        # value (e.g. front matter), when the box still sits in the position
+        # model's expected slot -- geometry-only, page_number stays None. Both
+        # cases are a real nombre worth anchoring margins on.
+        return p.margin.nombre_box is not None
 
-    # ONE size for the whole document (uniform judgment size). Two failure
-    # modes to avoid:
+    # ONE size for the whole document -- non-negotiable (page-format
+    # uniformity is the point; a real fold-out is the only legitimate
+    # exception, and even that should be a flagged human decision, not a
+    # silently-bigger page). Two failure modes to avoid when judging it:
     #  (a) detection FAILURE (confidence 0.0) falls back to the full raw page
     #      as "content", which is not a real body-text extent -- exclude those.
     #  (b) the raw MAX is pulled up by a single legitimate-but-large outlier
-    #      page (a fold-out, a detection that over-grew), bloating the crop for
-    #      the WHOLE document. Measured on tmp0613: e.g. img20260430_0002 width
-    #      max=2295px vs P97.5~1700px (one outlier inflating all 160 pages).
-    # So the uniform size is the P97.5 of reliable content extents -- robust to
-    # a few extreme pages without the instability of mean+2sigma (sigma is
-    # itself inflated by the very outliers we're discounting; on a tight book
-    # mean+2sigma can even exceed the max). The <=2.5% of pages whose own
-    # content exceeds the uniform size are NOT clipped: crop_size() floors each
-    # page at its own content+margin (see below), so an outlier gets a slightly
-    # larger page rather than losing content or enlarging every other page.
+    #      page (a fold-out, a dense full-bleed chapter-divider graphic, a
+    #      detection that over-grew), which would inflate the OUTPUT SIZE for
+    #      the whole document if naively used as-is. Measured on tmp0613:
+    #      img20260430_0002 has a circular full-bleed chapter-divider graphic
+    #      whose content height (2469px) is genuinely ~175px taller than every
+    #      other page's P97.5 (2294px).
+    # So the uniform TARGET size is the P97.5 of reliable content extents,
+    # robust to a few extreme pages without the instability of mean+2sigma
+    # (sigma is itself inflated by the very outliers being discounted; on a
+    # tight book mean+2sigma can even exceed the max). The <=2.5% of pages
+    # whose own content exceeds this are NOT clipped and NOT given a bigger
+    # page: crop_size() below still floors their SOURCE region at their own
+    # content (so nothing is lost), but compose_transform (render.py) then
+    # SHRINKS that larger source region to fit the same uniform target_w/
+    # target_h as everyone else -- see Margin.target_w/target_h.
     reliable = [p for p in have if p.margin.confidence >= 0.2] or have
     UNIFORM_PCT = 97.5
     uni_w = float(np.percentile([extent(p, p.margin.content.width) for p in reliable], UNIFORM_PCT))
     uni_h = float(np.percentile([extent(p, p.margin.content.height) for p in reliable], UNIFORM_PCT))
 
+    def target_size(p):  # the FIXED uniform output size, in this page's own pixel space
+        dpi = p.dpi if use_dpi else 1.0
+        pad = 2 * (output_margin_mm / 25.4)
+        return (uni_w + pad) * (dpi if use_dpi else 1), (uni_h + pad) * (dpi if use_dpi else 1)
+
     def crop_size(p):
         dpi = p.dpi if use_dpi else 1.0
         pad = 2 * (output_margin_mm / 25.4)
-        # uniform size, but never smaller than THIS page's own content+margin
-        # (so an outlier page is never clipped -- it just gets a larger crop)
-        w_in = max(uni_w, extent(p, p.margin.content.width)) + pad
-        h_in = max(uni_h, extent(p, p.margin.content.height)) + pad
+        # SOURCE region size: uniform, but never smaller than THIS page's own
+        # content+margin (so the source region fed to compose_transform never
+        # clips real content -- it gets shrunk to fit instead, not cropped).
+        # EXCEPT a detection-failed page (confidence < 0.2, same cutoff as
+        # `reliable` above): its "content" is the synthetic full-page
+        # fallback box, not a real extent, so flooring against it would
+        # inflate that one page's source region to the whole page for no
+        # reason. Trust the uniform size instead; there's no real detected
+        # content to risk clipping.
+        if p.margin.confidence >= 0.2:
+            w_in = max(uni_w, extent(p, p.margin.content.width)) + pad
+            h_in = max(uni_h, extent(p, p.margin.content.height)) + pad
+        else:
+            w_in = uni_w + pad
+            h_in = uni_h + pad
         cw = w_in * (dpi if use_dpi else 1)
         ch = h_in * (dpi if use_dpi else 1)
         return cw, ch
 
-    def baseline(p):  # this page's own content, centered in the uniform crop
+    def baseline(p):
+        # This page's own content, placed in the uniform crop at the SAME
+        # proportional position it had on the original page -- not dead-
+        # centered. A small, deliberately off-center block (e.g. a single
+        # right-aligned tategaki part-title sitting in the page's upper
+        # third) should land in roughly the same relative spot on the new
+        # uniform-size page; dead-centering it changes the layout's intent
+        # and, for a detection-failed page (confidence 0, content = the
+        # whole raw page), would be wrong anyway -- but there fx=fy=0.5
+        # automatically, since content already spans the full page, so this
+        # one formula covers both cases without a separate branch.
         c = p.margin.content
         cw, ch = crop_size(p)
-        return c.x0 + c.width / 2 - cw / 2, c.y0 + c.height / 2 - ch / 2
+        cx, cy = c.x0 + c.width / 2, c.y0 + c.height / 2
+        if p.margin.page_w and p.margin.page_h:
+            fx, fy = cx / p.margin.page_w, cy / p.margin.page_h
+        else:
+            fx, fy = 0.5, 0.5   # no stored page size (older data) -- center
+        return cx - fx * cw, cy - fy * ch
 
     # Common nombre CORRECTION, relative to the centered baseline (not to
     # content's edge, so the correction's mean is ~0 and doesn't drag pages
@@ -574,7 +657,12 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
         if offs_x:
             common_noff_x[parity] = float(np.median(offs_x))
 
-    offs_y = [extent(p, p.margin.nombre_box.y0 - baseline(p)[1])
+    # Anchor vertically on the nombre's BOTTOM edge (y1), not its top (y0).
+    # Digits sit on a shared baseline, not a shared cap-height: a single-digit
+    # "9" and a triple-digit "126" naturally have different glyph/bbox HEIGHTS
+    # but the same baseline, so top-aligning makes the printed numeral height
+    # visibly uneven page to page while bottom-aligning keeps it level.
+    offs_y = [extent(p, p.margin.nombre_box.y1 - baseline(p)[1])
               for p in have if confident(p)]
     common_noff = float(np.median(offs_y)) if offs_y else None
 
@@ -591,14 +679,44 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
         else:
             x0 = bx0                                  # fallback: centered
         if confident(p) and common_noff is not None:
-            y0 = p.margin.nombre_box.y0 - common_noff * (dpi if use_dpi else 1)
+            y0 = p.margin.nombre_box.y1 - common_noff * (dpi if use_dpi else 1)
         else:
             y0 = by0                                   # fallback: centered
-        # clamp so EVERY side keeps >= the output margin (never touches content);
-        # always feasible since the uniform crop >= content + 2*margin
-        x0 = max(min(x0, c.x0 - margin_px), c.x1 + margin_px - crop_w)
-        y0 = max(min(y0, c.y0 - margin_px), c.y1 + margin_px - crop_h)
+        # clamp so every side keeps >= some floor (never touches content);
+        # always feasible since the uniform crop >= content + 2*margin. Skipped
+        # entirely for a detection-failed page: its "content" is the synthetic
+        # full-page box (see crop_size), which is wider/taller than the now-
+        # uniform crop, so this clamp would force the crop to one corner
+        # instead of leaving it centered (the sane baseline -- there's no real
+        # content box to protect with a guaranteed margin here anyway).
+        #
+        # The floor itself depends on whether this axis is nombre-anchored: a
+        # CONFIDENT page intentionally shares one absolute nombre position with
+        # every other page (that's the whole point of the anchor); clamping it
+        # to the full output_margin_mm would override that shared position
+        # whenever this page's own content happens to sit unusually close to
+        # an edge (e.g. a chapter heading right at the top), reintroducing the
+        # per-page nombre-height jitter the anchor exists to remove. Floor at
+        # 0 instead for that axis -- only prevent literally clipping content,
+        # don't fight the shared anchor for cosmetic margin headroom. A page
+        # without a confident anchor (the centered baseline) keeps the full
+        # margin floor, since there's nothing else worth protecting it for.
+        if p.margin.confidence >= 0.2:
+            x_floor = 0.0 if (confident(p) and noff_x is not None) else margin_px
+            y_floor = 0.0 if (confident(p) and common_noff is not None) else margin_px
+            x0 = max(min(x0, c.x0 - x_floor), c.x1 + x_floor - crop_w)
+            y0 = max(min(y0, c.y0 - y_floor), c.y1 + y_floor - crop_h)
         p.margin.crop = Box(x0, y0, x0 + crop_w, y0 + crop_h)
+        target_w, target_h = target_size(p)
+        p.margin.target_w, p.margin.target_h = target_w, target_h
+        # crop_w/h > target_w/h means this page's own content didn't fit the
+        # uniform size and crop_size() floored the SOURCE region at its own
+        # content instead of clipping it -- compose_transform will shrink it
+        # back down to target_w/h, so flag it for a human to confirm that's
+        # the right call (vs. e.g. a genuine fold-out that should stay big).
+        if (crop_w > target_w * 1.001 or crop_h > target_h * 1.001) \
+                and Flag.CONTENT_SCALED_DOWN not in p.flags:
+            p.flags.append(Flag.CONTENT_SCALED_DOWN)
 
 
 MARGIN_OUTLIER_RATIO = 1.30   # content >30% larger than the median = an outlier
