@@ -1,7 +1,8 @@
 # HokusaiPress 引き継ぎ (Handoff)
 
-最終更新 2026-06-15 / HEAD `f9c20e2` / 86 tests green。
+最終更新 2026-06-23 / HEAD `ea892ef` (branch `param-profile`) / 170 tests green。
 リポジトリ: `C:\Users\user\dev\HokusaiPress`（github.com/science-education/HokusaiPress, GPLv3）。
+**PR**: [#1](https://github.com/science-education/HokusaiPress/pull/1)（`param-profile` → `main`, CI green）。
 
 スキャン PDF を「美しく整い・軽く・全文検索できる」電子書籍 PDF にするバッチアプリ。
 バッチ処理 → 低確信ページのみ人間/AI レビュー → 判断蓄積 → 自動化、が運用思想。
@@ -476,3 +477,158 @@ Codexのシェル障害(`-1073741502`)で未完だった検証を、別セッシ
 - **JBIG2は導入済みだが既定では未使用**: `MrcPageBuilder(compress=...)` のデフォルトは `g4`。JBIG2を使うには `compress="jbig2"` を渡す必要がある。`jbig2`バイナリはWSLラッパー(`%LOCALAPPDATA%\jbig2-wrapper\jbig2.cmd`)経由で、**新しいシェルのPATHにwrapperディレクトリが通っていることが前提**。CI/別マシンでは未導入なので、JBIG2をデフォルト化する場合はフォールバック設計が要る。
 - **k4 posterizeのパラメータ**は p29 一枚で調整した値（`mae<=10`, `p95<=28`, `bad_frac<=0.03`, K=4）。他ページ・他冊子での汎化は未検証。写真誤判定が起きると破綻するので、複数ページでの回帰確認が望ましい。
 - これらk4関連定数・関数は `src/hokusai_press/mrc.py`(`_try_posterized_tint_overlay_pdf`, `_smooth_tint_for_posterize`, `_encode_gray_flate_page_pdf` 等)にある。
+
+## 11. 2026-06-23 追記: margin/影検出の再設計、判型統一の強制、NPU並列化（PR #1）
+
+ユーザーが実データ（`C:\tmp\tmp0613\img20260427_0001.pdf` 中心、一部 `img20260423_0001.pdf` /
+`img20260430_0002.pdf` で横展開確認）を1ページずつ目視レビューし、「影が消えていない」「コンテンツ枠が
+おかしい」「判型が統一されていない」等を1つずつ実データで検証→修正、を繰り返したセッション。
+**6+1コミット、`param-profile` ブランチに積んで [PR #1](https://github.com/science-education/HokusaiPress/pull/1) 作成、CI green。**
+
+### 影検出: run-length方式 → 形状ベース方式に再設計
+
+`region_shadow_mask`(margin.py) の旧方式（テキスト枠外で「ページ高の25%以上」連続して暗い列を起点に
+±halo狭め白化）は、**短い影・先細りする影・ワーンアウトしたADFローラーの斑点状（断続）の影**を取り逃す。
+新方式は形状で判定: テキスト枠外の連結成分が `height >= SHADOW_MIN_HEIGHT_PX(15)` かつ
+`height/width >= SHADOW_ASPECT_MIN(6)`（細長い）なら影として丸ごと白化。判定前に縦方向だけ小さく
+dilateして数px断片を結合（疎なマージン文字のdot同士までは結合しない距離）。halo は 3→8px に拡大
+（影が両端でわずかに蛇行するため）。**TEXT領域が1つも無いページ（白紙寄り）は、旧コードは何もしない
+仕様だったが、新コードはページ全幅をスキャン対象にする**（テキストが無いページは消す対象を誤検知する
+リスクも無い）。
+
+### `find_content_box` の二値化を Otsu直結から ink_threshold() に変更
+
+`_deskewed_binary`(margin.py) が `cv2.threshold(..., OTSU)` を直接使っていたため、**ほぼ白紙のページで
+Otsuが暴走**（ノイズと背景を分離してしまい250前後の異常閾値になる）し、薄いアンチエイリアスノイズを
+コンテンツとして誤検出 → そのページのcontent boxが異常に大きくなっていた。`ink_threshold()`（既存の
+2信号degenerate判定）に統一して解消。
+
+### コンテンツ枠は「regionsベースのみ」を信頼。ink-bboxは regions が空の時だけのフォールバック
+
+`pipeline.py: compute_margin()`。以前は `find_content_box` のインク連結成分スキャンの結果と
+regions（OCR/レイアウト検出）の和集合をcontent boxにしていたが、**影検出が取り逃した断片や薄いゴミが
+ink-bbox側に残っていると、それがcontent boxを膨らませてレンダリング時のmargin-fillを無効化する**
+（枠の外側しか白化できないので、枠自体に影が取り込まれていると消せない）。regionsが1つでもあれば
+それだけでcontent boxを決め、ink-bboxは無視する。**regionsが空（＝何も検出されていない）場合のみ**
+`MIN_CONTENT_AREA_FRAC` 失敗時の全面フォールバック（confidence=0）を使う。
+
+注意点（要再発防止）: 「regionが1つでもあれば信頼する」を入れたら、`原理編`/`実践編`等の**短い部タイトル
+1行だけのページが、それまでは「検出失敗」とみなされ全面フォールバック→正規化で中央寄せされていたのに、
+今回の修正でそのregion box単体がcontent boxになり、しかも以前の「白紙ページ用センタリング」のままだと
+**右寄り・上寄りの本物のタイトル位置がクロップ範囲外に出て完全に消える**事故があった
+（後述の「proportional position」修正で解消）。
+
+### 判型統一（page-format uniformity）を「床上げ」から「縮小フィット」に変更
+
+旧 `crop_size()`（normalize_margins, margin.py）は「統一サイズ」と「自ページの内容サイズ」の大きい方を
+採用 → 章扉の円形フルブリード図版1ページのために**そのページだけ物理サイズが大きくなる**事故があった
+（ユーザー指摘: 「判型統一は基本。観音開きが唯一の例外」）。
+
+修正方針: **クロップ領域（元画像から取得するSOURCE範囲）と出力サイズ（最終ページの物理サイズ）を分離**。
+- `crop_size()`: 引き続き自ページの内容に床上げ（クリップ防止、変更なし）。
+- 新規 `target_size()`: 書籍全体で固定の統一出力サイズ（P97.5パーセンタイル基準、変更なし）。
+- `Margin.target_w/target_h` に保存（`model.py`）。
+- `render.py: compose_transform()` で、crop領域が target を超える場合は **アスペクト比を保ったまま
+  縮小**し、target_w×target_h の固定キャンバスの中央に配置（クリップなし、歪みなし）。
+- 縮小が起きたページは `Flag.CONTENT_SCALED_DOWN` でレビューフラグ。
+- 実データ確認: `img20260430_0002.pdf` の章扉ページ（円形図版、idx=6/58）で実証。全ページ完全に同一
+  出力サイズ（3218×4827px）になり、円形図版も歪まず縮小収納された。
+
+副産物のバグ修正: `render.py` の `photo_boxes` が出力canvas外/縮小後ほぼ0pxになる場合に
+img2pdf/pikepdfが `Page size must be between 3 and 14400 PDF units` で落ちる問題を、クリップ＋
+スキップで解消（`mrc.py` 側にも同様のガード追加）。
+
+### コンテンツの「元のページ上の相対位置」を保持する配置（dead-centerをやめる）
+
+`baseline()`(normalize_margins, margin.py)。ノンブルで位置確定できないページを「統一クロップの中央に
+強制配置」していたのを、**元ページでの相対位置（横%・縦%）を保ったまま新クロップに配置**するよう変更。
+理由は上述の「部タイトルページが中央寄せで消える」事故。`Margin.page_w/page_h`（元の deskew後ページ
+サイズ, `model.py`）を追加してこのfractionを計算。全面フォールバック（content=全面）の場合は元々
+fx=fy=0.5になるので、分岐なしで両方のケースをカバーする。実測: idx=12「原理編」が fx=94.5%(右端寄り)・
+fy=27.3%(上から3割)で検出され、ユーザーの目視推定とほぼ一致。
+
+### ノンブル: 上端基準→下端基準アンカー、かつ「数値が信用できなくても位置だけ使う」復帰パス追加
+
+- `normalize_margins` のノンブル縦アンカーを `nombre_box.y0`(上端)から `nombre_box.y1`(下端)に変更。
+  単桁「9」と3桁「126」は字形bboxの高さが違うが、同じベースラインに乗るため下端基準が正しい。
+- `nombre.py: _assign_with_position_model()` に **pass 3**を追加: OCR数値が信用できない
+  （前付けの短い連番で `_primary_clusters` の閾値に届かない、または `parse_numeral("00")==0` で
+  `v>0` フィルタに弾かれ候補にすらならない）ページでも、**ノンブル帯の領域が位置モデル上の期待座標に
+  あれば**、page_numberは付与せず`nombre_box`だけ採用してマージンアンカーに使う。
+  実証: `img20260427_0001.pdf` idx=3〜8（OCR誤読「15/10/17/00/19」、実際のページ番号は4〜9の単桁）で、
+  ジオメトリのみの復帰により全ページ実ページ番号が正しい位置に表示されるようになった。
+- `confident()`（margin.py）を `nombre_box is not None` のみに簡略化（page_number必須をやめた）。
+- 副作用としてクランプの床（output_margin_mm）を、ノンブルアンカーが効いている軸では0に緩和
+  （本文がページ上端に極端に近い偶数ページ群で、マージン保証がノンブル共通位置を上書きしていた問題への対処）。
+
+### ページ回転（`/Rotate`）の適用漏れを修正（横長ページ誤検出の真因）
+
+`source.py: _extract_original()` は埋め込み画像のバイト列をロスレスにそのまま抜き出す方式のため、
+**ページの `/Rotate` 属性を無視していた**。`img20260430_0002.pdf` のidx=82,84,130,110が「やたら横長で
+regions数百個」に見えた件の真因はこれ（横長スキャン＋`/Rotate=270`で本来は縦長書籍ページとして
+表示されるべきテーブル）。`page.get_rotation()` を見て `cv2.rotate()`（ロスレスな90度単位の入れ替え、
+リサンプルなし）を適用。`pdfium`の回転適用版render()と向きが一致することを直接比較で確認。
+
+保険として `pipeline.py: analyze_document()` に**書籍全体のドミナント向き（縦/横）と異なるページを
+強制的に向きを揃える**安全網も追加（`Flag.PAGE_REORIENTED`でレビュー対象化）。実データでは
+上記`/Rotate`修正だけで解消し、安全網は発火しなかった（発火0件を確認）。
+
+### 白紙ページの誤フラグ抑制
+
+`blank=True`（regions空 かつ 実インクなしと確認済み）のページに `MARGIN_NOT_FOUND` / `NO_TEXT` を
+付与しないよう変更（`pipeline.py`）。両フラグとも「regionsが空」という同じ事実を繰り返すだけで、
+白紙と確定している以上、人間が確認すべき新情報ではない。`blank=False`（regions空だが実インクあり、
+OCR見逃しの疑い）のページは引き続きフラグが立つ。
+
+### OCR再実行なしの高速イテレーションパス
+
+`pipeline.py: compute_margin()`（共通ヘルパー化）+ `recompute_shadows_and_margins()` を追加。
+regionsはOCR結果なので影/margin/コンテンツ枠ロジックの変更には依存しない → 保存済みregionsを
+再利用すれば、176ページの再計算がOCR込み15-30分→OCRなし**約30秒〜2分**に短縮。
+margin.py側のロジック調整は今後これで高速に検証できる。
+
+### NPU並列化: 学んだこと（重要、再発防止）
+
+- **Intel NPU（OpenVINOExecutionProvider, device_type="NPU"）に複数スレッドから同時に推論リクエストを
+  投げると、NPUドライバそのものがクラッシュする**（`ZE_RESULT_ERROR_DEVICE_LOST`,
+  "device hung, reset, was removed"）。一度発生すると、同一プロセス内ではその後の全呼び出しが
+  失敗し続ける（が、`content.py`の `except Exception: ... Flag.OCR_FAILED` により**データ破損は無く、
+  安全にフラグが立つだけ**だったことを確認済み）。新しいプロセスを起動すれば復旧する（永続故障ではない）。
+  → これは sibling project `NDL-OCR-Lite-NPU` の `docs/reports/11_NPU_STABILITY_QUEUE_CONTROL_REPORT.md`
+  / `12_QUEUE_CONTROLLED_BENCHMARK.md` で**既に報告・対策済みの既知問題**と完全に一致（彼らの対策は
+  `--rec-workers 1`）。
+- **対策**: `pipeline.py: analyze_document(max_workers=...)` で、NPU系device（`npu`/`qnn`/
+  `openvino-auto`）は常に**ページレベルのスレッドプールを使わない**（`max_workers`指定を無視して
+  強制的に1並列）。CPU/CUDA等は通常通り `ThreadPoolExecutor` で並列化（実測 ~1.7倍, 4 workers）。
+- **NPU向けの安全な高速化**: `_analyze_pages_npu_pipelined()` を追加。OCR呼び出し自体は常に1つしか
+  並行させないが、**次ページのデスキュー（CPU専用処理、約0.24秒）を背後スレッドで先読み**し、
+  現ページのOCR呼び出し（NPU、約3.3秒）の間にNPUを待たせない。A/B実測: 直列82.16秒→
+  パイプライン77.70秒（**約5.7%改善**、20ページ、warm engine）。理論値（0.24/3.81≈6.3%）とほぼ一致。
+- **NPU構築コスト**: `HybridOCR(device="npu", openvino_cache_dir=...)` のモデルロード+コンパイルは
+  約17〜140秒（キャッシュの温まり具合で変動、`openvino_cache_dir`指定で概ね2倍程度短縮）。
+  **プロセス内グローバルキャッシュ**（`content.py: _get_ocr_engine`）により、同一プロセス内で複数冊を
+  処理する場合は初回のみこのコストを払う（実証: 5冊×20ページのテストで2冊目以降は構築コストゼロ）。
+- **1ページの処理時間の内訳**（`img20260430_0002.pdf`, 20ページ平均, 構築コスト除く, NPU）:
+  デスキュー 0.242s / OCR(検出+認識) 3.289s(**全体の86%**) / 影除去+内容枠 0.149s / レンダリング
+  0.128s。OCR以外を完全にパイプライン化しても理論上 14%程度の改善が上限（認識が検出の2.3倍重い）。
+  NPU使用率がタスクマネージャー上70%程度（idle 30%）だった残りのギャップは、`hybrid_ocr`ライブラリ
+  内部（認識の前処理/後処理等、別プロジェクト）のCPU処理に起因する可能性が高く、今回は未着手。
+
+### 検証ツール（再利用可）
+- `C:\tmp\improvements_review\verify_content_box.py`: 任意のDB/ページ番号を指定すると、元画像に
+  content box・regions・OCRテキストを重ねたPNGを生成。「このページが大きい/おかしい理由」を
+  人間が目視確認できる常設の検証手段として作成（ユーザー要望: 「人間が確認できるような検証体制」）。
+- `C:\tmp\improvements_review\overlay_content_box_idx0_10.py`: 指定idx範囲のみ、OCRテキスト内容
+  （Meiryoフォントで日本語描画）付きのオーバーレイPDFを生成。
+
+### 既知の未着手・次セッションへの注意
+- 今回の修正は主に `img20260427_0001.pdf` で詳細検証し、`img20260423_0001.pdf` / `img20260430_0002.pdf`
+  は一部ページのみ抜粋確認（フル5冊の再処理・レビューキュー確認はまだ）。**次の一手は5冊フル再処理**
+  （高速パス`recompute_shadows_and_margins`があるので、既存DBがあればOCR再実行は不要）。
+- NPU並列前処理パイプラインによる5.7%改善は実装済みだが、`hybrid_ocr`内部のCPU処理（認識前処理等）
+  に踏み込んだ追加最適化はユーザーと相談の上で見送り中（別プロジェクトへの変更が必要なため）。
+- CIが見落としていたギャップ: `tests/test_profile_store.py::test_run_populates_profile` に
+  `pytest.importorskip("hybrid_ocr")` が無く、CI（hybrid-ocr未インストール環境）で必ず失敗していた
+  （`param-profile`ブランチが一度もpush/PRされていなかったため発覚しなかった）。修正済み(`ea892ef`)。
+  **`pipeline.run()`を経由するテストを新規追加する際は、必ず`pytest.importorskip("hybrid_ocr")`を
+  忘れないこと**（test_mrc.py/test_render_vecfill.pyと同じパターン）。
