@@ -64,6 +64,8 @@ class Flag(str, Enum):
     OCR_FAILED = "ocr_failed_on_page"            # recognition error on one page
     NOMBRE_UNREADABLE = "nombre_unreadable"      # no readable page number found
     PAGE_NUMBER_GAP = "page_number_gap"          # sequence break (possible miss)
+    PAGE_REORIENTED = "page_reoriented_to_match_book"  # forced portrait<->landscape
+    CONTENT_SCALED_DOWN = "content_scaled_down_to_match_book"  # outlier-large page
 
 
 @dataclass
@@ -113,6 +115,25 @@ class Margin:
     # consistent position. Already includes the output margin. When present the
     # renderer crops to this instead of content+margin.
     crop: Optional[Box] = None
+    # original (deskewed) page size in pixels, so normalize_margins can place
+    # a real-but-small content box (e.g. a single part-title line) at its own
+    # proportional position on the uniform-size page instead of dead-centering
+    # it -- a deliberately off-center layout shouldn't be dragged to the
+    # middle just because there's no nombre to anchor on.
+    page_w: Optional[float] = None
+    page_h: Optional[float] = None
+    # Document-wide UNIFORM output size, in this page's own original-pixel
+    # space (same space as `crop`). `crop` is allowed to be LARGER than this
+    # for an outlier page (so its real content is never clipped -- see
+    # normalize_margins' crop_size), but the final rendered page size must
+    # still be exactly this value for every page in the book (page-format
+    # uniformity is non-negotiable; a fold-out is the only real exception,
+    # and even that should be an explicit, flagged decision -- not a silently
+    # bigger page). compose_transform shrinks (never crops) an oversized
+    # page's content down to fit this target instead of letting it inflate
+    # the output canvas.
+    target_w: Optional[float] = None
+    target_h: Optional[float] = None
 
 
 @dataclass
@@ -234,6 +255,10 @@ def _decode_page(d) -> PageParams:
             confidence=margin.get("confidence", 0.0),
             nombre_box=_box(margin.get("nombre_box")),
             crop=_box(margin.get("crop")),
+            page_w=margin.get("page_w"),
+            page_h=margin.get("page_h"),
+            target_w=margin.get("target_w"),
+            target_h=margin.get("target_h"),
         ),
         regions=[_decode_region(r) for r in d.get("regions", [])],
         page_kind=PageKind(d.get("page_kind", "auto")),
