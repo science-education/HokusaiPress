@@ -476,13 +476,49 @@ def _assign_with_position_model(
         if cand is not None:
             chosen[i] = (dom_kind, i + dom_offset, cand[2])  # misread -> expected
 
+    # Pass 3 (anchor-only, no page_number): a page with no in-position primary
+    # or bracketed-misread candidate -- e.g. front matter that has its own real
+    # per-page numbering, just too few pages to ever form a "primary" cluster
+    # (_primary_clusters), and before the dominant run even starts so pass 2's
+    # bracketing never reaches it either. Its OCR'd digit VALUE isn't trusted
+    # (too few corroborating pages, easy 1-vs-misread-digit confusion), but the
+    # box's PHYSICAL POSITION is real: every page prints its nombre in the same
+    # slot, so a candidate sitting in the position model's expected spot is
+    # almost certainly the real nombre regardless of what digit it reads as.
+    # Anchor margins on it without touching page_number/gap tracking.
+    # Use cl's candidates first (their value at least parsed as a positive
+    # numeral); if none sits in position, fall back to ANY OCR'd text region
+    # in the band, value unparsed/zero/garbled and all (e.g. "00" -- a single
+    # real digit so badly misread parse_numeral rejected it as non-positive).
+    # Position is the only thing being trusted here, so a parse failure is no
+    # reason to give up on it.
+    geo_box: list = [None] * len(pages)
+    for i, (p, cl) in enumerate(zip(pages, cands)):
+        if chosen[i] is not None:
+            continue
+        cand = _in_position_candidate(
+            p, cl, i, band, max_v, page_heights, page_widths, model,
+            lambda kind, off: True)
+        if cand is not None:
+            geo_box[i] = cand[2].box
+            continue
+        for r in p.regions:
+            if not r.ocr_text or _band(r.box, page_heights[i]) != band:
+                continue
+            if _inside_position_model(p.source.page_index, r.box,
+                                      page_heights[i], page_widths[i], model):
+                geo_box[i] = r.box
+                break
+
     assigns = []
     for i, p in enumerate(pages):
         c = chosen[i]
         if c is None:
             p.page_number, p.nombre_text = None, None
             if p.margin:
-                p.margin.nombre_box = None
+                p.margin.nombre_box = (
+                    _aligned_box(geo_box[i], page_heights[i], model)
+                    if geo_box[i] is not None else None)
             continue
         kind, v, r = c
         p.page_number, p.nombre_text = v, r.ocr_text
