@@ -14,6 +14,8 @@ dependencies = [
     "opencv-python",
     "pypdfium2",
     "pikepdf",
+    "Pillow",
+    "reportlab",
 ]
 
 [project.optional-dependencies]
