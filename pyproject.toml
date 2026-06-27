@@ -26,6 +26,9 @@ ocr = ["hybrid-ocr[pdf]"]
 # vary by hardware. PaddleOCR-VL needs the doc-parser extra.
 paddle = ["paddleocr>=3.7.0", "paddlex[ocr]>=3.7.0"]
 paddle-structure = ["paddlepaddle"]
+# Lossless generic-region JBIG2 encoder (Apache-2.0). Pinned to a reviewed
+# release so default installs remain compiler-free and G4-only.
+jbig2 = ["pyjbig2 @ git+https://github.com/science-education/pyjbig2.git@v0.1.0"]
 # Review web UI.
 web = ["fastapi", "uvicorn", "pydantic"]
 dev = ["pytest"]
@@ -35,3 +38,6 @@ hokusai-press = "hokusai_press.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hokusai_press"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
