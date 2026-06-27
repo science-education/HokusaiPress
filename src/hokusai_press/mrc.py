@@ -24,6 +24,7 @@ from io import BytesIO
 import zlib
 
 import cv2
+from .pdf_export import _encode_gray_flate_page_pdf
 import numpy as np
 
 # Tint-zone local thresholding constants.
@@ -194,7 +195,7 @@ class MrcPageBuilder:
         the encode step measured ~65% of build_pdf's wall time (G4/JPEG
         codecs release the GIL), making this the highest-value parallel
         target, well ahead of margin/render."""
-        from hybrid_ocr.pdf_export import encode_page_pdf
+        from .pdf_export import encode_page_pdf
 
         from .render import binarize_bw
 
@@ -425,7 +426,7 @@ class MrcPageBuilder:
 
     def save(self, output_path: str) -> None:
         import pikepdf
-        from hybrid_ocr.pdf_export import build_text_overlay
+        from .pdf_export import build_text_overlay
 
         if not self._pages:
             raise ValueError("no pages added")
@@ -1104,35 +1105,6 @@ def _nearest_gray_centers(values: np.ndarray, centers: np.ndarray) -> np.ndarray
         best_dist[take] = dist[take]
     return labels
 
-
-def _encode_gray_flate_page_pdf(gray: np.ndarray) -> bytes:
-    """Single-page PDF containing an 8-bit DeviceGray FlateDecode image."""
-    import pikepdf
-
-    if gray.dtype != np.uint8 or gray.ndim != 2:
-        raise ValueError("gray must be an HxW uint8 array")
-    h, w = gray.shape
-    pdf = pikepdf.new()
-    image = pikepdf.Stream(
-        pdf,
-        zlib.compress(np.ascontiguousarray(gray).tobytes()),
-        Filter=pikepdf.Name("/FlateDecode"),
-    )
-    image.Type = pikepdf.Name("/XObject")
-    image.Subtype = pikepdf.Name("/Image")
-    image.Width = w
-    image.Height = h
-    image.ColorSpace = pikepdf.Name("/DeviceGray")
-    image.BitsPerComponent = 8
-    content = pikepdf.Stream(pdf, f"q {w} 0 0 {h} 0 0 cm /Im0 Do Q".encode())
-    page = pdf.add_blank_page(page_size=(w, h))
-    page.obj.Resources = pikepdf.Dictionary(
-        XObject=pikepdf.Dictionary(Im0=pdf.make_indirect(image))
-    )
-    page.obj.Contents = pdf.make_indirect(content)
-    buf = BytesIO()
-    pdf.save(buf)
-    return buf.getvalue()
 
 
 def _add_overlay_named(dest, overlay_page, rect, name: str) -> None:
