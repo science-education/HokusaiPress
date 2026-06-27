@@ -400,8 +400,7 @@ with tempfile.TemporaryDirectory() as d:
 HokusaiPressでの利用:
 - DB/設定上は `Document.render.bilevel_codec = "jbig2"` を使う。
 - CLIに直接 `--pdf-compress` は無い。現状は設定/DB経由または必要ならCLIオプション追加が別作業。
-- `jbig2` がPATHに無い状態で `jbig2` codecを選ぶと、`hybrid_ocr.pdf_export.SearchablePdfBuilder.__post_init__`
-  由来のRuntimeErrorになる。
+- `pyjbig2` がインポートできない状態で `jbig2` を指定した場合、`UnsupportedCodecError` が発生します。オートルーティング (`auto`) において、`pyjbig2` 不在時に `hybrid_ocr` へのフォールバックは行われません。
 
 注意:
 - WSLが初回起動で遅い場合、最初の `wsl.exe` 呼び出しだけ時間がかかる。

@@ -13,13 +13,14 @@
     - `bw` モードにおいて、`Pillow` で画像を TIFF G4 にエンコードし、そこから生の G4 バイト列を抽出して `pikepdf.Stream` (`/CCITTFaxDecode` フィルタ) に格納するロジックを実装。
     - `gray`/`color` モードにおいて、OpenCV で JPEG エンコードし、`pikepdf.Stream` (`/DCTDecode` フィルタ) に格納するロジックを実装。
   - `build_text_overlay`:
-    - 日本語フォントの自動検出 (Discovery) ロジックを実装（OS フォントディレクトリや `hybrid_ocr` のリソースから探索）。
+    - 全ページに非空テキストがない場合は、日本語フォントの検出や登録を行わず、空白のオーバーレイページを生成するロジックを実装。
+    - テキストが存在する場合は、日本語フォントの自動検出 (Discovery) ロジックを実行（OS フォントディレクトリや `hybrid_ocr` のリソースから探索）。
     - reportlab を使用して、縦書き (`direction=v` 時の一文字ごとの -90 度回転配置) および横書きテキストの重ね合わせを再現。
   - `_encode_gray_flate_page_pdf`:
     - `mrc.py` から既存の Flate エンコーダを移動し、再利用可能に。
 - `__init__.py`:
   - ファサード `SearchablePdfBuilder` を提供。
-  - `backend` 引数 (`"auto"`, `"internal"`, `"hybrid_ocr"`) によるバックエンド選択機能を実装。デフォルトは `auto` で、`hybrid_ocr` が利用可能な場合はそちらを優先、利用不可能な場合は `internal` を透過的に使用。
+  - `backend` 引数 (`"auto"`, `"internal"`, `"hybrid_ocr"`) によるバックエンド選択機能を実装。デフォルトは `auto` で、常に `internal` を優先して使用し、`pyjbig2` が存在しない場合は `UnsupportedCodecError` を送出する（`hybrid_ocr` へのフォールバックは行わない）。
   - 明示的に `hybrid_ocr` が指定されたが利用できない場合は `BackendUnavailableError` を送出し、サポート外のコーデックが指定された場合は `UnsupportedCodecError` を送出するよう例外設計を徹底。
 
 ### 2.2. `mrc.py` のインポートおよびエンコード処理の移行

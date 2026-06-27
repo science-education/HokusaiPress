@@ -264,26 +264,10 @@ def test_backend_auto_routing():
         from hokusai_press.pdf_export import InternalSearchablePdfBuilder
         assert isinstance(builder._builder, InternalSearchablePdfBuilder)
 
-    # 2. When compress='jbig2', if pyjbig2 is present, backend='auto' selects internal
-    with patch.dict(sys.modules, {"pyjbig2": sys.modules.get("pyjbig2") or object()}):
-        builder = SearchablePdfBuilder(compress="jbig2", backend="auto")
-        assert isinstance(builder._builder, InternalSearchablePdfBuilder)
-
-    # 3. When compress='jbig2' and pyjbig2 is absent:
-    # If hybrid_ocr is present, backend='auto' routes to hybrid_ocr
-    mock_hybrid = object()
+    # 2. When compress='jbig2' and pyjbig2 is absent, backend='auto' uses internal and raises UnsupportedCodecError
     with patch.dict(sys.modules, {"pyjbig2": None, "pyjbig2.api": None}):
-        # Mocking SearchablePdfBuilder on hybrid_ocr.pdf_export
-        class MockHybridBuilder:
-            def __init__(self, **kwargs):
-                pass
-
-        class MockModule:
-            SearchablePdfBuilder = MockHybridBuilder
-
-        with patch.dict(sys.modules, {"hybrid_ocr.pdf_export": MockModule, "hybrid_ocr": MockModule}):
-            builder = SearchablePdfBuilder(compress="jbig2", backend="auto")
-            assert builder._builder.__class__.__name__ == "MockHybridBuilder"
+        with pytest.raises(UnsupportedCodecError):
+            SearchablePdfBuilder(compress="jbig2", backend="auto")
 
 
 def test_input_validation():
@@ -304,3 +288,90 @@ def test_input_validation():
         decide_page_mode(np.zeros((10,)), [])
     with pytest.raises(ValueError):
         encode_page_pdf(np.zeros((10,)), "bw", "g4")
+
+
+def test_empty_overlays_no_font_discovery(tmp_path):
+    with patch("hokusai_press.pdf_export.backend.discover_font", side_effect=MissingFontError("Mock font missing")):
+        # 1. Empty pages overlay build should succeed without font discovery
+        pages = [(200, 300, []), (150, 250, [{"text": "   "}])]
+        overlay_bytes = build_text_overlay(pages, backend="internal")
+        with pikepdf.open(BytesIO(overlay_bytes)) as pdf:
+            assert len(pdf.pages) == 2
+            assert [float(v) for v in pdf.pages[0].MediaBox] == [0.0, 0.0, 200.0, 300.0]
+            assert [float(v) for v in pdf.pages[1].MediaBox] == [0.0, 0.0, 150.0, 250.0]
+
+        # 2. End-to-end MrcPageBuilder with no text (empty OCR lines)
+        from hokusai_press.mrc import MrcPageBuilder
+        img = np.full((100, 100, 3), 255, dtype=np.uint8)
+        builder = MrcPageBuilder(compress="g4", target_dpi=600)
+        builder.add_page(img, [{"text": ""}], [], mode="bw")
+
+        out_pdf = tmp_path / "mrc_no_ocr.pdf"
+        builder.save(str(out_pdf))
+
+        with pikepdf.open(out_pdf) as pdf:
+            assert len(pdf.pages) == 1
+            assert [float(v) for v in pdf.pages[0].MediaBox] == [0.0, 0.0, 100.0, 100.0]
+
+
+def test_rendered_pixels_g4():
+    # Asymmetric G4 page (100x150)
+    w, h = 100, 150
+    img = np.zeros((h, w), dtype=np.uint8)  # Black polarity (0)
+    # White polarity regions
+    img[0:40, 0:40] = 255
+    img[130:150, 80:100] = 255
+
+    pdf_bytes = encode_page_pdf(img, mode="bw", compress="g4", backend="internal")
+
+    # Render with pypdfium2
+    import pypdfium2 as pdfium
+    doc = pdfium.PdfDocument(pdf_bytes)
+    page = doc[0]
+    bitmap = page.render(scale=1.0)
+    pil_img = bitmap.to_pil()
+    rendered_np = np.array(pil_img)
+
+    # Convert to grayscale
+    if rendered_np.ndim == 3:
+        rendered_gray = cv2.cvtColor(rendered_np, cv2.COLOR_RGB2GRAY)
+    else:
+        rendered_gray = rendered_np
+
+    # Binarize rendered image to ensure polarity correctness
+    rendered_bin = np.where(rendered_gray > 127, 255, 0).astype(np.uint8)
+
+    assert np.array_equal(rendered_bin, img)
+
+
+def test_rendered_pixels_jpeg():
+    # Colored JPEG patch (120x80)
+    w, h = 120, 80
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    # Left-top: Red (BGR: [0, 0, 255])
+    img[0:40, 0:40] = [0, 0, 255]
+    # Right-top: Green (BGR: [0, 255, 0])
+    img[0:40, 80:120] = [0, 255, 0]
+    # Left-bottom: Blue (BGR: [255, 0, 0])
+    img[40:80, 0:40] = [255, 0, 0]
+
+    pdf_bytes = encode_page_pdf(img, mode="color", compress="g4", backend="internal")
+
+    # Render with pypdfium2
+    import pypdfium2 as pdfium
+    doc = pdfium.PdfDocument(pdf_bytes)
+    page = doc[0]
+    bitmap = page.render(scale=1.0)
+    pil_img = bitmap.to_pil()
+    rendered_np = np.array(pil_img)
+
+    # pypdfium2 renders in RGB (or RGBA). Convert to BGR for comparison.
+    rendered_bgr = cv2.cvtColor(rendered_np, cv2.COLOR_RGB2BGR)
+
+    # Sample specific points and assert colors within reasonable tolerance
+    # Left-top: Red
+    assert np.allclose(rendered_bgr[20, 20], [0, 0, 255], atol=15)
+    # Right-top: Green
+    assert np.allclose(rendered_bgr[20, 100], [0, 255, 0], atol=15)
+    # Left-bottom: Blue
+    assert np.allclose(rendered_bgr[60, 20], [255, 0, 0], atol=15)

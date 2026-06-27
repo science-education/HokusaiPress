@@ -326,14 +326,32 @@ def build_text_overlay(pages: list, font_path: str | None = None) -> bytes:
     from reportlab.pdfbase.ttfonts import TTFont
     from reportlab.pdfgen import canvas
 
+    # Check if there is any non-empty text across all pages
+    has_any_text = False
+    for w, h, lines in pages:
+        for ln in lines:
+            if ln.get("text", "").strip():
+                has_any_text = True
+                break
+        if has_any_text:
+            break
+
+    packet = BytesIO()
+    c = canvas.Canvas(packet)
+
+    if not has_any_text:
+        for w, h, lines in pages:
+            c.setPageSize((w, h))
+            c.showPage()
+        c.save()
+        return packet.getvalue()
+
     font_file = discover_font(font_path)
     font_name = "MPLUS1p-Medium"
 
     if font_name not in pdfmetrics.getRegisteredFontNames():
         pdfmetrics.registerFont(TTFont(font_name, font_file))
 
-    packet = BytesIO()
-    c = canvas.Canvas(packet)
     for w, h, lines in pages:
         c.setPageSize((w, h))
         for ln in lines:

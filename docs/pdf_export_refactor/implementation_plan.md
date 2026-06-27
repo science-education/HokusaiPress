@@ -18,7 +18,8 @@
 
 ### 2.2. フォント自動検出 (Font Discovery) とテキストレイヤー重ね合わせ
 - **フォント自動検出ロジック**:
-  - 明示的に `font_path` が指定された場合はそれを使用。
+  - 全ページに非空テキストがない場合は、フォントの検出・登録を一切行わずに空白のオーバーレイページを生成します。これにより、画像のみ/OCRなしPDF生成時には日本語フォントが不要となります。
+  - テキストが存在する場合は、明示的に `font_path` が指定された場合はそれを使用。
   - 未指定の場合、以下の候補パスを順に探索：
     1. `hybrid_ocr` パッケージがインストールされている場合、そのリソースディレクトリ (`hybrid_ocr/resource/MPLUS1p-Medium.ttf`)
     2. OSのシステムフォントディレクトリ (Windows: `%WINDIR%\Fonts\msgothic.ttc`, `msmincho.ttc` 等)
@@ -30,7 +31,7 @@
 - ファサードモジュールを提供し、以下の API を公開します。
   - `class SearchablePdfBuilder`:
     - 引数 `backend` (デフォルト `"auto"`) を追加。有効値は `"auto"`, `"internal"`, `"hybrid_ocr"`。
-    - `auto` の場合、`hybrid_ocr.pdf_export` のインポート可否を明示的にチェックし、利用可能なら `hybrid_ocr` を、不可能なら `internal` を使用。
+    - `auto` の場合、常に `internal` バックエンドを優先的に使用します。`pyjbig2` がない環境で `compress="jbig2"` を指定された場合は `UnsupportedCodecError` を発生させ、`hybrid_ocr` への自動フォールバックは行いません。
     - 明示指定されたバックエンドが利用できない場合は `BackendUnavailableError` を発生。
   - `encode_page_pdf`, `build_text_overlay`, `decide_page_mode`
 - `mrc.py` における PDF エンコードのインポート元を、この新モジュールに切り替えます。

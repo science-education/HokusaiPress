@@ -69,15 +69,6 @@ def encode_page_pdf(
     chosen = backend
     if chosen == "auto":
         chosen = "internal"
-        if compress == "jbig2":
-            try:
-                import pyjbig2  # noqa
-            except ImportError:
-                try:
-                    import hybrid_ocr.pdf_export  # noqa
-                    chosen = "hybrid_ocr"
-                except ImportError:
-                    pass
 
     if chosen == "hybrid_ocr":
         try:
@@ -177,15 +168,6 @@ class SearchablePdfBuilder:
         chosen = self.backend
         if chosen == "auto":
             chosen = "internal"
-            if self.compress == "jbig2":
-                try:
-                    import pyjbig2  # noqa
-                except ImportError:
-                    try:
-                        import hybrid_ocr.pdf_export  # noqa
-                        chosen = "hybrid_ocr"
-                    except ImportError:
-                        pass
 
         if chosen == "hybrid_ocr":
             try:
