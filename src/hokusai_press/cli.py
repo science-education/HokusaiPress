@@ -165,8 +165,8 @@ def main(argv=None) -> int:
                                 "paddle-vl", "paddleocr-vl"],
                        help="text OCR engine: NDL-OCR/hybrid, PP-OCRv6, "
                             "PaddleOCR-VL, or none")
-    p_run.add_argument("--device", default="auto",
-                       help="OCR device. hybrid: auto|cpu|npu|cuda|dml|qnn; "
+    p_run.add_argument("--device", default="auto", choices=["auto", "cpu", "npu", "cuda", "dml", "qnn", "mps"],
+                       help="compute device for OCR. hybrid: auto|cpu|npu|cuda|dml|qnn; "
                             "Paddle: cpu|gpu|npu[:0]|xpu[:0]|... as supported "
                             "by the installed Paddle runtime")
     p_run.add_argument("--runtime", default=None,

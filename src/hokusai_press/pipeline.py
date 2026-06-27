@@ -277,7 +277,7 @@ def analyze_document(
     # fed back-to-back instead of idling on the next page's CPU-only deskew
     # (measured ~0.24s deskew vs ~3.3s OCR on tmp0613 -- recovers most of
     # that gap "for free", with no risk to the NPU driver).
-    npu_class = {"qnn", "npu", "openvino-auto"}
+    npu_class = {"qnn", "npu", "openvino-auto", "mps"}
     is_npu = device.lower() in npu_class
     effective_workers = 1 if is_npu else max_workers
     t = perf_counter()

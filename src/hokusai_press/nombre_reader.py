@@ -288,8 +288,12 @@ def _session(model_path: Path):
     import onnxruntime as ort
 
     providers = ort.get_available_providers()
-    use = ["CPUExecutionProvider"]
-    if "CPUExecutionProvider" not in providers:
+    use = []
+    if "CoreMLExecutionProvider" in providers:
+        use.append("CoreMLExecutionProvider")
+    if "CPUExecutionProvider" in providers:
+        use.append("CPUExecutionProvider")
+    if not use:
         use = providers[:1]
     return ort.InferenceSession(str(model_path), providers=use)
 
