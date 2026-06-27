@@ -43,7 +43,7 @@ def test_backend_selection_unavailable():
 
 def test_invalid_inputs():
     img = np.zeros((100, 100, 3), dtype=np.uint8)
-    
+
     # 無効なモード
     with pytest.raises(UnsupportedCodecError):
         encode_page_pdf(img, mode="invalid", compress="g4", backend="internal")
@@ -56,7 +56,7 @@ def test_invalid_inputs():
     with patch.dict(sys.modules, {"pyjbig2": None, "pyjbig2.api": None}):
         with pytest.raises(UnsupportedCodecError):
             encode_page_pdf(img, mode="bw", compress="jbig2", backend="internal")
-            
+
         with pytest.raises(UnsupportedCodecError):
             SearchablePdfBuilder(compress="jbig2", backend="internal")
 
@@ -67,12 +67,12 @@ def test_exact_mediabox_and_filters_g4():
     img[50:250, 50:150] = 255  # 一部白
 
     pdf_bytes = encode_page_pdf(img, mode="bw", compress="g4", backend="internal")
-    
+
     # pikepdf で検証
     with pikepdf.open(BytesIO(pdf_bytes)) as pdf:
         assert len(pdf.pages) == 1
         page = pdf.pages[0]
-        
+
         # 物理 MediaBox (width, height)
         # pikepdf の Page.MediaBox / Page.trimbox / Page.cropbox などは [0, 0, 200, 300]
         # (1px = 1pt 物理スケール)
@@ -83,13 +83,13 @@ def test_exact_mediabox_and_filters_g4():
         images = list(page.Resources.XObject.values())
         assert len(images) == 1
         img_obj = images[0]
-        
+
         assert img_obj.Filter == pikepdf.Name("/CCITTFaxDecode")
         assert img_obj.Width == 200
         assert img_obj.Height == 300
         assert img_obj.ColorSpace == pikepdf.Name("/DeviceGray")
         assert img_obj.BitsPerComponent == 1
-        
+
         # DecodeParms
         parms = img_obj.DecodeParms
         assert parms.K == -1
@@ -109,7 +109,7 @@ def test_exact_mediabox_and_filters_jpeg():
         page = pdf.pages[0]
         box = [float(v) for v in page.MediaBox]
         assert box == [0.0, 0.0, 150.0, 250.0]
-        
+
         img_obj = list(page.Resources.XObject.values())[0]
         assert img_obj.Filter == pikepdf.Name("/DCTDecode")
         assert img_obj.Width == 150
@@ -123,7 +123,7 @@ def test_exact_mediabox_and_filters_jpeg():
         page = pdf.pages[0]
         box = [float(v) for v in page.MediaBox]
         assert box == [0.0, 0.0, 150.0, 250.0]
-        
+
         img_obj = list(page.Resources.XObject.values())[0]
         assert img_obj.Filter == pikepdf.Name("/DCTDecode")
         assert img_obj.Width == 150
@@ -157,12 +157,12 @@ def test_text_overlay_horizontal_and_vertical():
     pages = [
         (200, 300, lines),
     ]
-    
+
     overlay_bytes = build_text_overlay(pages, backend="internal")
     with pikepdf.open(BytesIO(overlay_bytes)) as pdf:
         assert len(pdf.pages) == 1
         page = pdf.pages[0]
-        
+
         # コンテンツストリームの内容をデコードして検証
         contents_obj = page.obj.Contents
         if isinstance(contents_obj, pikepdf.Array):
@@ -170,7 +170,7 @@ def test_text_overlay_horizontal_and_vertical():
         else:
             content_bytes = contents_obj.read_bytes()
         content_str = content_bytes.decode("utf-8", errors="ignore")
-        
+
         # MPLUS1p-Medium フォントが使用されていること
         font_resources = page.Resources.Font
         has_font = False
@@ -179,10 +179,10 @@ def test_text_overlay_horizontal_and_vertical():
                 has_font = True
                 break
         assert has_font
-        
+
         # Text Render Mode が 3 (invisible) に設定されていること
         assert "3 Tr" in content_str
-        
+
         # 縦書きの各文字が回転配置されているため、rotate(-90) すなわち三角関数マトリックス
         # reportlabは通常、回転操作として "0 -1 1 0" または "0 -1.0 1.0 0" を含む変換マトリックスを出力する
         # （縦書き一文字ずつ回転するため、複数回現れる）
@@ -198,7 +198,7 @@ def test_font_discovery_missing():
 def test_searchable_pdf_builder_internal():
     img1 = np.zeros((300, 200, 3), dtype=np.uint8)
     img2 = np.zeros((400, 300, 3), dtype=np.uint8)
-    
+
     # 模擬OCRデータ
     lines1 = [{"text": "Page 1 Line 1", "box": [10, 10, 100, 30], "direction": "h"}]
     lines2 = [{"text": "Page 2 Line 1", "box": [20, 20, 150, 45], "direction": "h"}]
@@ -206,30 +206,30 @@ def test_searchable_pdf_builder_internal():
     builder = SearchablePdfBuilder(mode="bw", compress="g4", backend="internal")
     builder.add_page(img1, lines1)
     builder.add_page(img2, lines2)
-    
+
     # 一時ファイルに保存
     import tempfile
     import os
-    
+
     fd, temp_path = tempfile.mkstemp(suffix=".pdf")
     os.close(fd)
     try:
         builder.save(temp_path)
-        
+
         # pikepdf で再オープンして検証
         with pikepdf.open(temp_path) as pdf:
             assert len(pdf.pages) == 2
-            
+
             # 1ページ目
             page1 = pdf.pages[0]
             box1 = [float(v) for v in page1.MediaBox]
             assert box1 == [0.0, 0.0, 200.0, 300.0]
-            
+
             # 2ページ目
             page2 = pdf.pages[1]
             box2 = [float(v) for v in page2.MediaBox]
             assert box2 == [0.0, 0.0, 300.0, 400.0]
-            
+
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
