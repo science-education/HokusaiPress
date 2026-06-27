@@ -6,6 +6,7 @@ import json
 import os
 import queue
 import subprocess
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -16,7 +17,7 @@ import numpy as np
 from .base import LayoutBox, OCRLine, OCRResult
 
 
-DEFAULT_WORKER_PYTHON = r"C:\Users\user\dev\NDL-OCR-Lite-NPU\.venv-openvino\Scripts\python.exe"
+DEFAULT_WORKER_PYTHON = os.environ.get("HOKUSAI_DEIM_PYTHON", sys.executable)
 DEFAULT_WORKER_SCRIPT = (
     Path(__file__).resolve().parents[3] / "engines" / "deim" / "deim_worker.py"
 )

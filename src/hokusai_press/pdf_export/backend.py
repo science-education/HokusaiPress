@@ -291,8 +291,11 @@ def discover_font(font_path: str | None = None) -> str:
     ]
     candidates.extend(linux_paths)
 
-    # macOS Fonts
+    # macOS Fonts (Japanese first, then CJK fallbacks)
     macos_paths = [
+        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+        "/System/Library/Fonts/ヒラギノ明朝 ProN W3.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
         "/System/Library/Fonts/STHeiti Light.ttc",
         "/System/Library/Fonts/STHeiti Medium.ttc",
         "/System/Library/Fonts/PingFang.ttc",

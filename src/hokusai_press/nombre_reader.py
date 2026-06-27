@@ -257,12 +257,27 @@ def _default_model_path() -> Path:
     env = os.environ.get("HOKUSAI_FOLIO_DIGIT_ONNX")
     if env:
         return Path(env)
-    root = Path(r"C:\tmp\tmp0613\bench\digit")
-    bin_model = root / "folio_digit_bin.onnx"
-    if bin_model.exists():
-        return bin_model
-    ft = root / "folio_digit_ft.onnx"
-    return ft if ft.exists() else root / "folio_digit.onnx"
+    # Platform-independent default: look relative to the project root
+    # (two levels above this source file), then the current working directory.
+    pkg_root = Path(__file__).resolve().parents[2]
+    candidates = [
+        pkg_root / "models" / "nombre",
+        Path("models") / "nombre",
+    ]
+    for root in candidates:
+        if not root.is_dir():
+            continue
+        bin_model = root / "folio_digit_bin.onnx"
+        if bin_model.exists():
+            return bin_model
+        ft = root / "folio_digit_ft.onnx"
+        if ft.exists():
+            return ft
+        base = root / "folio_digit.onnx"
+        if base.exists():
+            return base
+    # No model found — return a descriptive path so the error message is clear.
+    return pkg_root / "models" / "nombre" / "folio_digit.onnx"
 
 
 class _Recognizer:

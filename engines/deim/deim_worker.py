@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import sys
 import time
 import traceback
@@ -16,7 +17,10 @@ from typing import Any
 import numpy as np
 
 
-NDL_SRC = Path(r"C:\Users\user\dev\NDL-OCR-Lite-NPU\src")
+NDL_SRC = Path(
+    os.environ.get("HOKUSAI_NDL_SRC")
+    or str(Path(__file__).resolve().parents[2] / "engines" / "ndl-ocr" / "src")
+)
 
 # DEIM 17-class (ndl.yaml) -> canonical layout vocabulary (see base.FIGURE_LIKE_LABELS).
 # The consumer maps from canonical labels; raw_label carries the native name.
