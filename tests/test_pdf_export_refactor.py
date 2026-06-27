@@ -391,3 +391,27 @@ def test_rendered_pixels_jpeg():
     assert np.allclose(rendered_bgr[20, 100], [0, 255, 0], atol=15)
     # Left-bottom: Blue
     assert np.allclose(rendered_bgr[60, 20], [255, 0, 0], atol=15)
+
+
+def test_rendered_pixels_jbig2_is_bit_exact():
+    import pypdfium2 as pdfium
+
+    h, w = 173, 257
+    bitmap = np.full((h, w), 255, dtype=np.uint8)
+    bitmap[7:41, 11:83] = 0
+    bitmap[80:84, 5:240] = 0
+    yy, xx = np.indices(bitmap.shape)
+    bitmap[(xx + 3 * yy) % 97 == 0] = 0
+
+    pdf_bytes = encode_page_pdf(
+        bitmap, mode="bw", compress="jbig2", backend="internal"
+    )
+    with pikepdf.open(BytesIO(pdf_bytes)) as pdf:
+        image = next(iter(pdf.pages[0].Resources.XObject.values()))
+        assert image.Filter == pikepdf.Name("/JBIG2Decode")
+        assert [float(v) for v in pdf.pages[0].MediaBox] == [0.0, 0.0, w, h]
+
+    rendered = np.asarray(
+        pdfium.PdfDocument(pdf_bytes)[0].render(scale=1).to_pil().convert("L")
+    )
+    assert np.array_equal(rendered, bitmap)

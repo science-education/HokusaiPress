@@ -685,3 +685,17 @@ margin.py側のロジック調整は今後これで高速に検証できる。
   本文位置も連動するため未修正。ノンブルの自前下ギャップで再アンカーするかは要判断。
 - **5冊フル再処理・本番DB(final2.db)反映は未実施**。検証は各冊30頁サブセットの目視まで（結果は
   `C:\tmp\tmp0613\verify30c_out\` に保持）。これらの修正を全頁で確認後に本番反映する。
+
+## 2026-06-27追記: 内製pyjbig2への移行
+
+- 外部`jbig2`コマンド／WSLラッパー経路は過去の方式。現在のinternal PDF backendは
+  optional extra `.[jbig2]` の `pyjbig2==0.1.0`を利用する。
+- 実装は`jbig2enc 0.32`（Apache-2.0）から移植したlossless generic-region算術符号化。
+  symbol dictionaryを使用せず、PDFium復号で全画素一致を検証する。
+- `pyjbig2`はCython高速版と純Python fallbackを持ち、Ubuntu/Windows × Python
+  3.12/3.13のCIで双方を検証している。
+- 実画像12ページの試算ではJBIG2はG4比71.8%（148,699対207,184 bytes）、
+  エンコード0.152秒対0.341秒、全12ページbit-exactだった。
+- 既定値は引き続きG4。JBIG2を使うには`Document.render.bilevel_codec = "jbig2"`
+  とoptional extraの導入が必要。未導入時は`UnsupportedCodecError`となり、暗黙の
+  codec fallbackは行わない。
