@@ -15,9 +15,24 @@ class OCRLine(TypedDict, total=False):
     source: str
 
 
+# Canonical layout vocabulary shared across OCR engines. Each engine's worker
+# normalizes its native classes into one of these labels; `raw_label` keeps the
+# engine-native name (e.g. "block_folio") for traceability and future use.
+CANONICAL_LAYOUT_LABELS = frozenset({
+    "text", "title", "caption", "note", "rubi",
+    "figure", "chart", "table", "equation",
+    "page_number", "running_head", "advertisement", "colophon",
+})
+# Labels a consumer should treat as a figure/photo (image) region (MRC).
+FIGURE_LIKE_LABELS = frozenset({"figure", "chart", "table", "photo", "advertisement"})
+
+
 class LayoutBox(TypedDict, total=False):
     box: tuple[float, float, float, float]
-    label: str
+    label: str            # canonical label (see CANONICAL_LAYOUT_LABELS)
+    raw_label: str        # engine-native label, e.g. "block_folio"
+    class_id: int         # engine-native class id (optional)
+    text: str             # recognized text for furniture (folio / running head)
     score: float | None
     source: str
 

@@ -29,6 +29,7 @@ import cv2
 import numpy as np
 
 from .model import Box, Flag, Region, RegionKind, SourceRef
+from .ocr.base import FIGURE_LIKE_LABELS
 
 PHOTO_AREA_FRAC = 0.01      # dense residual blob larger than this = photo
 PHOTO_FILL = 0.2           # connected-component fill ratio separating photo from line art
@@ -37,6 +38,8 @@ LOW_COVERAGE_FRAC = 0.3    # text+figure covers < 30% of ink -> flag for review.
 # Calibrated on real books: detected-line polygons cover only ~40% of text ink
 # even on clean dense pages (boxes are tight), so 0.5 flagged the median page.
 # At 0.3 only genuine outliers (OCR truly missed most text) reach the queue.
+TEXT_LAYOUT_LABELS = frozenset({"page_number", "running_head"})
+FIGURE_LAYOUT_LABELS = FIGURE_LIKE_LABELS | frozenset({"image"})
 
 def analyze(
     original_bgr: np.ndarray,
@@ -93,10 +96,22 @@ def analyze(
         if result is not None:
             text_mask = np.zeros(ocr_bgr.shape[:2], dtype=np.uint8)
             lines = result.get("lines", [])
+            text_layout_boxes = []
+            for lb in result.get("layout_boxes", []):
+                label = lb.get("label")
+                if label in TEXT_LAYOUT_LABELS:
+                    text_layout_boxes.append((label, tuple(float(v) for v in lb["box"])))
             for ln in lines:
-                poly = np.array(ln["polygon"], dtype=np.int32)
-                cv2.fillPoly(text_mask, [poly], 1)
                 x0, y0, x1, y1 = ln["box"]
+                poly = ln.get("polygon")
+                if poly is None:
+                    poly = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+                poly = np.array(poly, dtype=np.int32)
+                cv2.fillPoly(text_mask, [poly], 1)
+                layout_label = _matching_layout_label(
+                    (float(x0), float(y0), float(x1), float(y1)),
+                    text_layout_boxes,
+                )
                 regions.append(
                     Region(
                         kind=RegionKind.TEXT,
@@ -105,11 +120,35 @@ def analyze(
                         source=ln.get("source", "dbnet"),
                         ocr_text=ln.get("text") or None,
                         ocr_conf=ln.get("det_score"),
+                        layout_label=layout_label,
                     )
                 )
             if not lines:
                 flags.append(Flag.NO_TEXT)
+            # Furniture (folio / running head) is recognized by the engine but is not
+            # part of the reading-order lines. Surface it as a tagged TEXT region so
+            # nombre can read the page number.
             for lb in result.get("layout_boxes", []):
+                label = lb.get("label")
+                txt = lb.get("text")
+                if label not in TEXT_LAYOUT_LABELS or not txt:
+                    continue
+                fx0, fy0, fx1, fy1 = lb["box"]
+                regions.append(Region(
+                    kind=RegionKind.TEXT,
+                    box=Box(fx0 * inv_scale, fy0 * inv_scale,
+                            fx1 * inv_scale, fy1 * inv_scale),
+                    source=lb.get("source", "deim"),
+                    ocr_text=txt,
+                    layout_label=label,
+                ))
+            for lb in result.get("layout_boxes", []):
+                # Engines now emit ALL classified regions (text/page_number/figure/...).
+                # Only figure-like classes become image regions; an absent label keeps
+                # legacy behaviour (treated as figure).
+                label = lb.get("label")
+                if label is not None and label not in FIGURE_LAYOUT_LABELS:
+                    continue
                 x0, y0, x1, y1 = [int(v) for v in lb["box"]]
                 if x1 - x0 < 4 or y1 - y0 < 4:
                     continue
@@ -196,3 +235,33 @@ def _is_continuous_tone(crop: np.ndarray) -> bool:
     hist = cv2.calcHist([gray], [0], None, [32], [0, 256]).ravel()
     occupied = int((hist > gray.size * 0.01).sum())
     return occupied >= 6
+
+
+def _matching_layout_label(line_box, layout_boxes) -> str | None:
+    for label, box in layout_boxes:
+        if _box_center_inside(line_box, box) or _box_iou(line_box, box) >= 0.3:
+            return label
+    return None
+
+
+def _box_center_inside(inner, outer) -> bool:
+    x0, y0, x1, y1 = inner
+    ox0, oy0, ox1, oy1 = outer
+    cx = (x0 + x1) / 2.0
+    cy = (y0 + y1) / 2.0
+    return ox0 <= cx <= ox1 and oy0 <= cy <= oy1
+
+
+def _box_iou(a, b) -> float:
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    ix0, iy0 = max(ax0, bx0), max(ay0, by0)
+    ix1, iy1 = min(ax1, bx1), min(ay1, by1)
+    iw, ih = max(0.0, ix1 - ix0), max(0.0, iy1 - iy0)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, ax1 - ax0) * max(0.0, ay1 - ay0)
+    area_b = max(0.0, bx1 - bx0) * max(0.0, by1 - by0)
+    denom = area_a + area_b - inter
+    return inter / denom if denom > 0.0 else 0.0

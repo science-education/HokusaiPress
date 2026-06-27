@@ -61,12 +61,16 @@ def get_ocr_engine(
         _config = None
         gc.collect()
 
-        # Avoid loading a heavy VLM twice when the user intentionally delegates
-        # both layout and text to PaddleOCR-VL.
+        # Avoid loading a heavy VLM or out-of-process worker twice when the user
+        # intentionally delegates both layout and text to one backend.
         if layout_name == "paddle-vl" and text_name == "paddle-vl":
             from .paddle import PaddleOCRVLEngine
 
             _engine = PaddleOCRVLEngine(model_dir, device, runtime)
+        elif layout_name == "deim-oop" and text_name == "deim-oop":
+            from .oop import OutOfProcessEngine
+
+            _engine = OutOfProcessEngine(device="cpu" if device == "auto" else device)
         else:
             _engine = CompositeOCREngine(
                 text_engine=_build_text_engine(text_name, model_dir, device,
@@ -97,6 +101,7 @@ def resolve_engine_selection(
         "pp-structure": ("pp-structurev3", "none"),
         "paddle-vl": ("paddle-vl", "paddle-vl"),
         "paddleocr-vl": ("paddle-vl", "paddle-vl"),
+        "deim-oop": ("deim-oop", "deim-oop"),
         "none": ("none", "none"),
     }
     base_layout, base_text = legacy_map.get(legacy, (legacy, legacy))
@@ -140,6 +145,10 @@ def _build_text_engine(
         from .paddle import PaddleOCRVLEngine
 
         return PaddleOCRVLEngine(model_dir, device, runtime)
+    if name == "deim-oop":
+        from .oop import OutOfProcessEngine
+
+        return OutOfProcessEngine(device="cpu" if device == "auto" else device)
     raise ValueError(f"unknown text engine: {name}")
 
 
@@ -170,4 +179,8 @@ def _build_layout_engine(
         from .paddle import PaddleOCRVLEngine
 
         return PaddleOCRVLEngine(model_dir, device, runtime)
+    if name == "deim-oop":
+        from .oop import OutOfProcessEngine
+
+        return OutOfProcessEngine(device="cpu" if device == "auto" else device)
     raise ValueError(f"unknown layout engine: {name}")
