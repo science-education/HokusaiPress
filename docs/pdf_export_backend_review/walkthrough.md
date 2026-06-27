@@ -8,15 +8,14 @@
 - **対象ファイル**: [__init__.py](file:///C:/Users/user/dev/HokusaiPress/src/hokusai_press/pdf_export/__init__.py)
 - **修正内容**:
   - `decide_page_mode` と `build_text_overlay` は `auto` の時に常に `internal` を選択します。
-  - `encode_page_pdf` と `SearchablePdfBuilder` は `auto` の時に `internal` を優先して選択しますが、もし `compress='jbig2'` が要求され、且つ `pyjbig2` パッケージが利用できない（`ImportError`）場合のみ、`hybrid_ocr` にルーティングします。
+  - `encode_page_pdf` と `SearchablePdfBuilder` は `auto` の時に常に `internal` を選択します。`compress='jbig2'` で `pyjbig2` がない場合は、同じ依存を使う `hybrid_ocr` へ無意味にフォールバックせず、`UnsupportedCodecError` を返します。
   - インポート時に `AttributeError` が発生した場合も `BackendUnavailableError` を適切に発生させるようにしました。
 
-### 1.2 Linux (Ubuntu CI) 等での日本語フォント探索のポータビリティ向上
+### 1.2 日本語フォントの自己完結化
 - **対象ファイル**: [backend.py](file:///C:/Users/user/dev/HokusaiPress/src/hokusai_press/pdf_export/backend.py) の `discover_font`
 - **修正内容**:
-  - `sys_fonts` の代わりに Windows/Linux/macOS の日本語フォント候補を網羅する `candidates` リストを用意しました。
-  - Linux 用に `fonts-ipafont` (`ipag.ttf`/`ipam.ttf`) や `fonts-noto-cjk` などの一般的なオープンソースフォントパスを追加。
-  - これにより、ライセンス面で問題のある Windows 用フォントを CI 環境に持ち込むことなく、Ubuntu CI 上で安全に自動検出できるようになりました。
+  - 公式Google Fonts版の未改変 `NotoSansJP[wght].ttf` とSIL OFL 1.1をパッケージ資源として同梱しました。
+  - `importlib.resources` で参照するため、OSやOCR extraに依存せず、通常インストールとwheelの双方で同じフォントを利用できます。
 
 ### 1.3 `tests/test_mrc.py` の `hybrid_ocr` 依存の排除
 - **対象ファイル**: [test_mrc.py](file:///C:/Users/user/dev/HokusaiPress/tests/test_mrc.py)

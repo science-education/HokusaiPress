@@ -20,9 +20,9 @@
 - **フォント自動検出ロジック**:
   - 全ページに非空テキストがない場合は、フォントの検出・登録を一切行わずに空白のオーバーレイページを生成します。これにより、画像のみ/OCRなしPDF生成時には日本語フォントが不要となります。
   - テキストが存在する場合は、明示的に `font_path` が指定された場合はそれを使用。
-  - 未指定の場合、以下の候補パスを順に探索：
-    1. `hybrid_ocr` パッケージがインストールされている場合、そのリソースディレクトリ (`hybrid_ocr/resource/MPLUS1p-Medium.ttf`)
-    2. OSのシステムフォントディレクトリ (Windows: `%WINDIR%\Fonts\msgothic.ttc`, `msmincho.ttc` 等)
+  - 未指定の場合、公式Google Fonts版 `NotoSansJP[wght].ttf` をパッケージ資源から使用します。
+  - フォントは未改変のままSIL Open Font License 1.1で同梱し、`resources/OFL.txt` にライセンス全文を収録します。
+  - 旧インストールとの互換用に、`hybrid_ocr`同梱フォントとOSフォントも後段の候補として探索します。
   - 適切な日本語フォントが見つからない場合は、明確な `MissingFontError` を発生させます。
 - **縦書き・横書きのテキスト配置 (`build_text_overlay`)**:
   - reportlab を使用し、既存の配置ロジック（`direction=v` 時の1文字ずつの -90 度回転と y-up 座標系での配置）を完全に再現します。

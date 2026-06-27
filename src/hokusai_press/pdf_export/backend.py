@@ -1,5 +1,6 @@
 import logging
 import os
+from importlib import resources
 import cv2
 import numpy as np
 from PIL import Image
@@ -246,7 +247,17 @@ def discover_font(font_path: str | None = None) -> str:
             return font_path
         raise MissingFontError(f"Specified font path does not exist: {font_path}")
 
-    # 1. Check hybrid_ocr package resource
+    # 1. The official, unmodified Google Fonts Noto Sans JP distribution is
+    # bundled under SIL OFL 1.1.  Keeping the default inside this package makes
+    # searchable Japanese PDFs deterministic and independent of OCR extras or
+    # host OS fonts.  See resources/OFL.txt.
+    bundled = resources.files(__package__).joinpath(
+        "resources", "NotoSansJP[wght].ttf"
+    )
+    if bundled.is_file():
+        return os.fspath(bundled)
+
+    # 2. Compatibility fallback for installations built without package data.
     try:
         import hybrid_ocr
         hybrid_ocr_dir = os.path.dirname(hybrid_ocr.__file__)
@@ -256,7 +267,7 @@ def discover_font(font_path: str | None = None) -> str:
     except ImportError:
         pass
 
-    # 2. Check System Fonts (Windows, Linux, macOS)
+    # 3. Check System Fonts (Windows, Linux, macOS)
     candidates = []
 
     # Windows Fonts
@@ -293,7 +304,7 @@ def discover_font(font_path: str | None = None) -> str:
         if os.path.exists(fp):
             return fp
 
-    # 3. Last fallback: check a few other common locations or generic names in current workdir
+    # 4. Last fallback: check a few common names in the current directory.
     generic_paths = [
         "MPLUS1p-Medium.ttf",
         "msgothic.ttc",
@@ -347,7 +358,7 @@ def build_text_overlay(pages: list, font_path: str | None = None) -> bytes:
         return packet.getvalue()
 
     font_file = discover_font(font_path)
-    font_name = "MPLUS1p-Medium"
+    font_name = "NotoSansJP"
 
     if font_name not in pdfmetrics.getRegisteredFontNames():
         pdfmetrics.registerFont(TTFont(font_name, font_file))

@@ -1,5 +1,7 @@
 import sys
 from io import BytesIO
+from importlib import resources
+from pathlib import Path
 from unittest.mock import patch
 
 import cv2
@@ -171,11 +173,11 @@ def test_text_overlay_horizontal_and_vertical():
             content_bytes = contents_obj.read_bytes()
         content_str = content_bytes.decode("utf-8", errors="ignore")
 
-        # MPLUS1p-Medium フォントが使用されていること
+        # The bundled Noto Sans JP font is used on every platform.
         font_resources = page.Resources.Font
         has_font = False
         for font_key, font_val in font_resources.items():
-            if "MPLUS1p-Medium" in str(font_val.BaseFont):
+            if "NotoSansJP" in str(font_val.BaseFont):
                 has_font = True
                 break
         assert has_font
@@ -193,6 +195,20 @@ def test_font_discovery_missing():
     # 存在しないフォントを指定した場合に MissingFontError になるか
     with pytest.raises(MissingFontError):
         discover_font("C:\\path\\to\\nonexistent\\font.ttf")
+
+
+def test_bundled_noto_font_and_license_are_available():
+    font = Path(discover_font())
+    assert font.name == "NotoSansJP[wght].ttf"
+    assert font.stat().st_size > 9_000_000
+
+    license_file = resources.files("hokusai_press.pdf_export").joinpath(
+        "resources", "OFL.txt"
+    )
+    assert license_file.is_file()
+    assert "SIL OPEN FONT LICENSE Version 1.1" in license_file.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_searchable_pdf_builder_internal():

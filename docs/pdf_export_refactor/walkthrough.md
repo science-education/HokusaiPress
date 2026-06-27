@@ -14,7 +14,7 @@
     - `gray`/`color` モードにおいて、OpenCV で JPEG エンコードし、`pikepdf.Stream` (`/DCTDecode` フィルタ) に格納するロジックを実装。
   - `build_text_overlay`:
     - 全ページに非空テキストがない場合は、日本語フォントの検出や登録を行わず、空白のオーバーレイページを生成するロジックを実装。
-    - テキストが存在する場合は、日本語フォントの自動検出 (Discovery) ロジックを実行（OS フォントディレクトリや `hybrid_ocr` のリソースから探索）。
+    - テキストが存在する場合は、同梱した公式Google Fonts版 Noto Sans JPを使用。未改変フォントとSIL OFL 1.1全文をwheelに収録。
     - reportlab を使用して、縦書き (`direction=v` 時の一文字ごとの -90 度回転配置) および横書きテキストの重ね合わせを再現。
   - `_encode_gray_flate_page_pdf`:
     - `mrc.py` から既存の Flate エンコーダを移動し、再利用可能に。
