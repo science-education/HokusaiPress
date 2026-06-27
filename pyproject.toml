@@ -21,7 +21,9 @@ dependencies = [
 [project.optional-dependencies]
 # OCR + searchable-PDF assembly engine (detector is CC BY-NC-SA 4.0 -> output
 # is non-commercial; see README).
-ocr = ["hybrid-ocr[pdf]"]
+ocr = ["hybrid-ocr[pdf] @ git+https://github.com/science-education/Yomitoku_NDL-OCR-Lite.git"]
+# Complete Mac setup: hybrid-ocr + PyTorch for MPS (GPU) acceleration
+mac-ocr = ["hybrid-ocr[pdf] @ git+https://github.com/science-education/Yomitoku_NDL-OCR-Lite.git", "torch", "torchvision"]
 # PaddleOCR engines are optional because their runtime and accelerator wheels
 # vary by hardware. PaddleOCR-VL needs the doc-parser extra.
 paddle = ["paddleocr>=3.7.0", "paddlex[ocr]>=3.7.0"]

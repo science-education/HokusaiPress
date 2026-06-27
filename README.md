@@ -34,9 +34,12 @@
 
 ```bash
 pip install -e .[ocr,web]
+# Mac（Apple Silicon）で NDL-OCR/Yomitoku と GPU (MPS) 高速化を利用する場合
+pip install -e ".[mac-ocr,web]"
 # JBIG2を使う場合（既定のG4だけなら不要）
 pip install -e .[ocr,web,jbig2]
-hokusai-press run scan.pdf --out book.pdf --device npu      # バッチ解析+生成
+hokusai-press run scan.pdf --out book.pdf --device npu      # バッチ解析+生成 (Intel NPU)
+hokusai-press run scan.pdf --out book.pdf --device mps      # バッチ解析+生成 (Mac GPU 高速化)
 hokusai-press run scan.pdf --out book.pdf --layout-engine none --text-engine ppocr-v6 --runtime onnxruntime --device npu
 hokusai-press run scan.pdf --out book.pdf --layout-engine paddle-vl --text-engine ppocr-v6 --device npu
 hokusai-press queue                                          # 要レビュー一覧
