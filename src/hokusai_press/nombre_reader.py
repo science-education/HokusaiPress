@@ -254,15 +254,18 @@ def _crop_with_padding(img: np.ndarray, box: Box, page_w, page_h) -> np.ndarray:
 
 
 def _default_model_path() -> Path:
+    """The shipped digit recognizer, bundled in-package (small, in-house
+    trained -- no third-party model license applies, unlike the OCR engine
+    models in models/, which stay external/gitignored for that reason).
+
+    HOKUSAI_FOLIO_DIGIT_ONNX overrides this with a path to an alternate
+    checkpoint (e.g. one of the training run's other variants) for local
+    experiments, without needing to touch this default.
+    """
     env = os.environ.get("HOKUSAI_FOLIO_DIGIT_ONNX")
     if env:
         return Path(env)
-    root = Path(r"C:\tmp\tmp0613\bench\digit")
-    bin_model = root / "folio_digit_bin.onnx"
-    if bin_model.exists():
-        return bin_model
-    ft = root / "folio_digit_ft.onnx"
-    return ft if ft.exists() else root / "folio_digit.onnx"
+    return Path(__file__).parent / "data" / "folio_digit.onnx"
 
 
 class _Recognizer:
