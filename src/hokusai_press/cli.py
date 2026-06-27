@@ -77,8 +77,13 @@ def _run_one(payload: dict) -> dict:
     summary = run(
         payload["src"], payload["out"], db_path=payload["db"],
         model_dir=payload["model_dir"], device=payload["device"],
-        use_ocr=payload["use_ocr"], learned_model_path=payload["learned_model"],
-        openvino_cache_dir=payload["cache"], pages=payload["pages"],
+        ocr_engine=payload["ocr_engine"],
+        layout_engine=payload["layout_engine"],
+        text_engine=payload["text_engine"],
+        use_ocr=payload["use_ocr"],
+        learned_model_path=payload["learned_model"],
+        openvino_cache_dir=payload["cache"],
+        runtime=payload["runtime"], pages=payload["pages"],
     )
     summary["tpb"] = time.perf_counter() - t0
     return summary
@@ -143,8 +148,34 @@ def main(argv=None) -> int:
                        help="output PDF path, or a folder (saves <source>.pdf)")
     p_run.add_argument("--db", default="hokusai.db", help="job/decision SQLite db")
     p_run.add_argument("--model-dir", default="models", help="hybrid-ocr model dir")
+    p_run.add_argument("--ocr-engine", default="hybrid",
+                       choices=["auto", "hybrid", "yomitoku", "ndlocr",
+                                "ppocr-v6", "paddleocr-v6",
+                                "pp-structurev3", "pp-structure",
+                                "paddle-vl", "paddleocr-vl", "none"],
+                       help="legacy combined engine selector. Prefer "
+                            "--layout-engine and --text-engine for new runs")
+    p_run.add_argument("--layout-engine", default=None,
+                       choices=["none", "yomitoku", "pp-structurev3",
+                                "pp-structure", "paddle-vl", "paddleocr-vl"],
+                       help="layout engine: Yomitoku RT-DETR, PP-StructureV3, "
+                            "PaddleOCR-VL, or none")
+    p_run.add_argument("--text-engine", default=None,
+                       choices=["none", "ndlocr", "ppocr-v6", "paddleocr-v6",
+                                "paddle-vl", "paddleocr-vl"],
+                       help="text OCR engine: NDL-OCR/hybrid, PP-OCRv6, "
+                            "PaddleOCR-VL, or none")
     p_run.add_argument("--device", default="auto",
-                       help="OCR device: auto|cpu|npu|cuda|dml|qnn")
+                       help="OCR device. hybrid: auto|cpu|npu|cuda|dml|qnn; "
+                            "Paddle: cpu|gpu|npu[:0]|xpu[:0]|... as supported "
+                            "by the installed Paddle runtime")
+    p_run.add_argument("--runtime", default=None,
+                       choices=["auto", "openvino", "onnxruntime", "paddle",
+                                "transformers"],
+                       help="runtime/backend for selected engines")
+    p_run.add_argument("--paddle-engine", default=None,
+                       choices=["paddle", "transformers", "onnxruntime"],
+                       help="deprecated alias for --runtime")
     p_run.add_argument("--no-ocr", action="store_true",
                        help="skip OCR (geometry + heuristic separation only)")
     p_run.add_argument("--learned-model", default=None,
@@ -239,8 +270,13 @@ def main(argv=None) -> int:
             return {
                 "src": src, "out": _resolve_out(args.out, src), "db": db,
                 "model_dir": args.model_dir, "device": args.device,
+                "ocr_engine": args.ocr_engine,
+                "layout_engine": args.layout_engine,
+                "text_engine": args.text_engine,
                 "use_ocr": not args.no_ocr, "learned_model": args.learned_model,
-                "cache": args.openvino_cache_dir, "pages": pages_sel,
+                "cache": args.openvino_cache_dir,
+                "runtime": args.runtime or args.paddle_engine or "paddle",
+                "pages": pages_sel,
             }
 
         flagged_docs = 0

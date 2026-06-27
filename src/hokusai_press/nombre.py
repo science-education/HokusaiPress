@@ -24,6 +24,7 @@ Runs only when OCR produced text; with --no-ocr the geometric box stands.
 
 from __future__ import annotations
 
+import os
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -47,6 +48,10 @@ POS_DOM_FRAC = 0.3        # a cluster is "primary" only if it reaches this fract
                          # minority misread offset within a kind is rejected, while
                          # a legitimate secondary system like roman front matter,
                          # which is dominant within its own kind, is kept)
+POS_CLUSTER_X = 0.055     # pre-vote page-crossing position cluster windows
+POS_CLUSTER_Y = 0.030
+POS_CLUSTER_MIN_SUPPORT = 3
+POS_CLUSTER_MIN_OFFSET_SUPPORT = 2
 
 _KANJI_DIGIT = {"〇": 0, "零": 0, "一": 1, "二": 2, "三": 3, "四": 4,
                 "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
@@ -155,6 +160,13 @@ def _candidates(params: PageParams, page_h: float):
     interfere.
     """
     out = []
+    for item in getattr(params, "_nombre_candidates", []) or []:
+        try:
+            band, kind, value, region = item
+        except ValueError:
+            continue
+        if value is not None and value > 0:
+            out.append((band, kind, value, region))
     for r in params.regions:
         if not r.ocr_text:
             continue
@@ -174,6 +186,87 @@ def _candidates(params: PageParams, page_h: float):
             out.append((b, "num", v, Region(kind=r.kind, box=sub,
                                             ocr_text=str(v), source=r.source)))
     return out
+
+
+def _cluster_x(fx: float) -> float:
+    """Parity-tolerant x coordinate: outside corners mirror to one position."""
+    return min(fx, 1.0 - fx)
+
+
+def _cluster_feature(box: Box, page_w: float, page_h: float) -> tuple[float, float]:
+    fx, fy = _box_center_frac(box, page_w, page_h)
+    return _cluster_x(fx), fy
+
+
+def _position_clustered_candidates(cands, pages, page_heights, page_widths, max_v):
+    """Prefer candidates from the strongest cross-page position+offset cluster.
+
+    The historical resolver first voted by number offset and only then learned a
+    position model.  When body fragments intrude into the nombre band, that order
+    can let repeated non-footer fragments dominate.  This lightweight pre-pass
+    groups candidates by mirrored x/y position, then scores each position by its
+    slope-1 offset support.  If no stable position exists, callers keep the old
+    candidate set unchanged.
+    """
+    clusters: list[dict] = []
+    for i, cl in enumerate(cands):
+        for cand_i, (band, kind, v, r) in enumerate(cl):
+            if v > max_v:
+                continue
+            x, y = _cluster_feature(r.box, page_widths[i], page_heights[i])
+            best = None
+            best_d = None
+            for c in clusters:
+                if c["band"] != band:
+                    continue
+                dx = abs(x - c["mx"])
+                dy = abs(y - c["my"])
+                if dx <= POS_CLUSTER_X and dy <= POS_CLUSTER_Y:
+                    d = dx / POS_CLUSTER_X + dy / POS_CLUSTER_Y
+                    if best is None or d < best_d:
+                        best, best_d = c, d
+            if best is None:
+                best = {"band": band, "items": [], "mx": x, "my": y}
+                clusters.append(best)
+            best["items"].append((i, cand_i, kind, v, x, y))
+            n = len(best["items"])
+            best["mx"] += (x - best["mx"]) / n
+            best["my"] += (y - best["my"]) / n
+
+    best_cluster = None
+    best_score = 0.0
+    for c in clusters:
+        pages_seen = {i for i, *_ in c["items"]}
+        if len(pages_seen) < POS_CLUSTER_MIN_SUPPORT:
+            continue
+        vote_pages: dict[tuple[str, int], set[int]] = {}
+        for i, _, kind, v, _, _ in c["items"]:
+            vote_pages.setdefault((kind, v - i), set()).add(i)
+        support = max((len(s) for s in vote_pages.values()), default=0)
+        if support < POS_CLUSTER_MIN_OFFSET_SUPPORT:
+            continue
+        xs = [x for *_, x, _ in c["items"]]
+        ys = [y for *_, y in c["items"]]
+        spread = (max(xs) - min(xs) if xs else 1.0) + (max(ys) - min(ys) if ys else 1.0)
+        score = support * 4.0 + len(pages_seen) - spread * 20.0
+        if score > best_score:
+            best_cluster, best_score = c, score
+
+    if best_cluster is None:
+        return None
+
+    selected = [set() for _ in cands]
+    best_pages = {i for i, *_ in best_cluster["items"]}
+    for i, cand_i, *_ in best_cluster["items"]:
+        selected[i].add(cand_i)
+
+    analysis = []
+    assignment = []
+    for i, cl in enumerate(cands):
+        picked = [cand for j, cand in enumerate(cl) if j in selected[i]]
+        analysis.append(picked)
+        assignment.append(picked if picked else cl)
+    return analysis, assignment, len(best_pages)
 
 
 @dataclass
@@ -201,7 +294,27 @@ def resolve(
 
     Mutates each page's margin.nombre_box / page_number / nombre_text / flags.
     """
-    cands = [_candidates(p, h) for p, h in zip(pages, page_heights)]
+    raw_cands = [_candidates(p, h) for p, h in zip(pages, page_heights)]
+    max_v = len(pages) + 50
+    # Position clustering rejects body-text fragments but currently interacts with
+    # the position model so the "missing pages" gap warning can be lost. Keep it
+    # opt-in until that is made gap-warning-safe (default OFF = proven behavior).
+    if os.environ.get("HOKUSAI_NOMBRE_POSITION_CLUSTER") == "1":
+        clustered = _position_clustered_candidates(
+            raw_cands, pages, page_heights, page_widths, max_v)
+    else:
+        clustered = None
+    if clustered is None:
+        cands = raw_cands
+        assign_cands = raw_cands
+        min_support = MIN_SUPPORT
+        min_anchors = POS_MIN_ANCHORS
+        strict_short_cluster = False
+    else:
+        cands, assign_cands, _cluster_pages = clustered
+        min_support = MIN_SUPPORT
+        strict_short_cluster = False
+        min_anchors = POS_MIN_ANCHORS
 
     # choose the band (top/bottom) that carries numbers on the most pages
     pages_with = {"top": set(), "bottom": set()}
@@ -214,37 +327,43 @@ def resolve(
         return []
 
     # vote for (kind, offset) with slope 1; a real run clusters, noise scatters
-    max_v = len(pages) + 50
     votes: Counter = Counter()
     for i, cl in enumerate(cands):
         for b, kind, v, _ in cl:
             if b == band and v <= max_v:
                 votes[(kind, v - i)] += 1
-    supported = {k for k, c in votes.items() if c >= MIN_SUPPORT}
+    supported = {k for k, c in votes.items() if c >= min_support}
+    if not supported and clustered is not None:
+        min_support = POS_CLUSTER_MIN_OFFSET_SUPPORT
+        supported = {k for k, c in votes.items() if c >= min_support}
     if not supported:
         return []
 
-    dominant = max(supported, key=lambda k: votes[k])
+    dominant = max(supported, key=lambda k: (votes[k], -abs(k[1])))
+    if clustered is not None and votes[dominant] < POS_MIN_ANCHORS:
+        strict_short_cluster = True
+        min_anchors = POS_CLUSTER_MIN_OFFSET_SUPPORT
 
     # Assign once by the historical vote-only method. If the position model is
     # under-supported or unstable, these assignments are the fallback behavior.
     fallback_warnings = _assign_supported(
-        pages, cands, band, votes, supported, max_v)
+        pages, assign_cands, band, votes, supported, max_v)
 
     anchors = []
-    for i, cl in enumerate(cands):
+    for i, cl in enumerate(assign_cands):
         for b, kind, v, r in cl:
             if b != band or v > max_v or (kind, v - i) != dominant:
                 continue
             fx, fy = _box_center_frac(r.box, page_widths[i], page_heights[i])
             anchors.append((pages[i].source.page_index, fx, fy))
             break
-    model = _build_position_model(anchors)
+    model = _build_position_model(anchors, min_anchors)
     if model is None:
         return fallback_warnings
 
     return _assign_with_position_model(
-        pages, cands, page_heights, page_widths, band, votes, max_v, model)
+        pages, assign_cands, page_heights, page_widths, band, votes, max_v,
+        model, min_support, strict_short_cluster)
 
 
 def _assign_supported(pages, cands, band, votes, supported, max_v) -> list[str]:
@@ -310,21 +429,22 @@ def _too_broad(stats) -> bool:
 
 def _build_position_model(
     anchors: list[tuple[int, float, float]],
+    min_anchors: int = POS_MIN_ANCHORS,
 ) -> Optional[_PositionModel]:
-    if len(anchors) < POS_MIN_ANCHORS:
+    if len(anchors) < min_anchors:
         return None
 
     by_parity = {
         0: [(fx, fy) for idx, fx, fy in anchors if idx % 2 == 0],
         1: [(fx, fy) for idx, fx, fy in anchors if idx % 2 == 1],
     }
-    use_merged = any(len(points) < POS_MIN_ANCHORS
+    use_merged = any(len(points) < min_anchors
                      for points in by_parity.values())
 
     if use_merged:
         all_points = [(fx, fy) for _, fx, fy in anchors]
         st = _stats_after_rejection(all_points)
-        if st is None or st.n < POS_MIN_ANCHORS or _too_broad(st):
+        if st is None or st.n < min_anchors or _too_broad(st):
             return None
         return _PositionModel(
             x_mode="pooled",
@@ -336,7 +456,7 @@ def _build_position_model(
     filtered_by_parity = {}
     for parity, points in by_parity.items():
         st = _stats_after_rejection(points)
-        if st is None or st.n < POS_MIN_ANCHORS:
+        if st is None or st.n < min_anchors:
             return None
         y_stats[parity] = st
         filtered_by_parity[parity] = [
@@ -353,7 +473,7 @@ def _build_position_model(
         x_mode = "pooled"
         pooled = [p for points in filtered_by_parity.values() for p in points]
         pooled_stats = _stats_after_rejection(pooled)
-        if (pooled_stats is None or pooled_stats.n < POS_MIN_ANCHORS
+        if (pooled_stats is None or pooled_stats.n < min_anchors
                 or _too_broad(pooled_stats)):
             return None
         x_stats = pooled_stats
@@ -375,7 +495,7 @@ def _inside_position_model(
             and abs(fy - y_stats.my) <= max(POS_K * y_stats.sy, POS_FLOOR_Y))
 
 
-def _primary_clusters(votes: Counter) -> set:
+def _primary_clusters(votes: Counter, min_support: int = MIN_SUPPORT) -> set:
     """(kind, offset) clusters that are dominant *within their own numbering
     system*. A kind's strongest offset sets the bar; an offset reaching
     POS_DOM_FRAC of it is primary. This keeps a legitimate secondary system
@@ -387,7 +507,7 @@ def _primary_clusters(votes: Counter) -> set:
         kind_top[kind] = max(kind_top.get(kind, 0), c)
     return {
         (kind, off) for (kind, off), c in votes.items()
-        if c >= max(MIN_SUPPORT, POS_DOM_FRAC * kind_top[kind])
+        if c >= max(min_support, POS_DOM_FRAC * kind_top[kind])
     }
 
 
@@ -411,6 +531,7 @@ def _in_position_candidate(p, cl, i, band, max_v, page_heights, page_widths,
 
 def _assign_with_position_model(
     pages, cands, page_heights, page_widths, band, votes, max_v, model,
+    min_support=MIN_SUPPORT, strict_dominant=False,
 ) -> list[str]:
     # Position is the gate (kind-agnostic). Pass 1: among in-position candidates
     # keep only those whose (kind, offset) is primary, and trust their own value
@@ -418,10 +539,12 @@ def _assign_with_position_model(
     # never hidden. Pass 2: a page with no primary candidate but an in-position
     # candidate of the dominant kind, bracketed on both sides by the dominant
     # run, is an OCR misread -> recover it as index+dominant_offset.
-    primary = _primary_clusters(votes)
-    dom_kind, dom_offset = max(votes, key=lambda k: votes[k])
+    primary = _primary_clusters(votes, min_support)
+    dom_kind, dom_offset = max(votes, key=lambda k: (votes[k], -abs(k[1])))
     chosen: list = [None] * len(pages)
     dom_idx: list[int] = []
+    if strict_dominant:
+        primary = {(dom_kind, dom_offset)}
 
     for i, (p, cl) in enumerate(zip(pages, cands)):
         in_model = []
@@ -453,7 +576,12 @@ def _assign_with_position_model(
             seen = True
 
     for i, (p, cl) in enumerate(zip(pages, cands)):
-        if chosen[i] is not None or not (has_before[i] and has_after[i]):
+        near_short_cluster = (
+            strict_dominant and (has_before[i] or has_after[i])
+            and dom_idx and min(dom_idx) - 1 <= i <= max(dom_idx) + 1
+        )
+        if (chosen[i] is not None
+                or not ((has_before[i] and has_after[i]) or near_short_cluster)):
             continue
         cand = _in_position_candidate(
             p, cl, i, band, max_v, page_heights, page_widths, model,

@@ -148,6 +148,7 @@ class Region:
     # picture inside an otherwise bilevel ("bw") page is handled — the page
     # stays bw and just this region renders as a gray JPEG overlay.
     tone: Optional[str] = None       # None (auto) | "gray" | "color"
+    layout_label: Optional[str] = None  # canonical layout hint from DEIM/OOP
 
 
 @dataclass
@@ -239,6 +240,7 @@ def _decode_region(d) -> Region:
         ocr_text=d.get("ocr_text"),
         ocr_conf=d.get("ocr_conf"),
         tone=d.get("tone"),
+        layout_label=d.get("layout_label"),
     )
 
 

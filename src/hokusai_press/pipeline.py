@@ -116,13 +116,16 @@ def _finish_page(args, sk, ocr_up) -> tuple[PageParams, np.ndarray, Margin]:
     inside content_mod.analyze is the one step that must never overlap
     another in-flight call on an NPU-class device (concurrent NPU inference
     requests crash the Intel NPU driver -- see analyze_document)."""
-    (source, original, ocr_img, dpi, reoriented, model_dir, device, use_ocr,
-     layout_provider, openvino_cache_dir) = args
+    (source, original, ocr_img, dpi, reoriented, model_dir, device,
+     ocr_engine, layout_engine, text_engine, use_ocr, layout_provider,
+     openvino_cache_dir, runtime) = args
 
     regions, cflags = content_mod.analyze(
         original, ocr_up, source, model_dir=model_dir,
-        device=device, use_ocr=use_ocr, layout_provider=layout_provider,
-        openvino_cache_dir=openvino_cache_dir,
+        device=device, ocr_engine=ocr_engine, layout_engine=layout_engine,
+        text_engine=text_engine, use_ocr=use_ocr,
+        layout_provider=layout_provider,
+        openvino_cache_dir=openvino_cache_dir, runtime=runtime,
     )
 
     original, mg = compute_margin(original, sk, regions)
@@ -191,10 +194,14 @@ def analyze_document(
     path: str,
     model_dir: str = "models",
     device: str = "auto",
+    ocr_engine: str = "hybrid",
+    layout_engine: str | None = None,
+    text_engine: str | None = None,
     use_ocr: bool = True,
     learned_model: Optional[dict] = None,
     layout_provider=None,
     openvino_cache_dir: Optional[str] = None,
+    runtime: str | None = "paddle",
     pages: "set[int] | None" = None,
     max_workers: int = 4,
 ) -> AnalyzeResult:
@@ -276,7 +283,8 @@ def analyze_document(
     t = perf_counter()
     worker_args = [
         (source, original, ocr_img, dpi, reoriented, model_dir, device,
-         use_ocr, layout_provider, openvino_cache_dir)
+         ocr_engine, layout_engine, text_engine, use_ocr, layout_provider,
+         openvino_cache_dir, runtime)
         for source, original, ocr_img, dpi in loaded
     ]
     if is_npu and len(worker_args) > 1:
@@ -308,10 +316,36 @@ def analyze_document(
     # consistent band), so normalization anchors correctly and missing pages
     # can be detected. Runs before align/normalize so the better nombre feeds them.
     from . import nombre as nombre_mod
+    from . import nombre_reader as nombre_reader_mod
+    from .model import Region, RegionKind
 
     t = perf_counter()
     heights = [o.shape[0] for o in originals]
     widths = [o.shape[1] for o in originals]
+    if os.environ.get("HOKUSAI_DISABLE_NOMBRE_READER") != "1":
+        for params, original, h, w in zip(doc.pages, originals, heights, widths):
+            if not params.margin or not params.margin.content:
+                continue
+            deskewed = _apply_deskew(original, params.deskew.angle_deg)
+            extra = [
+                r.box for r in params.regions
+                if getattr(r, "layout_label", None) == "page_number"
+            ]
+            try:
+                rcands = nombre_reader_mod.read_folio_candidates(
+                    deskewed, params.margin.content, h, w, extra_boxes=extra)
+            except Exception:
+                rcands = []
+            params._nombre_candidates = [
+                (
+                    c.band,
+                    c.kind,
+                    c.value,
+                    Region(kind=RegionKind.TEXT, box=c.box, source="nombre_reader",
+                           ocr_text=c.text, ocr_conf=c.conf),
+                )
+                for c in rcands
+            ]
     warnings = nombre_mod.resolve(doc.pages, heights, widths)
 
     # 6. cross-page margin consistency + nombre-anchored normalization.
@@ -362,9 +396,13 @@ def run(
     db_path: str = "hokusai.db",
     model_dir: str = "models",
     device: str = "auto",
+    ocr_engine: str = "hybrid",
+    layout_engine: str | None = None,
+    text_engine: str | None = None,
     use_ocr: bool = True,
     learned_model_path: Optional[str] = None,
     openvino_cache_dir: Optional[str] = None,
+    runtime: str | None = "paddle",
     pages: "set[int] | None" = None,
 ) -> dict:
     """Full batch run: analyze, persist params, render the PDF."""
@@ -373,8 +411,13 @@ def run(
 
     learned = learn.load(learned_model_path) if learned_model_path else None
     result = analyze_document(path, model_dir=model_dir, device=device,
-                              use_ocr=use_ocr, learned_model=learned,
-                              openvino_cache_dir=openvino_cache_dir, pages=pages)
+                              ocr_engine=ocr_engine,
+                              layout_engine=layout_engine,
+                              text_engine=text_engine,
+                              use_ocr=use_ocr,
+                              learned_model=learned,
+                              openvino_cache_dir=openvino_cache_dir,
+                              runtime=runtime, pages=pages)
     doc_id = os.path.basename(path)
     t = perf_counter()
     store = Store(db_path)
