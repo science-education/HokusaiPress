@@ -515,6 +515,58 @@ def _detect_nombre(binary: np.ndarray, content: Box) -> Box | None:
     return best[1] if best else None
 
 
+MARGINAL_SPAN_GAP_FRAC = 0.02   # text spans this far apart (frac of content
+#                                 width) are separate blocks, not one block
+MARGINAL_SPAN_FRAC = 0.25       # a span narrower than this (frac of content
+#                                 width) sitting apart from a dominant body
+#                                 block is furniture (running head/柱, nombre)
+DOMINANT_SPAN_FRAC = 0.50       # ... but only strip furniture when ONE span is
+#                                 at least this wide (a real horizontal body
+#                                 block); tategaki column pages have no such
+#                                 dominant span and keep their whole content box
+
+
+def body_text_box(params) -> "Box | None":
+    """The main text block, EXCLUDING marginal furniture (a running head / 柱
+    hugging the fore-edge, the page number) that sits apart from the body in
+    the margin. Used for centering + format sizing so a fore-edge 柱 doesn't
+    drag the whole block off-centre (real-corpus issue: img20260430_0002).
+
+    Found from the horizontal spans of the text regions: merge regions into
+    x-spans; if ONE span dominates the content width (a horizontal body block,
+    yokogaki), keep the wide spans and drop the narrow separated ones (柱 /
+    nombre); otherwise (no dominant span -- e.g. tategaki columns, or a
+    figure page) fall back to the full content box, so nothing is wrongly
+    stripped. The body's y-extent comes from the kept regions too."""
+    content = params.margin.content if params.margin else None
+    if content is None:
+        return None
+    regions = [r for r in (params.regions or []) if r.kind == RegionKind.TEXT]
+    if not regions or content.width <= 0:
+        return content
+    ivs = sorted((r.box.x0, r.box.x1) for r in regions)
+    gap = MARGINAL_SPAN_GAP_FRAC * content.width
+    merged: list[list[float]] = []
+    for a, b in ivs:
+        if merged and a <= merged[-1][1] + gap:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    if max(b - a for a, b in merged) < DOMINANT_SPAN_FRAC * content.width:
+        return content                       # no dominant block -> keep all
+    keep = [(a, b) for a, b in merged
+            if (b - a) >= MARGINAL_SPAN_FRAC * content.width]
+    if not keep:
+        return content
+    x0 = min(a for a, _ in keep)
+    x1 = max(b for _, b in keep)
+    ys = [(r.box.y0, r.box.y1) for r in regions
+          if any(a - 1 <= (r.box.x0 + r.box.x1) / 2 <= b + 1 for a, b in keep)]
+    if not ys:
+        return content
+    return Box(x0, min(y for y, _ in ys), x1, max(y for _, y in ys))
+
+
 def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     """Uniform-size, nombre-anchored margin normalization (sets margin.crop).
 
@@ -589,131 +641,165 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     uni_w = float(np.percentile([extent(p, p.margin.content.width) for p in reliable], UNIFORM_PCT))
     uni_h = float(np.percentile([extent(p, p.margin.content.height) for p in reliable], UNIFORM_PCT))
 
-    def target_size(p):  # the FIXED uniform output size, in this page's own pixel space
+    # Per-page body box (furniture-stripped, see body_text_box) -- the thing we
+    # actually centre and size the format from, so a fore-edge 柱 can't drag
+    # the block off-centre. Cached per page id.
+    body_boxes = {id(p): body_text_box(p) for p in have}
+
+    def bbox(p):
+        return body_boxes.get(id(p)) or p.margin.content
+
+    # Robust layout statistics, measured ONLY from numbered body pages (a
+    # cover/divider's box is deliberately off-position and would pollute them;
+    # those pages instead keep the proportional baseline() path below).
+    #
+    #   M  -- ONE symmetric side margin: the average of the clean left & right
+    #         BODY margins (the 柱 is already excluded from the body box, so
+    #         BOTH sides are clean here). Centering the body in body_w + 2M
+    #         gives equal left/right margins -- the whole point, since perfect
+    #         deskew makes any L/R imbalance jump out.
+    #   a_top / a_bottom -- independent head/foot margins (this asymmetry, e.g.
+    #         running-header space, is a real design choice, kept).
+    #   d  -- how far the nombre's OUTER edge sticks out past the body's
+    #         fore-edge; lets us anchor on the crisp nombre while still landing
+    #         the body's fore margin at M.
+    default_margin_in = output_margin_mm / 25.4
+    stat_pages = [p for p in reliable if confident(p) and p.margin.page_w and p.margin.page_h]
+    body_w_vals, body_h_vals, side_margin_vals = [], [], []
+    top_vals, bottom_vals, d_vals = [], [], []
+    by_parity_nombre_x: dict[int, list[float]] = {0: [], 1: []}
+    nombre_y_fracs: list[float] = []
+    for p in stat_pages:
+        bb = bbox(p)
+        pw, ph = p.margin.page_w, p.margin.page_h
+        nb = p.margin.nombre_box
+        body_w_vals.append(extent(p, bb.width))
+        body_h_vals.append(extent(p, bb.height))
+        side_margin_vals.append(extent(p, bb.x0))           # left body margin
+        side_margin_vals.append(extent(p, pw - bb.x1))      # right body margin
+        top_vals.append(extent(p, bb.y0))
+        bottom_vals.append(extent(p, ph - bb.y1))
+        by_parity_nombre_x[p.source.page_index % 2].append((nb.x0 + nb.x1) / 2 / pw)
+        # nombre outer edge vs body fore edge (sign: outward past the body)
+        if (nb.x0 + nb.x1) / 2 > (bb.x0 + bb.x1) / 2:        # nombre on the right
+            d_vals.append(extent(p, nb.x1 - bb.x1))
+        else:                                               # nombre on the left
+            d_vals.append(extent(p, bb.x0 - nb.x0))
+        nombre_y_fracs.append(((nb.y0 + nb.y1) / 2 - bb.y0) / (bb.height or 1.0))
+
+    body_w = float(np.median(body_w_vals)) if body_w_vals else uni_w
+    body_h = float(np.median(body_h_vals)) if body_h_vals else uni_h
+    side_margin = float(np.median(side_margin_vals)) if side_margin_vals else default_margin_in
+    top_margin = float(np.median(top_vals)) if top_vals else default_margin_in
+    bottom_margin = float(np.median(bottom_vals)) if bottom_vals else default_margin_in
+    d_med = float(np.median(d_vals)) if d_vals else 0.0
+    # the nombre's own (visible) fore margin that keeps the body's fore margin
+    # at the symmetric side_margin: side_margin = nombre_fore_margin + d
+    nombre_fore_margin = side_margin - d_med
+
+    # Which side carries the nombre, per parity, IS the fore-edge (a page
+    # number is conventionally set at the fore-edge corner). A direct, reliable
+    # signal -- unlike comparing raw L/R gap magnitudes, which picks the wrong
+    # side on any page whose content detection is a little noisy on one edge.
+    nombre_side: dict[int, str] = {}
+    for parity, xs in by_parity_nombre_x.items():
+        if xs:
+            nombre_side[parity] = "right" if float(np.median(xs)) > 0.5 else "left"
+    nombre_near_bottom = (
+        float(np.median(nombre_y_fracs)) > 0.5 if nombre_y_fracs else True)
+
+    def target_size(p):  # the FIXED uniform output size, in this page's own pixels
         dpi = p.dpi if use_dpi else 1.0
-        pad = 2 * (output_margin_mm / 25.4)
-        return (uni_w + pad) * (dpi if use_dpi else 1), (uni_h + pad) * (dpi if use_dpi else 1)
+        pad_w, pad_h = 2 * side_margin, top_margin + bottom_margin
+        return (body_w + pad_w) * (dpi if use_dpi else 1), (body_h + pad_h) * (dpi if use_dpi else 1)
 
     def crop_size(p):
-        dpi = p.dpi if use_dpi else 1.0
-        pad = 2 * (output_margin_mm / 25.4)
-        # SOURCE region size: uniform, but never smaller than THIS page's own
-        # content+margin (so the source region fed to compose_transform never
-        # clips real content -- it gets shrunk to fit instead, not cropped).
-        # EXCEPT a detection-failed page (confidence < 0.2, same cutoff as
-        # `reliable` above): its "content" is the synthetic full-page
-        # fallback box, not a real extent, so flooring against it would
-        # inflate that one page's source region to the whole page for no
-        # reason. Trust the uniform size instead; there's no real detected
-        # content to risk clipping.
+        # SOURCE region size = the uniform target, but never narrower than this
+        # page's own FULL content box (柱 included), so the crop always
+        # CONTAINS the 柱 even though only the body box was centred -- the 柱
+        # rides along inside the side margin (it protrudes less than
+        # side_margin past the body, so it fits without widening the format).
+        # Only a genuine outlier whose whole content exceeds the uniform target
+        # makes crop > target; compose_transform then shrinks it to target,
+        # never clips. target_size already adds the margins, so do NOT add them
+        # again to content.width here -- doing so silently inflated the format
+        # by the 柱's width and broke the centering.
+        tw, th = target_size(p)
         if p.margin.confidence >= 0.2:
-            w_in = max(uni_w, extent(p, p.margin.content.width)) + pad
-            h_in = max(uni_h, extent(p, p.margin.content.height)) + pad
-        else:
-            w_in = uni_w + pad
-            h_in = uni_h + pad
-        cw = w_in * (dpi if use_dpi else 1)
-        ch = h_in * (dpi if use_dpi else 1)
-        return cw, ch
+            c = p.margin.content
+            fl = output_margin_mm / 25.4 * (p.dpi if use_dpi else 96)
+            return max(tw, c.width + 2 * fl), max(th, c.height + 2 * fl)
+        return tw, th
 
     def baseline(p):
-        # This page's own content, placed in the uniform crop at the SAME
-        # proportional position it had on the original page -- not dead-
-        # centered. A small, deliberately off-center block (e.g. a single
-        # right-aligned tategaki part-title sitting in the page's upper
-        # third) should land in roughly the same relative spot on the new
-        # uniform-size page; dead-centering it changes the layout's intent
-        # and, for a detection-failed page (confidence 0, content = the
-        # whole raw page), would be wrong anyway -- but there fx=fy=0.5
-        # automatically, since content already spans the full page, so this
-        # one formula covers both cases without a separate branch.
+        # ⑤/⑥ fallback for a page with no usable nombre (cover, divider, OCR
+        # miss): keep its content at the SAME proportional position it had on
+        # the original page (a deliberately off-centre part-title stays where
+        # it was); with no stored page size, dead-centre instead.
         c = p.margin.content
         cw, ch = crop_size(p)
         cx, cy = c.x0 + c.width / 2, c.y0 + c.height / 2
         if p.margin.page_w and p.margin.page_h:
             fx, fy = cx / p.margin.page_w, cy / p.margin.page_h
         else:
-            fx, fy = 0.5, 0.5   # no stored page size (older data) -- center
+            fx, fy = 0.5, 0.5
         return cx - fx * cw, cy - fy * ch
-
-    # Common nombre CORRECTION, relative to the centered baseline (not to
-    # content's edge, so the correction's mean is ~0 and doesn't drag pages
-    # off-center). Horizontal is computed PER PARITY: recto/verso legitimately
-    # place the nombre on opposite sides. Vertical is computed ACROSS BOTH
-    # PARITIES TOGETHER: a real book prints the nombre at the SAME height
-    # regardless of recto/verso -- measured on real corpus data, raw-scan
-    # nombre.y0 is ~2371 for both odd and even pages (no parity-dependent
-    # offset at all). Splitting the vertical anchor by parity (as it was
-    # first written, by analogy with the horizontal one) let the two
-    # parities' baselines drift apart and reintroduced an ~80px recto/verso
-    # height mismatch that doesn't exist in the source.
-    common_noff_x: dict[int, float] = {}
-    by_parity: dict[int, list] = {0: [], 1: []}
-    for p in have:
-        by_parity[p.source.page_index % 2].append(p)
-    for parity, group in by_parity.items():
-        offs_x = [extent(p, p.margin.nombre_box.x0 - baseline(p)[0])
-                  for p in group if confident(p)]
-        if offs_x:
-            common_noff_x[parity] = float(np.median(offs_x))
-
-    # Anchor vertically on the nombre's BOTTOM edge (y1), not its top (y0).
-    # Digits sit on a shared baseline, not a shared cap-height: a single-digit
-    # "9" and a triple-digit "126" naturally have different glyph/bbox HEIGHTS
-    # but the same baseline, so top-aligning makes the printed numeral height
-    # visibly uneven page to page while bottom-aligning keeps it level.
-    offs_y = [extent(p, p.margin.nombre_box.y1 - baseline(p)[1])
-              for p in have if confident(p)]
-    common_noff = float(np.median(offs_y)) if offs_y else None
 
     for p in have:
         dpi = p.dpi if use_dpi else 1.0
+        unit = dpi if use_dpi else 1
         margin_px = output_margin_mm / 25.4 * (p.dpi if use_dpi else 96)
         crop_w, crop_h = crop_size(p)
-        bx0, by0 = baseline(p)
         c = p.margin.content
-        noff_x = common_noff_x.get(p.source.page_index % 2)
-        if confident(p) and noff_x is not None:
-            # centered baseline + the common per-parity nombre correction
-            x0 = p.margin.nombre_box.x0 - noff_x * (dpi if use_dpi else 1)
+        bb = bbox(p)
+        parity = p.source.page_index % 2
+        side = nombre_side.get(parity)
+        # HORIZONTAL: anchor on the nombre's outer edge so it lands at the same
+        # visible fore margin (nombre_fore_margin) on every same-parity page --
+        # the user-chosen priority. Because that margin is derived to put the
+        # body's fore edge at the symmetric side_margin, the body is centred
+        # for the median page; per-page body-width variation lands on the
+        # GUTTER (binding) side, the least visible edge.
+        if confident(p) and side is not None:
+            nb = p.margin.nombre_box
+            if side == "left":
+                x0 = nb.x0 - nombre_fore_margin * unit
+            else:
+                x0 = nb.x1 + nombre_fore_margin * unit - crop_w
         else:
-            x0 = bx0                                  # fallback: centered
-        if confident(p) and common_noff is not None:
-            y0 = p.margin.nombre_box.y1 - common_noff * (dpi if use_dpi else 1)
+            x0 = baseline(p)[0]
+        # VERTICAL: anchor on the nombre's bottom edge (y1) -- digits share a
+        # baseline, not a cap-height, so this keeps the printed numeral level.
+        if confident(p):
+            nb = p.margin.nombre_box
+            if nombre_near_bottom:
+                y0 = nb.y1 + bottom_margin * unit - crop_h
+            else:
+                y0 = nb.y1 - top_margin * unit
         else:
-            y0 = by0                                   # fallback: centered
-        # clamp so every side keeps >= some floor (never touches content);
-        # always feasible since the uniform crop >= content + 2*margin. Skipped
-        # entirely for a detection-failed page: its "content" is the synthetic
-        # full-page box (see crop_size), which is wider/taller than the now-
-        # uniform crop, so this clamp would force the crop to one corner
-        # instead of leaving it centered (the sane baseline -- there's no real
-        # content box to protect with a guaranteed margin here anyway).
-        #
-        # The floor itself depends on whether this axis is nombre-anchored: a
-        # CONFIDENT page intentionally shares one absolute nombre position with
-        # every other page (that's the whole point of the anchor); clamping it
-        # to the full output_margin_mm would override that shared position
-        # whenever this page's own content happens to sit unusually close to
-        # an edge (e.g. a chapter heading right at the top), reintroducing the
-        # per-page nombre-height jitter the anchor exists to remove. Floor at
-        # 0 instead for that axis -- only prevent literally clipping content,
-        # don't fight the shared anchor for cosmetic margin headroom. A page
-        # without a confident anchor (the centered baseline) keeps the full
-        # margin floor, since there's nothing else worth protecting it for.
+            y0 = baseline(p)[1]
+        # Never clip real content: if the nombre anchor would push the FULL
+        # content box (柱 included) outside the crop, shift the crop minimally
+        # to contain it -- the user's "判型外に出る要素があれば中心をずらす".
+        # A confident page floors at 0 (only prevent clipping, don't fight the
+        # shared anchor for cosmetic headroom); a baseline page keeps the small
+        # output-margin floor. Skipped for a detection-failed page (its content
+        # is the synthetic full page, wider than the uniform crop).
+        # Floor: a nombre-anchored page only needs "don't clip" (floor 0) -- it
+        # already sits at the large robust side/top/bottom margin, and forcing
+        # the small output-margin floor on top could only fight that shared
+        # anchor. A baseline (no-nombre) page keeps the real output-margin
+        # floor, since there's no anchor to protect instead.
         if p.margin.confidence >= 0.2:
-            x_floor = 0.0 if (confident(p) and noff_x is not None) else margin_px
-            y_floor = 0.0 if (confident(p) and common_noff is not None) else margin_px
-            x0 = max(min(x0, c.x0 - x_floor), c.x1 + x_floor - crop_w)
-            y0 = max(min(y0, c.y0 - y_floor), c.y1 + y_floor - crop_h)
+            xf = 0.0 if (confident(p) and side is not None) else margin_px
+            yf = 0.0 if confident(p) else margin_px
+            x0 = max(min(x0, c.x0 - xf), c.x1 + xf - crop_w)
+            y0 = max(min(y0, c.y0 - yf), c.y1 + yf - crop_h)
         p.margin.crop = Box(x0, y0, x0 + crop_w, y0 + crop_h)
         target_w, target_h = target_size(p)
         p.margin.target_w, p.margin.target_h = target_w, target_h
-        # crop_w/h > target_w/h means this page's own content didn't fit the
-        # uniform size and crop_size() floored the SOURCE region at its own
-        # content instead of clipping it -- compose_transform will shrink it
-        # back down to target_w/h, so flag it for a human to confirm that's
-        # the right call (vs. e.g. a genuine fold-out that should stay big).
+        # crop bigger than target = this page's own content didn't fit the
+        # uniform size; compose_transform shrinks it down -- flag for review.
         if (crop_w > target_w * 1.001 or crop_h > target_h * 1.001) \
                 and Flag.CONTENT_SCALED_DOWN not in p.flags:
             p.flags.append(Flag.CONTENT_SCALED_DOWN)

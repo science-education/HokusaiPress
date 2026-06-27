@@ -11,6 +11,15 @@ def _page(idx, content, dpi=600, nombre=None):
     )
 
 
+def _numbered_page(idx, content, page_w, page_h, nombre, dpi=600):
+    """A page with page_w/page_h set -- only pages with this populated (real
+    analyze_document output, not the bare _page() fixture above) feed the
+    robust per-side margin statistic in normalize_margins."""
+    p = _page(idx, content, dpi=dpi, nombre=nombre)
+    p.margin.page_w, p.margin.page_h = page_w, page_h
+    return p
+
+
 def test_uniform_size_for_the_bulk_outlier_gets_own_size_no_clip():
     # The bulk of pages share ONE uniform size (an ADF book has one page size).
     # The uniform size is the P97.5 of content extents, so a single large
@@ -177,3 +186,91 @@ def test_mixed_dpi_yields_equal_physical_size():
     in0 = pages[0].margin.crop.width / 600
     in1 = pages[1].margin.crop.width / 300
     assert abs(in0 - in1) < 1e-6
+
+
+def test_body_centered_symmetric_left_right_via_nombre():
+    # No 柱 (no regions) so body box == content box. recto fore-edge = right
+    # (nombre at x~665), verso fore-edge = left (nombre at x~335). The body
+    # must end up horizontally CENTERED -- left margin == right margin on
+    # every page -- with one uniform crop width, regardless of the raw
+    # binding-side asymmetry (recto left gap 100 vs right 300, etc.).
+    pages = [
+        _numbered_page(0, Box(100, 250, 700, 1300), 1000, 1400,
+                       Box(650, 1305, 680, 1325)),
+        _numbered_page(1, Box(300, 250, 900, 1300), 1000, 1400,
+                       Box(320, 1305, 350, 1325)),
+        _numbered_page(2, Box(100, 250, 700, 1300), 1000, 1400,
+                       Box(650, 1305, 680, 1325)),
+        _numbered_page(3, Box(300, 250, 900, 1300), 1000, 1400,
+                       Box(320, 1305, 350, 1325)),
+    ]
+    normalize_margins(pages, output_margin_mm=5.0)
+
+    # crop width = body_w(600) + 2*side_margin, side_margin = mean of the L/R
+    # body margins ((100+300)/2 = 200) -> 600 + 400 = 1000.
+    for p in pages:
+        assert abs(p.margin.crop.width - 1000.0) < 1.0
+    widths = {round(p.margin.crop.width, 1) for p in pages}
+    assert len(widths) == 1
+    # the actual goal: each page's left margin equals its right margin
+    # (clean centering -- what perfect deskew makes conspicuous if broken).
+    for p in pages:
+        c, crop = p.margin.content, p.margin.crop
+        assert abs((c.x0 - crop.x0) - (crop.x1 - c.x1)) < 1.0
+
+
+def test_robust_margin_keeps_top_bottom_asymmetric():
+    # top gap (250px) and bottom gap (100px) are NOT a binding artifact (no
+    # left/right flip with parity), so they must stay asymmetric -- unlike
+    # left/right, there is no single "fore-edge" value to fall back on here.
+    pages = [
+        _numbered_page(0, Box(100, 250, 700, 1300), 1000, 1400,
+                       Box(650, 1305, 680, 1325)),
+        _numbered_page(1, Box(300, 250, 900, 1300), 1000, 1400,
+                       Box(320, 1305, 350, 1325)),
+        _numbered_page(2, Box(100, 250, 700, 1300), 1000, 1400,
+                       Box(650, 1305, 680, 1325)),
+        _numbered_page(3, Box(300, 250, 900, 1300), 1000, 1400,
+                       Box(320, 1305, 350, 1325)),
+    ]
+    normalize_margins(pages, output_margin_mm=5.0)
+
+    expected_h = 1050.0 + 250.0 + 100.0   # uni_h(content) + top + bottom
+    for p in pages:
+        assert abs(p.margin.crop.height - expected_h) < 1.0
+
+
+def test_divider_page_without_nombre_keeps_proportional_position():
+    # numbered pages (with page_w/h + nombre) establish the robust-margin
+    # statistic; a divider/cover page WITHOUT a nombre must still use the
+    # old proportional baseline() -- its content sits in the upper-left of
+    # the original page (fx, fy both small), and that relative position
+    # must survive onto the new uniform-size page rather than being pulled
+    # to the numbered pages' fore-edge/top/bottom margin scheme.
+    numbered = [
+        _numbered_page(0, Box(100, 250, 700, 1300), 1000, 1400,
+                       Box(650, 1305, 680, 1325)),
+        _numbered_page(1, Box(300, 250, 900, 1300), 1000, 1400,
+                       Box(320, 1305, 350, 1325)),
+        _numbered_page(2, Box(100, 250, 700, 1300), 1000, 1400,
+                       Box(650, 1305, 680, 1325)),
+        _numbered_page(3, Box(300, 250, 900, 1300), 1000, 1400,
+                       Box(320, 1305, 350, 1325)),
+    ]
+    # off-centre but not glued to the paper edge (>5mm in on every side, so
+    # the no-clip margin floor doesn't have to move it)
+    divider_content = Box(150, 250, 450, 600)
+    divider = _page(4, divider_content, dpi=600, nombre=None)
+    divider.margin.page_w, divider.margin.page_h = 1000.0, 1400.0
+    pages = numbered + [divider]
+
+    normalize_margins(pages, output_margin_mm=5.0)
+
+    c = divider.margin.content
+    crop = divider.margin.crop
+    orig_fx = (c.x0 + c.width / 2) / divider.margin.page_w
+    orig_fy = (c.y0 + c.height / 2) / divider.margin.page_h
+    new_cx = (c.x0 + c.width / 2 - crop.x0) / crop.width
+    new_cy = (c.y0 + c.height / 2 - crop.y0) / crop.height
+    assert abs(orig_fx - new_cx) < 0.05
+    assert abs(orig_fy - new_cy) < 0.05

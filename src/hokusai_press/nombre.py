@@ -42,7 +42,6 @@ POS_FLOOR_Y = 0.02        # minimum vertical acceptance window (page fraction)
 POS_SEP_THRESH = 0.25     # parity x separation: alternating corners vs pooled
 POS_MIN_ANCHORS = 8       # below this, keep the historical vote-only behavior
 POS_MAX_SPREAD = 0.15     # too broad means the document has no stable nombre pos
-POS_ALIGN_Y_THRESH = 0.005
 POS_DOM_FRAC = 0.3        # a cluster is "primary" only if it reaches this fraction
                          # of its own numbering system's strongest offset (so a
                          # minority misread offset within a kind is rejected, while
@@ -191,8 +190,6 @@ class _PositionModel:
     x_mode: str
     x_stats: dict[int, _PosStats] | _PosStats
     y_stats: dict[int, _PosStats]
-    common_my: float
-    align_y: bool
 
 
 def resolve(
@@ -333,8 +330,6 @@ def _build_position_model(
             x_mode="pooled",
             x_stats=st,
             y_stats={0: st, 1: st},
-            common_my=st.my,
-            align_y=False,
         )
 
     y_stats = {}
@@ -363,9 +358,7 @@ def _build_position_model(
             return None
         x_stats = pooled_stats
 
-    common_my = median([fy for _, _, fy in anchors])
-    align_y = abs(y_stats[0].my - y_stats[1].my) > POS_ALIGN_Y_THRESH
-    return _PositionModel(x_mode, x_stats, y_stats, common_my, align_y)
+    return _PositionModel(x_mode, x_stats, y_stats)
 
 
 def _inside_position_model(
@@ -380,14 +373,6 @@ def _inside_position_model(
     y_stats = model.y_stats[parity]
     return (abs(fx - x_stats.mx) <= max(POS_K * x_stats.sx, POS_FLOOR_X)
             and abs(fy - y_stats.my) <= max(POS_K * y_stats.sy, POS_FLOOR_Y))
-
-
-def _aligned_box(box: Box, page_h: float, model: _PositionModel) -> Box:
-    if not model.align_y:
-        return box
-    cy = model.common_my * page_h
-    half_h = box.height / 2.0
-    return Box(box.x0, cy - half_h, box.x1, cy + half_h)
 
 
 def _primary_clusters(votes: Counter) -> set:
@@ -516,14 +501,18 @@ def _assign_with_position_model(
         if c is None:
             p.page_number, p.nombre_text = None, None
             if p.margin:
-                p.margin.nombre_box = (
-                    _aligned_box(geo_box[i], page_heights[i], model)
-                    if geo_box[i] is not None else None)
+                # Store the TRUE detected box, never a y-snapped one: margin
+                # normalization anchors the crop on this box to land the real
+                # nombre INK at one shared output height. Snapping the box to a
+                # common band (the old _aligned_box) moves the box but NOT the
+                # ink, so the render would still show each page's real nombre
+                # offset -- the very recto/verso height mismatch we're aligning.
+                p.margin.nombre_box = geo_box[i]
             continue
         kind, v, r = c
         p.page_number, p.nombre_text = v, r.ocr_text
         if p.margin:
-            p.margin.nombre_box = _aligned_box(r.box, page_heights[i], model)
+            p.margin.nombre_box = r.box
         assigns.append((p.source.page_index, kind, v))
 
     _clear_gap_flags(pages)

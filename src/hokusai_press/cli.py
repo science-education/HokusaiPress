@@ -213,6 +213,14 @@ def main(argv=None) -> int:
                             help="use processes instead of threads for the "
                                  "render+encode half of --workers (see "
                                  "rebuild --process-pool)")
+    p_remargin.add_argument("--pages", default=None,
+                            help="only RENDER these 0-based pages to the "
+                                 "output PDF, e.g. '0-29' (fast preview). "
+                                 "Margin recompute still uses the WHOLE "
+                                 "book's stored pages -- the robust per-side "
+                                 "statistics need the full book to be "
+                                 "representative; only the final render is "
+                                 "limited.")
 
     args = parser.parse_args(argv)
 
@@ -320,6 +328,7 @@ def main(argv=None) -> int:
             print("error: --out must be a folder when processing multiple inputs")
             return 1
 
+        pages_sel = _parse_pages(args.pages)
         store = Store(args.db)
         try:
             for src in sources:
@@ -330,9 +339,10 @@ def main(argv=None) -> int:
                     max_workers=args.workers)
                 summary = rebuild(doc_id, src, out, db_path=args.db,
                                   max_workers=args.workers,
-                                  use_processes=args.process_pool)
-                print(f"[OK] remargin {doc_id}: {n} pages (no OCR) "
-                      f"-> {summary['out_pdf']}")
+                                  use_processes=args.process_pool,
+                                  pages=pages_sel)
+                print(f"[OK] remargin {doc_id}: {n} pages recomputed (no OCR), "
+                      f"{summary['pages']} rendered -> {summary['out_pdf']}")
         finally:
             store.close()
         return 0

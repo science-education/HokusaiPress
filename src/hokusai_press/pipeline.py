@@ -438,7 +438,8 @@ def _save_profile(store, doc_id: str, result) -> None:
 
 def rebuild(doc_id: str, source_path: str, out_pdf: str,
             db_path: str = "hokusai.db", max_workers: int = 1,
-            use_processes: bool = False) -> dict:
+            use_processes: bool = False,
+            pages: "set[int] | None" = None) -> dict:
     """Regenerate the PDF purely from stored (possibly corrected) parameters.
 
     The output is a pure function of the parameters + the original image, so a
@@ -448,6 +449,10 @@ def rebuild(doc_id: str, source_path: str, out_pdf: str,
     max_workers > 1 parallelizes both the per-page original-image load (see
     recompute_shadows_and_margins) and build_pdf's render+encode (the
     dominant cost -- see build_pdf).
+
+    pages, if given, restricts the OUTPUT to that subset of 0-based page
+    indices (e.g. a fast preview of a few pages) -- it does not affect
+    what's stored; the full book's params are untouched.
     """
     from .render import build_pdf
     from .source import load_single
@@ -457,6 +462,8 @@ def rebuild(doc_id: str, source_path: str, out_pdf: str,
         rows = store.list_pages(doc_id)
     finally:
         store.close()
+    if pages is not None:
+        rows = [r for r in rows if r.page_index in pages]
     if not rows:
         raise ValueError(f"no stored pages for doc_id={doc_id}")
 

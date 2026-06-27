@@ -152,7 +152,19 @@ def render_page_image(
     # margins", and the right tool for uniform-illumination ADF scans.
     if params.margin and params.margin.content:
         ow, oh = out_size
-        b = _map_box(params.margin.content, M)
+        # The fill region is the content box UNIONED with the nombre box grown
+        # by a fraction of its own height. The page-number's OCR box bounds the
+        # digits tightly, but its printed underline / rule sits a few px OUTSIDE
+        # that box (and so outside the content box, whose bottom == the nombre's
+        # on a numbered page) -- without this pad the margin fill would whiten
+        # that underline away (real-corpus: every 0525 nombre lost its rule).
+        fb = params.margin.content
+        nb = params.margin.nombre_box
+        if nb is not None:
+            pad = 0.6 * nb.height        # enough for an underline/overline/rule
+            fb = Box(min(fb.x0, nb.x0 - pad), min(fb.y0, nb.y0 - pad),
+                     max(fb.x1, nb.x1 + pad), max(fb.y1, nb.y1 + pad))
+        b = _map_box(fb, M)
         x0 = max(0, min(ow, int(round(b.x0))))
         y0 = max(0, min(oh, int(round(b.y0))))
         x1 = max(0, min(ow, int(round(b.x1))))
