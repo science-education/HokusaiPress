@@ -77,8 +77,13 @@ def _run_one(payload: dict) -> dict:
     summary = run(
         payload["src"], payload["out"], db_path=payload["db"],
         model_dir=payload["model_dir"], device=payload["device"],
-        use_ocr=payload["use_ocr"], learned_model_path=payload["learned_model"],
-        openvino_cache_dir=payload["cache"], pages=payload["pages"],
+        ocr_engine=payload["ocr_engine"],
+        layout_engine=payload["layout_engine"],
+        text_engine=payload["text_engine"],
+        use_ocr=payload["use_ocr"],
+        learned_model_path=payload["learned_model"],
+        openvino_cache_dir=payload["cache"],
+        runtime=payload["runtime"], pages=payload["pages"],
     )
     summary["tpb"] = time.perf_counter() - t0
     return summary
@@ -143,8 +148,34 @@ def main(argv=None) -> int:
                        help="output PDF path, or a folder (saves <source>.pdf)")
     p_run.add_argument("--db", default="hokusai.db", help="job/decision SQLite db")
     p_run.add_argument("--model-dir", default="models", help="hybrid-ocr model dir")
+    p_run.add_argument("--ocr-engine", default="hybrid",
+                       choices=["auto", "hybrid", "yomitoku", "ndlocr",
+                                "ppocr-v6", "paddleocr-v6",
+                                "pp-structurev3", "pp-structure",
+                                "paddle-vl", "paddleocr-vl", "none"],
+                       help="legacy combined engine selector. Prefer "
+                            "--layout-engine and --text-engine for new runs")
+    p_run.add_argument("--layout-engine", default=None,
+                       choices=["none", "yomitoku", "pp-structurev3",
+                                "pp-structure", "paddle-vl", "paddleocr-vl"],
+                       help="layout engine: Yomitoku RT-DETR, PP-StructureV3, "
+                            "PaddleOCR-VL, or none")
+    p_run.add_argument("--text-engine", default=None,
+                       choices=["none", "ndlocr", "ppocr-v6", "paddleocr-v6",
+                                "paddle-vl", "paddleocr-vl"],
+                       help="text OCR engine: NDL-OCR/hybrid, PP-OCRv6, "
+                            "PaddleOCR-VL, or none")
     p_run.add_argument("--device", default="auto",
-                       help="OCR device: auto|cpu|npu|cuda|dml|qnn")
+                       help="OCR device. hybrid: auto|cpu|npu|cuda|dml|qnn; "
+                            "Paddle: cpu|gpu|npu[:0]|xpu[:0]|... as supported "
+                            "by the installed Paddle runtime")
+    p_run.add_argument("--runtime", default=None,
+                       choices=["auto", "openvino", "onnxruntime", "paddle",
+                                "transformers"],
+                       help="runtime/backend for selected engines")
+    p_run.add_argument("--paddle-engine", default=None,
+                       choices=["paddle", "transformers", "onnxruntime"],
+                       help="deprecated alias for --runtime")
     p_run.add_argument("--no-ocr", action="store_true",
                        help="skip OCR (geometry + heuristic separation only)")
     p_run.add_argument("--learned-model", default=None,
@@ -177,11 +208,50 @@ def main(argv=None) -> int:
     p_re.add_argument("--out", required=True,
                       help="output PDF path, or a folder (saves <source>.pdf)")
     p_re.add_argument("--db", default="hokusai.db")
+    p_re.add_argument("--workers", type=int, default=1,
+                      help="parallelize per-page render+encode across this "
+                           "many threads (no OCR engine involved here, so "
+                           "there's no NPU concurrency limit -- core count "
+                           "is the natural ceiling)")
+    p_re.add_argument("--process-pool", action="store_true",
+                      help="use processes instead of threads for --workers "
+                           "(faster: PIL's TIFF/group4 encode doesn't fully "
+                           "release the GIL, capping thread speedup; "
+                           "processes pay numpy-array pickling cost instead)")
 
     p_learn = sub.add_parser("learn",
                              help="train a page-kind model from the decision log")
     p_learn.add_argument("--db", default="hokusai.db")
     p_learn.add_argument("--out", default="hokusai_model.json")
+
+    p_remargin = sub.add_parser(
+        "remargin",
+        help="re-run shadow/margin/content-box detection from STORED OCR "
+             "regions (no OCR re-run) and rebuild the PDF -- for iterating "
+             "on margin.py without re-paying OCR")
+    p_remargin.add_argument("source", nargs="+",
+                            help="original source PDF/image(s) the stored "
+                                 "doc_id(s) were analyzed from")
+    p_remargin.add_argument("--out", required=True,
+                            help="output PDF path, or a folder (saves <source>.pdf)")
+    p_remargin.add_argument("--db", default="hokusai.db")
+    p_remargin.add_argument("--output-margin-mm", type=float, default=5.0)
+    p_remargin.add_argument("--workers", type=int, default=1,
+                            help="parallelize per-page margin-recompute and "
+                                 "render+encode across this many threads "
+                                 "(no OCR here, so core count is the ceiling)")
+    p_remargin.add_argument("--process-pool", action="store_true",
+                            help="use processes instead of threads for the "
+                                 "render+encode half of --workers (see "
+                                 "rebuild --process-pool)")
+    p_remargin.add_argument("--pages", default=None,
+                            help="only RENDER these 0-based pages to the "
+                                 "output PDF, e.g. '0-29' (fast preview). "
+                                 "Margin recompute still uses the WHOLE "
+                                 "book's stored pages -- the robust per-side "
+                                 "statistics need the full book to be "
+                                 "representative; only the final render is "
+                                 "limited.")
 
     args = parser.parse_args(argv)
 
@@ -200,8 +270,13 @@ def main(argv=None) -> int:
             return {
                 "src": src, "out": _resolve_out(args.out, src), "db": db,
                 "model_dir": args.model_dir, "device": args.device,
+                "ocr_engine": args.ocr_engine,
+                "layout_engine": args.layout_engine,
+                "text_engine": args.text_engine,
                 "use_ocr": not args.no_ocr, "learned_model": args.learned_model,
-                "cache": args.openvino_cache_dir, "pages": pages_sel,
+                "cache": args.openvino_cache_dir,
+                "runtime": args.runtime or args.paddle_engine or "paddle",
+                "pages": pages_sel,
             }
 
         flagged_docs = 0
@@ -270,9 +345,42 @@ def main(argv=None) -> int:
         from .pipeline import rebuild
 
         out = _resolve_out(args.out, args.source)
-        summary = rebuild(args.doc, args.source, out, db_path=args.db)
+        summary = rebuild(args.doc, args.source, out, db_path=args.db,
+                          max_workers=args.workers,
+                          use_processes=args.process_pool)
         print(f"[OK] rebuilt {summary['doc_id']}: {summary['pages']} pages "
               f"-> {summary['out_pdf']}")
+        return 0
+
+    if args.command == "remargin":
+        from .pipeline import recompute_shadows_and_margins, rebuild
+        from .store import Store
+
+        sources = _expand_sources(args.source)
+        if not sources:
+            print("no input files matched")
+            return 1
+        if len(sources) > 1 and not _is_folder_out(args.out):
+            print("error: --out must be a folder when processing multiple inputs")
+            return 1
+
+        pages_sel = _parse_pages(args.pages)
+        store = Store(args.db)
+        try:
+            for src in sources:
+                doc_id = os.path.basename(src)
+                out = _resolve_out(args.out, src)
+                n = recompute_shadows_and_margins(
+                    store, doc_id, src, output_margin_mm=args.output_margin_mm,
+                    max_workers=args.workers)
+                summary = rebuild(doc_id, src, out, db_path=args.db,
+                                  max_workers=args.workers,
+                                  use_processes=args.process_pool,
+                                  pages=pages_sel)
+                print(f"[OK] remargin {doc_id}: {n} pages recomputed (no OCR), "
+                      f"{summary['pages']} rendered -> {summary['out_pdf']}")
+        finally:
+            store.close()
         return 0
 
     if args.command == "learn":

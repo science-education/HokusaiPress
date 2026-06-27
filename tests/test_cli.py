@@ -8,6 +8,90 @@ from hokusai_press.cli import (
 )
 
 
+def test_remargin_skips_ocr(tmp_path, monkeypatch):
+    """remargin must rebuild from stored regions without calling OCR again --
+    that's the whole point (margin/figure tweaks are cheap to re-verify)."""
+    import cv2
+    import numpy as np
+    import pytest
+
+    pytest.importorskip("hybrid_ocr")  # pipeline.run -> build_pdf needs it
+    pytest.importorskip("pikepdf")
+
+    from hokusai_press import pipeline
+    from hokusai_press.cli import main
+
+    img = np.full((1000, 700, 3), 255, np.uint8)
+    cv2.rectangle(img, (100, 120), (600, 880), (0, 0, 0), 2)
+    for y in range(160, 840, 40):
+        cv2.rectangle(img, (120, y), (580, y + 16), (0, 0, 0), -1)
+    src = str(tmp_path / "pg.png")
+    cv2.imwrite(src, img)
+
+    db = str(tmp_path / "j.db")
+    pipeline.run(src, str(tmp_path / "o.pdf"), db_path=db, use_ocr=False)
+
+    calls = []
+    import hokusai_press.content as content_mod
+    monkeypatch.setattr(content_mod, "analyze",
+                        lambda *a, **k: calls.append(1) or (None, None))
+
+    out = str(tmp_path / "remargin.pdf")
+    rc = main(["remargin", src, "--out", out, "--db", db])
+    assert rc == 0
+    assert os.path.exists(out)
+    assert calls == []  # content.analyze (OCR) was never invoked
+
+
+def test_rebuild_pages_filter_limits_output_without_touching_stored_data(tmp_path):
+    """rebuild(pages=...) renders only a subset (a fast preview) but must not
+    drop or alter the OTHER stored pages -- a second rebuild with no filter
+    must still produce the full page count."""
+    import pytest
+
+    pytest.importorskip("hybrid_ocr")
+    pytest.importorskip("pikepdf")
+
+    import cv2
+    import numpy as np
+    import pypdfium2  # noqa: F401 -- just confirms it's importable here
+
+    from hokusai_press import pipeline
+    from hokusai_press.model import Box, Deskew, Margin, PageParams, SourceRef
+    from hokusai_press.store import Store
+
+    # a tiny multi-page PDF via img2pdf-less direct PIL save (no OCR needed --
+    # rebuild only reads stored params, not regions detection).
+    from PIL import Image
+
+    pages_img = []
+    for i in range(5):
+        img = np.full((400, 300, 3), 255, np.uint8)
+        cv2.rectangle(img, (40, 40), (260, 360), (0, 0, 0), 2)
+        pages_img.append(Image.fromarray(img))
+    src = str(tmp_path / "multi.pdf")
+    pages_img[0].save(src, save_all=True, append_images=pages_img[1:])
+
+    db = str(tmp_path / "j.db")
+    store = Store(db)
+    doc_id = "multi.pdf"
+    for i in range(5):
+        store.upsert_page(doc_id, i, PageParams(
+            source=SourceRef(path=src, page_index=i),
+            deskew=Deskew(),
+            margin=Margin(content=Box(40, 40, 260, 360), confidence=1.0),
+        ))
+    store.close()
+
+    out_subset = str(tmp_path / "subset.pdf")
+    summary = pipeline.rebuild(doc_id, src, out_subset, db_path=db, pages={1, 2})
+    assert summary["pages"] == 2
+
+    out_full = str(tmp_path / "full.pdf")
+    summary_full = pipeline.rebuild(doc_id, src, out_full, db_path=db)
+    assert summary_full["pages"] == 5
+
+
 def test_parse_pages():
     assert _parse_pages(None) is None
     assert _parse_pages("") is None

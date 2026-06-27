@@ -2,8 +2,11 @@ import cv2
 import numpy as np
 
 from hokusai_press.geometry.deskew import GOOD_CONFIDENCE, find_skew, is_confident
-from hokusai_press.geometry.margin import find_content_box, remove_edge_shadows
-from hokusai_press.model import Deskew
+from hokusai_press.geometry.margin import (
+    find_content_box, remove_edge_shadows, detect_shadow_bands, apply_shadow_bands,
+    region_shadow_mask, remove_region_shadows,
+)
+from hokusai_press.model import Deskew, Region, RegionKind, Box
 
 
 def _text_page(rotate_deg=0.0):
@@ -94,3 +97,145 @@ def test_remove_edge_shadows_keeps_text_dots():
     out = remove_edge_shadows(img)
     assert (out[::3, 20:40] == 0).any()     # text kept
     assert (out[:, 290:294] == 255).all()   # shadow removed
+
+
+def _book_pages(n, with_left_bar=True, bar_x=8, running_head=False, jitter=True):
+    """n synthetic yokogaki pages (HxW = 300x400). Optional fixed left shadow
+    bar (outer band), optional recurring running head, body ink that wanders."""
+    rng = np.random.default_rng(0)
+    pages = []
+    for i in range(n):
+        g = np.full((300, 400), 255, dtype=np.uint8)
+        bx = 60 + (rng.integers(-20, 20) if jitter else 0)   # body left edge wanders
+        for y in range(40, 270, 18):                          # body text lines
+            g[y:y+8, bx:bx+260] = 0
+        if with_left_bar:
+            g[:, bar_x:bar_x+3] = 40                          # fixed thin edge shadow
+        if running_head:
+            g[18:22, 70:330] = 0                              # wide line at constant y
+        pages.append(g)
+    return pages
+
+
+def test_detect_shadow_bands_finds_consistent_edge_line():
+    pages = _book_pages(12, with_left_bar=True, bar_x=8)
+    bands = detect_shadow_bands(pages)
+    vbands = [b for b in bands if b[0] == 0]
+    assert vbands, "should detect the fixed left edge bar"
+    # the band covers x=8 (=0.02 of W=400)
+    assert any(lo <= 8/400 <= hi for _, lo, hi in vbands)
+    # applying it whitens the bar but keeps body ink
+    out = apply_shadow_bands(pages[0].copy(), bands)
+    assert (out[:, 8:11] == 255).all()                # bar removed
+    assert (out[:, 60:320] < 128).any()               # body text kept
+
+
+def test_detect_shadow_bands_ignores_wandering_content():
+    # no fixed edge bar; body ink wanders -> no consistent column -> no band
+    pages = _book_pages(12, with_left_bar=False, jitter=True)
+    bands = detect_shadow_bands(pages)
+    assert [b for b in bands if b[0] == 0] == []
+
+
+def test_detect_shadow_bands_ignores_running_head():
+    # a recurring horizontal running head must NOT be detected (vertical-only),
+    # else it (and the nombre) would be whitened
+    pages = _book_pages(12, with_left_bar=False, running_head=True, jitter=True)
+    bands = detect_shadow_bands(pages)
+    assert bands == []
+
+
+def test_detect_shadow_bands_needs_minimum_pages():
+    pages = _book_pages(4, with_left_bar=True)
+    assert detect_shadow_bands(pages) == []
+
+
+def test_ink_threshold_book_valley_handles_showthrough():
+    from hokusai_press.geometry.margin import ink_threshold, document_ink_valley
+    # a normal inked page: clear dark text on white -> Otsu valley in the middle
+    normal = np.full((200, 200), 255, dtype=np.uint8)
+    normal[40:160, 40:160] = 30
+    valley = document_ink_valley([normal] * 10)
+    assert valley is not None
+    # the same normal page keeps its own Otsu (not the floor)
+    assert ink_threshold(normal, valley) == ink_threshold(normal, None)
+    # a show-through page: only faint gray bleed, no real dark ink -> its own
+    # Otsu shoots high; with the book valley it must fall back to the valley
+    show = np.full((200, 200), 245, dtype=np.uint8)
+    show[::4, ::4] = 205     # faint bleed pattern, nothing genuinely dark
+    with_valley = ink_threshold(show, valley)
+    # show-through Otsu is well above the book valley -> clamped to it
+    assert with_valley <= valley + 1
+
+
+def test_flag_skew_outliers_flags_large_book_relative_outlier():
+    from hokusai_press.geometry.deskew import flag_skew_outliers
+    # a mostly-straight book (angles ~0) with two genuinely skewed pages
+    ds = [Deskew(angle_deg=a, confidence=5.0) for a in
+          ([0.0, 0.1, -0.1, 0.05, 0.0, 0.1, -0.05, 0.0, 0.1, -0.1] + [0.8, -0.9])]
+    flags = flag_skew_outliers(ds)
+    assert flags[-1] and flags[-2]              # the 0.8 / -0.9 pages flagged
+    assert not any(flags[:10])                  # the straight bulk not flagged
+
+
+def test_flag_skew_outliers_spares_consistent_small_skew():
+    from hokusai_press.geometry.deskew import flag_skew_outliers
+    # every page has a small ~0.3deg skew (consistent) -> none is an outlier,
+    # and all are below the absolute-review floor anyway
+    ds = [Deskew(angle_deg=0.3, confidence=1.0) for _ in range(12)]
+    assert not any(flag_skew_outliers(ds))
+
+
+def test_flag_skew_outliers_small_book_falls_back_to_confidence():
+    from hokusai_press.geometry.deskew import flag_skew_outliers, GOOD_CONFIDENCE
+    # < SKEW_MIN_PAGES -> per-page rule: a tilted low-confidence page is flagged
+    ds = [Deskew(angle_deg=1.0, confidence=GOOD_CONFIDENCE - 0.5)]
+    assert flag_skew_outliers(ds) == [True]
+    ds2 = [Deskew(angle_deg=0.0, confidence=0.0)]   # upright -> not flagged
+    assert flag_skew_outliers(ds2) == [False]
+
+
+def _txt(x0, y0, x1, y1):
+    return Region(kind=RegionKind.TEXT, box=Box(x0, y0, x1, y1))
+
+
+def test_region_shadow_removed_outside_text_box():
+    # A thin near-full-height dark line in the left margin (outside the text box)
+    # is a binding/ADF shadow -> removed. The body text is kept.
+    g = np.full((400, 300), 255, dtype=np.uint8)
+    g[:, 8:10] = 30                       # thin tall shadow line at x=8 (margin)
+    for y in range(40, 360, 20):          # body text lines, left edge at x=80
+        g[y:y+8, 80:250] = 0
+    regions = [_txt(80, 40, 250, 360)]
+    out = remove_region_shadows(g, regions)
+    assert (out[:, 8:10] == 255).all()    # shadow line removed
+    assert (out[:, 80:250] < 128).any()   # body text kept
+
+
+def test_region_shadow_does_not_touch_figure():
+    # A figure that bleeds into the left margin must be protected: a dark line
+    # inside the figure's box is NOT whitened, even though it is left of the text.
+    g = np.full((400, 300), 255, dtype=np.uint8)
+    g[50:350, 5:120] = 60                 # a figure block reaching the left edge
+    for y in range(40, 360, 20):
+        g[y:y+8, 150:260] = 0             # text to the right of the figure
+    regions = [
+        _txt(150, 40, 260, 360),
+        Region(kind=RegionKind.PHOTO, box=Box(5, 50, 120, 350)),
+    ]
+    out = remove_region_shadows(g, regions)
+    # the figure interior is untouched (not whitened to 255)
+    assert (out[60:340, 10:110] < 255).any()
+
+
+def test_region_shadow_keeps_margin_text():
+    # Sparse marginal text (no >=25%-tall consecutive run) in the margin must NOT
+    # be removed -- only a solid tall line qualifies as a shadow.
+    g = np.full((400, 300), 255, dtype=np.uint8)
+    for y in range(40, 360, 40):          # sparse dots in the left margin
+        g[y:y+6, 12:20] = 0
+    for y in range(40, 360, 20):
+        g[y:y+8, 80:250] = 0
+    regions = [_txt(80, 40, 250, 360)]
+    out = remove_region_shadows(g, regions)
+    assert (out[:, 12:20] < 128).any()    # sparse margin marks kept (not a line)

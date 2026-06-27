@@ -31,7 +31,9 @@ def test_layout_provider_adds_photo_region():
     rt = [r for r in regions if r.source == "rtdetr"]
     assert len(rt) == 1
     assert rt[0].kind == RegionKind.PHOTO   # gradient -> continuous tone
-    assert rt[0].box.x0 == 50 and rt[0].box.y1 == 350
+    # padded outward a few px (soft/anti-aliased figure edges can fall just
+    # outside the raw detector box) -- so x0 shrinks and y1 grows from input
+    assert rt[0].box.x0 < 50 and rt[0].box.y1 > 350
 
 
 def test_layout_provider_line_art_is_figure():
@@ -55,4 +57,7 @@ def test_ocr_scale_maps_layout_box_to_original():
         use_ocr=False, layout_provider=provider,
     )
     rt = [r for r in regions if r.source == "rtdetr"][0]
-    assert rt.box.x0 == 100 and rt.box.x1 == 500  # divided by ocr_scale
+    # divided by ocr_scale, then a few px of padding (applied pre-scale) shows
+    # up scaled by 1/ocr_scale too -- so x0 is a bit under 100, x1 a bit over 500
+    assert 90 < rt.box.x0 < 100
+    assert 500 < rt.box.x1 < 510

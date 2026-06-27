@@ -45,9 +45,11 @@ def compose_transform(
     # crop box in deskewed frame. Prefer the normalized crop (uniform size,
     # nombre-anchored) when margin normalization has run; otherwise fall back
     # to the raw content box padded by the output margin.
+    target_w = target_h = None
     if params.margin and params.margin.crop:
         crop = params.margin.crop
         cx0, cy0, crop_w, crop_h = crop.x0, crop.y0, crop.width, crop.height
+        target_w, target_h = params.margin.target_w, params.margin.target_h
     elif params.margin and params.margin.content:
         c = params.margin.content
         margin_px = settings.output_margin_mm / 25.4 * dpi
@@ -56,20 +58,55 @@ def compose_transform(
     else:
         cx0, cy0, crop_w, crop_h = 0, 0, w, h
 
-    scale = settings.target_dpi / dpi if dpi else 1.0
-    # scale + translate so (cx0,cy0) -> (0,0) and then upscale to target dpi
-    A = np.array([[scale, 0, -scale * cx0],
-                  [0, scale, -scale * cy0],
+    base_scale = settings.target_dpi / dpi if dpi else 1.0
+    # Page-format uniformity is non-negotiable: every page in the book must
+    # render at the SAME output size (target_w/target_h, set by
+    # normalize_margins). crop_w/crop_h CAN be larger than that for an
+    # outlier page (its own real content didn't fit the uniform size, so
+    # crop_size() floored the SOURCE region at its own content rather than
+    # clip it -- see margin.py). Shrink (never enlarge) the scale so that
+    # larger source region still maps into the fixed target_w x target_h
+    # canvas, and center the result there (extra space lands evenly on
+    # both sides, not all on one edge).
+    extra_x = extra_y = 0.0
+    if target_w and target_h:
+        shrink = min(1.0, target_w / crop_w, target_h / crop_h)
+        scale = base_scale * shrink
+        out_w, out_h = max(1, round(target_w * base_scale)), max(1, round(target_h * base_scale))
+        extra_x = (out_w - crop_w * scale) / 2.0
+        extra_y = (out_h - crop_h * scale) / 2.0
+    else:
+        scale = base_scale
+        out_w, out_h = max(1, round(crop_w * scale)), max(1, round(crop_h * scale))
+
+    # scale + translate so (cx0,cy0) -> (extra_x,extra_y) and upscale to target dpi
+    A = np.array([[scale, 0, -scale * cx0 + extra_x],
+                  [0, scale, -scale * cy0 + extra_y],
                   [0, 0, 1]], dtype=np.float64)
     M = (A @ R_h)[:2, :]
-    out_size = (max(1, round(crop_w * scale)), max(1, round(crop_h * scale)))
+    out_size = (out_w, out_h)
     return M.astype(np.float32), out_size, scale
 
 
 def _map_box(box: Box, M: np.ndarray) -> Box:
-    pts = np.array([[box.x0, box.y0, 1], [box.x1, box.y1, 1]], dtype=np.float64).T
+    # All FOUR corners, not just the two diagonal ones: M can carry a deskew
+    # rotation, under which a rotated rectangle's true bounding box is not
+    # simply "transform the top-left and bottom-right corners" -- a corner
+    # far from the rotation center (e.g. a text line near the very top of a
+    # tall page) shifts sideways by several px more than the box's nominal
+    # opposite corner does. Mapping only 2 corners under-covered exactly that
+    # far corner, and the margin-fill step then whitened part of real text
+    # past the (wrongly short) computed edge -- seen on real corpus data
+    # (img20260427_0001 p11: deskew -0.4 deg clipped the right side of
+    # characters in a text line near the page top, far from the rotation
+    # center, while center-ish lines were unaffected).
+    pts = np.array([
+        [box.x0, box.y0, 1], [box.x1, box.y0, 1],
+        [box.x0, box.y1, 1], [box.x1, box.y1, 1],
+    ], dtype=np.float64).T
     out = M @ pts
-    return Box(float(out[0, 0]), float(out[1, 0]), float(out[0, 1]), float(out[1, 1]))
+    return Box(float(out[0].min()), float(out[1].min()),
+               float(out[0].max()), float(out[1].max()))
 
 
 def render_page_image(
@@ -85,7 +122,7 @@ def render_page_image(
     (auto gray/color), "gray", or "color" — the per-region override that lets a
     grayscale picture live inside an otherwise bilevel page.
     """
-    from .geometry.margin import remove_edge_shadows
+    from .geometry.margin import remove_edge_shadows, remove_region_shadows
 
     # whiten binding/ADF edge shadows on the FULL original first (robust, the
     # validated location) -- then warp the clean image, so no shadow survives
@@ -97,7 +134,13 @@ def render_page_image(
         white = np.full((out_size[1], out_size[0], 3), 255, dtype=np.uint8)
         return white, [], "bw", []
 
-    clean = remove_edge_shadows(original_bgr)
+    # region-based margin shadow removal first (uses this page's OCR text/figure
+    # regions: thin near-full-height dark line outside the text box, figures
+    # protected), then the per-page component rule for wider shadows. On the
+    # production run path the original is already region-cleaned (no-op here); on
+    # the rebuild path the original is freshly loaded, so this is where it applies.
+    clean = remove_region_shadows(original_bgr, params.regions)
+    clean = remove_edge_shadows(clean)
     out = cv2.warpAffine(clean, M, out_size, flags=cv2.INTER_AREA,
                          borderValue=(255, 255, 255))
 
@@ -109,7 +152,19 @@ def render_page_image(
     # margins", and the right tool for uniform-illumination ADF scans.
     if params.margin and params.margin.content:
         ow, oh = out_size
-        b = _map_box(params.margin.content, M)
+        # The fill region is the content box UNIONED with the nombre box grown
+        # by a fraction of its own height. The page-number's OCR box bounds the
+        # digits tightly, but its printed underline / rule sits a few px OUTSIDE
+        # that box (and so outside the content box, whose bottom == the nombre's
+        # on a numbered page) -- without this pad the margin fill would whiten
+        # that underline away (real-corpus: every 0525 nombre lost its rule).
+        fb = params.margin.content
+        nb = params.margin.nombre_box
+        if nb is not None:
+            pad = 0.6 * nb.height        # enough for an underline/overline/rule
+            fb = Box(min(fb.x0, nb.x0 - pad), min(fb.y0, nb.y0 - pad),
+                     max(fb.x1, nb.x1 + pad), max(fb.y1, nb.y1 + pad))
+        b = _map_box(fb, M)
         x0 = max(0, min(ow, int(round(b.x0))))
         y0 = max(0, min(oh, int(round(b.y0))))
         x1 = max(0, min(ow, int(round(b.x1))))
@@ -121,10 +176,15 @@ def render_page_image(
 
     lines = []
     photo_boxes: list[tuple] = []
+    ow, oh = out_size
     for r in params.regions:
         if r.kind == RegionKind.PHOTO:
             b = _map_box(r.box, M)
-            photo_boxes.append((b.x0, b.y0, b.x1, b.y1, r.tone))
+            x0, y0 = max(0.0, b.x0), max(0.0, b.y0)
+            x1, y1 = min(float(ow), b.x1), min(float(oh), b.y1)
+            if x1 - x0 < 1 or y1 - y0 < 1:
+                continue   # clipped to nothing (box mapped outside the page)
+            photo_boxes.append((x0, y0, x1, y1, r.tone))
         if r.ocr_text:
             b = _map_box(r.box, M)
             lines.append({
@@ -142,16 +202,101 @@ def render_page_image(
     return out, lines, mode, photo_boxes
 
 
-def binarize_bw(bgr: np.ndarray) -> np.ndarray:
-    """{0,255} single-channel bw layer. Threshold is clamped to an absolute ceil
-    (min(Otsu, INK_CEIL)) so faint show-through and soft shadow penumbra stay
-    white while text cores stay black -- Otsu alone turns them black on near-blank
-    ADF pages. HokusaiPress owns its output binarization (the OCR side keeps its
-    own global-Otsu binarize for recognition)."""
+def _figure_vecfills(
+    out_bgr: np.ndarray,
+    params: PageParams,
+    settings: RenderSettings,
+    original_shape: tuple[int, int],
+) -> list[dict]:
+    """Return vector fills for solid FIGURE regions in rendered pixel space."""
+    from .region_class import classify_patch
+
+    M, _, _ = compose_transform(original_shape, params, settings)
+    h, w = out_bgr.shape[:2]
+    fills = []
+    for r in params.regions:
+        if r.kind != RegionKind.FIGURE:
+            continue
+        b = _map_box(r.box, M)
+        x0i = max(0, min(w, int(round(min(b.x0, b.x1)))))
+        y0i = max(0, min(h, int(round(min(b.y0, b.y1)))))
+        x1i = max(0, min(w, int(round(max(b.x0, b.x1)))))
+        y1i = max(0, min(h, int(round(max(b.y0, b.y1)))))
+        if x1i - x0i < 4 or y1i - y0i < 4:
+            continue
+        patch = out_bgr[y0i:y1i, x0i:x1i]
+        if classify_patch(patch) != "solid_fill":
+            continue
+        gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+        # Median is stable under small antialiasing or scan noise at the edge.
+        tone = float(np.median(gray)) / 255.0
+        fills.append({"rect": (x0i, y0i, x1i, y1i), "gray": tone})
+    return fills
+
+
+def _overlaps_any(rect: tuple, fills: list[dict]) -> bool:
+    """True if rect shares >50% of its area with any existing fill."""
+    x0, y0, x1, y1 = rect
+    area = max(1, (x1 - x0) * (y1 - y0))
+    for f in fills:
+        fx0, fy0, fx1, fy1 = f["rect"]
+        ix = max(0, min(x1, fx1) - max(x0, fx0))
+        iy = max(0, min(y1, fy1) - max(y0, fy0))
+        if ix * iy > area * 0.5:
+            return True
+    return False
+
+
+def _raster_tint_fills(out_bgr: np.ndarray, existing: list[dict]) -> list[dict]:
+    """Detect tint panels from the raster and return fills not already covered.
+
+    Legacy flat-fill path kept for tests.  Production code uses _raster_tint_zones.
+    """
+    from .tint_panel import detect_tint_panels
+
+    new_fills = []
+    for fill in detect_tint_panels(out_bgr):
+        if not _overlaps_any(fill["rect"], existing):
+            new_fills.append(fill)
+    return new_fills
+
+
+def _raster_tint_zones(
+    out_bgr: np.ndarray,
+    existing_fills: list[dict],
+    text_boxes: list[tuple[float, float, float, float]] | None = None,
+):
+    """Detect tint panels and return non-overlapping TintZone objects.
+
+    Panels that overlap with already-placed vector fills are skipped.
+    Column-projection results that overlap with row-projection results at their
+    ends are clipped inside build_tint_zones (overlap deduplication).
+    """
+    from .tint_panel import detect_tint_panels
+    from .tint_zone import build_tint_zones
+
+    import cv2
+
+    gray = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2GRAY) if out_bgr.ndim == 3 else out_bgr
+    panels = [
+        p for p in detect_tint_panels(out_bgr)
+        if not _overlaps_any(p["rect"], existing_fills)
+    ]
+    return build_tint_zones(gray, panels, text_boxes)
+
+
+def binarize_bw(bgr: np.ndarray, book_valley: "int | None" = None) -> np.ndarray:
+    """{0,255} single-channel bw layer. Threshold is Otsu (the real ink/paper
+    valley, kept as is so light strokes survive); on a degenerate near-blank page
+    -- high Otsu with no genuinely dark pixels -- ink_threshold drops to the
+    book's valley (2-pass, when book_valley is given) or a fixed floor so
+    show-through / shadow penumbra stay white instead of turning black (see
+    geometry.margin.ink_threshold). HokusaiPress owns its output binarization
+    (the OCR side keeps its own global-Otsu binarize for recognition)."""
     from .geometry.margin import ink_threshold
 
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
-    return np.where(gray <= ink_threshold(gray), 0, 255).astype(np.uint8)
+    return np.where(gray <= ink_threshold(gray, book_valley), 0, 255).astype(np.uint8)
 
 
 def _binarize_for_preview(bgr: np.ndarray) -> np.ndarray:
@@ -195,24 +340,69 @@ def render_output_preview(
     return canvas
 
 
+def _render_and_encode_page(args) -> dict:
+    """Per-page render (compose/warp/shadow-clean) + MRC encode (G4/JPEG/
+    posterize), as one pure function of (params, original, settings, builder
+    config) -- no shared state -- so build_pdf can run this on a thread pool.
+    Measured ~80% of build_pdf's wall time (encode alone ~65%), making this
+    the highest-value parallel target in the whole pipeline."""
+    params, original, settings, encoder = args
+    out_bgr, lines, mode, photo_boxes = render_page_image(original, params, settings)
+    vecfills = _figure_vecfills(out_bgr, params, settings, original.shape)
+    text_boxes = [tuple(line["box"]) for line in lines]
+    tint_zones = (
+        _raster_tint_zones(out_bgr, vecfills, text_boxes)
+        if settings.tint_overlay else []
+    )
+    return encoder.encode_page(out_bgr, lines, photo_boxes, mode, vecfills, tint_zones)
+
+
 def build_pdf(
     document: Document,
     originals: list[np.ndarray],
     out_path: str,
+    max_workers: int = 1,
+    use_processes: bool = False,
 ) -> str:
-    """Assemble the searchable MRC PDF from per-page params + originals."""
+    """Assemble the searchable MRC PDF from per-page params + originals.
+
+    max_workers > 1 runs render+encode for each page on a pool (see
+    _render_and_encode_page): every page is otherwise-independent work, and
+    encode_page returns only plain bytes/tuples/lists (encode_page_pdf
+    returns raw PDF bytes, never a pikepdf object), so the result is cheaply
+    picklable across a process boundary too. Results are collected via
+    Executor.map, which preserves page order, so the sequential
+    add_encoded_page loop below is just the cheap bookkeeping half.
+
+    use_processes selects ProcessPoolExecutor over ThreadPoolExecutor.
+    Measured on tmp0613 (176 pages, 14 logical cores): threads plateau at
+    ~2.8x around max_workers=14 and regress beyond it (oversubscription) --
+    PIL's TIFF/group4 encode (the "bw" mode path, the common case) does not
+    release the GIL for its full duration, so thread-level parallelism is
+    capped by that. Processes pay numpy-array pickling cost per page instead,
+    but get a real GIL each -- worth comparing on the actual workload size
+    before picking a default.
+    """
     from .mrc import MrcPageBuilder
 
     builder = MrcPageBuilder(
         compress=document.render.bilevel_codec,
         target_dpi=document.render.target_dpi,
         jpeg_quality=document.render.jpeg_quality,
+        ink_valley=getattr(document.render, "ink_valley", None),
     )
-    for params, original in zip(document.pages, originals):
-        out_bgr, lines, mode, photo_boxes = render_page_image(
-            original, params, document.render
-        )
-        builder.add_page(out_bgr, lines, photo_boxes, mode)
+    worker_args = [(params, original, document.render, builder)
+                  for params, original in zip(document.pages, originals)]
+    if max_workers > 1 and len(worker_args) > 1:
+        from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+        Executor = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
+        with Executor(max_workers=max_workers) as ex:
+            for encoded in ex.map(_render_and_encode_page, worker_args):
+                builder.add_encoded_page(encoded)
+    else:
+        for args in worker_args:
+            builder.add_encoded_page(_render_and_encode_page(args))
     builder.save(out_path)
     _set_physical_page_size(out_path, document.render.target_dpi)
     return out_path
@@ -237,4 +427,4 @@ def _set_physical_page_size(pdf_path: str, dpi: int) -> None:
             )
             pg.contents_add(pikepdf.Stream(pdf, b"Q"), prepend=False)
             page.MediaBox = [0, 0, round(w_px * s, 3), round(h_px * s, 3)]
-        pdf.save()
+        pdf.save(deterministic_id=True)
