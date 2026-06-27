@@ -3,7 +3,6 @@ from io import BytesIO
 import numpy as np
 import pytest
 
-pytest.importorskip("hybrid_ocr")
 pytest.importorskip("pikepdf")
 
 import pikepdf
@@ -463,7 +462,7 @@ def test_mrc_keeps_tints_as_raster_overlays(tmp_path):
 
 
 def test_tint_posterized_flate_beats_jpeg_on_flat_halftone():
-    from hybrid_ocr.pdf_export import encode_page_pdf
+    from hokusai_press.pdf_export import encode_page_pdf
 
     rng = np.random.default_rng(1234)
     h, w = 720, 720

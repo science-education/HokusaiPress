@@ -233,3 +233,74 @@ def test_searchable_pdf_builder_internal():
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
+
+
+def test_mrc_page_builder_internal(tmp_path):
+    # Simulating hybrid_ocr is absent
+    with patch.dict(sys.modules, {"hybrid_ocr": None, "hybrid_ocr.pdf_export": None}):
+        from hokusai_press.mrc import MrcPageBuilder
+        # Simple test image
+        img = np.full((100, 100, 3), 255, dtype=np.uint8)
+        img[20:80, 20:80] = 0  # Black square
+
+        builder = MrcPageBuilder(compress="g4", target_dpi=600)
+        lines = [{"text": "テスト", "box": [20, 20, 80, 40], "direction": "h"}]
+        builder.add_page(img, lines, [], mode="bw")
+
+        out_pdf = tmp_path / "mrc_internal.pdf"
+        builder.save(str(out_pdf))
+
+        with pikepdf.open(out_pdf) as pdf:
+            assert len(pdf.pages) == 1
+            page = pdf.pages[0]
+            box = [float(v) for v in page.MediaBox]
+            assert box == [0.0, 0.0, 100.0, 100.0]
+
+
+def test_backend_auto_routing():
+    # 1. When compress='g4', backend='auto' should always select internal
+    with patch.dict(sys.modules, {"hybrid_ocr.pdf_export": None, "hybrid_ocr": None}):
+        builder = SearchablePdfBuilder(compress="g4", backend="auto")
+        from hokusai_press.pdf_export import InternalSearchablePdfBuilder
+        assert isinstance(builder._builder, InternalSearchablePdfBuilder)
+
+    # 2. When compress='jbig2', if pyjbig2 is present, backend='auto' selects internal
+    with patch.dict(sys.modules, {"pyjbig2": sys.modules.get("pyjbig2") or object()}):
+        builder = SearchablePdfBuilder(compress="jbig2", backend="auto")
+        assert isinstance(builder._builder, InternalSearchablePdfBuilder)
+
+    # 3. When compress='jbig2' and pyjbig2 is absent:
+    # If hybrid_ocr is present, backend='auto' routes to hybrid_ocr
+    mock_hybrid = object()
+    with patch.dict(sys.modules, {"pyjbig2": None, "pyjbig2.api": None}):
+        # Mocking SearchablePdfBuilder on hybrid_ocr.pdf_export
+        class MockHybridBuilder:
+            def __init__(self, **kwargs):
+                pass
+
+        class MockModule:
+            SearchablePdfBuilder = MockHybridBuilder
+
+        with patch.dict(sys.modules, {"hybrid_ocr.pdf_export": MockModule, "hybrid_ocr": MockModule}):
+            builder = SearchablePdfBuilder(compress="jbig2", backend="auto")
+            assert builder._builder.__class__.__name__ == "MockHybridBuilder"
+
+
+def test_input_validation():
+    # Invalid image type
+    with pytest.raises(TypeError):
+        decide_page_mode("not an array", [])
+    with pytest.raises(TypeError):
+        encode_page_pdf("not an array", "bw", "g4")
+
+    # Empty array
+    with pytest.raises(ValueError):
+        decide_page_mode(np.array([]), [])
+    with pytest.raises(ValueError):
+        encode_page_pdf(np.array([]), "bw", "g4")
+
+    # Invalid dimension
+    with pytest.raises(ValueError):
+        decide_page_mode(np.zeros((10,)), [])
+    with pytest.raises(ValueError):
+        encode_page_pdf(np.zeros((10,)), "bw", "g4")

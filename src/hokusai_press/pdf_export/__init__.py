@@ -32,20 +32,20 @@ def decide_page_mode(img_bgr: np.ndarray, lines: list, backend: str = "auto") ->
     """auto mode decision for page image mode."""
     if backend not in ("auto", "internal", "hybrid_ocr"):
         raise ValueError(f"backend must be one of {('auto', 'internal', 'hybrid_ocr')}")
+    if not isinstance(img_bgr, np.ndarray):
+        raise TypeError("img_bgr must be a numpy.ndarray")
+    if img_bgr.size == 0 or img_bgr.ndim < 2:
+        raise ValueError("img_bgr must be a non-empty 2D or 3D array")
 
     chosen = backend
     if chosen == "auto":
-        try:
-            import hybrid_ocr.pdf_export  # noqa
-            chosen = "hybrid_ocr"
-        except ImportError:
-            chosen = "internal"
+        chosen = "internal"
 
     if chosen == "hybrid_ocr":
         try:
             from hybrid_ocr.pdf_export import decide_page_mode as hybrid_decide
             return hybrid_decide(img_bgr, lines)
-        except ImportError as e:
+        except (ImportError, AttributeError) as e:
             raise BackendUnavailableError("hybrid_ocr backend is not available") from e
     else:
         return _internal_decide_page_mode(img_bgr, lines)
@@ -61,20 +61,29 @@ def encode_page_pdf(
     """Encode one page image as a single-page PDF (no text layer)."""
     if backend not in ("auto", "internal", "hybrid_ocr"):
         raise ValueError(f"backend must be one of {('auto', 'internal', 'hybrid_ocr')}")
+    if not isinstance(img_bgr, np.ndarray):
+        raise TypeError("img_bgr must be a numpy.ndarray")
+    if img_bgr.size == 0 or img_bgr.ndim < 2:
+        raise ValueError("img_bgr must be a non-empty 2D or 3D array")
 
     chosen = backend
     if chosen == "auto":
-        try:
-            import hybrid_ocr.pdf_export  # noqa
-            chosen = "hybrid_ocr"
-        except ImportError:
-            chosen = "internal"
+        chosen = "internal"
+        if compress == "jbig2":
+            try:
+                import pyjbig2  # noqa
+            except ImportError:
+                try:
+                    import hybrid_ocr.pdf_export  # noqa
+                    chosen = "hybrid_ocr"
+                except ImportError:
+                    pass
 
     if chosen == "hybrid_ocr":
         try:
             from hybrid_ocr.pdf_export import encode_page_pdf as hybrid_encode
             return hybrid_encode(img_bgr, mode, compress)
-        except ImportError as e:
+        except (ImportError, AttributeError) as e:
             raise BackendUnavailableError("hybrid_ocr backend is not available") from e
     else:
         return _internal_encode_page_pdf(img_bgr, mode, compress, jpeg_quality)
@@ -91,17 +100,13 @@ def build_text_overlay(
 
     chosen = backend
     if chosen == "auto":
-        try:
-            import hybrid_ocr.pdf_export  # noqa
-            chosen = "hybrid_ocr"
-        except ImportError:
-            chosen = "internal"
+        chosen = "internal"
 
     if chosen == "hybrid_ocr":
         try:
             from hybrid_ocr.pdf_export import build_text_overlay as hybrid_build
             return hybrid_build(pages, font_path)
-        except ImportError as e:
+        except (ImportError, AttributeError) as e:
             raise BackendUnavailableError("hybrid_ocr backend is not available") from e
     else:
         return _internal_build_text_overlay(pages, font_path)
@@ -171,11 +176,16 @@ class SearchablePdfBuilder:
 
         chosen = self.backend
         if chosen == "auto":
-            try:
-                import hybrid_ocr.pdf_export  # noqa
-                chosen = "hybrid_ocr"
-            except ImportError:
-                chosen = "internal"
+            chosen = "internal"
+            if self.compress == "jbig2":
+                try:
+                    import pyjbig2  # noqa
+                except ImportError:
+                    try:
+                        import hybrid_ocr.pdf_export  # noqa
+                        chosen = "hybrid_ocr"
+                    except ImportError:
+                        pass
 
         if chosen == "hybrid_ocr":
             try:
@@ -185,7 +195,7 @@ class SearchablePdfBuilder:
                     compress=self.compress,
                     font_path=self.font_path,
                 )
-            except ImportError as e:
+            except (ImportError, AttributeError) as e:
                 raise BackendUnavailableError("hybrid_ocr backend is not available") from e
         else:
             if self.compress == "jbig2":

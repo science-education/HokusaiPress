@@ -82,6 +82,11 @@ def _encode_g4(binary: np.ndarray) -> bytes:
     """Encode binary image to CCITT G4 PDF Stream and return PDF bytes."""
     import pikepdf
 
+    if not isinstance(binary, np.ndarray):
+        raise TypeError("binary must be a numpy.ndarray")
+    if binary.ndim != 2 or binary.dtype != np.uint8:
+        raise ValueError("binary must be an HxW uint8 array")
+
     h, w = binary.shape
     pil = Image.fromarray(binary).convert("1")
     buf = BytesIO()
@@ -132,6 +137,11 @@ def _encode_g4(binary: np.ndarray) -> bytes:
 def _encode_jpeg(img_bgr: np.ndarray, color_mode: str, jpeg_quality: int = 85) -> bytes:
     """Encode grayscale/color image to JPEG PDF Stream and return PDF bytes."""
     import pikepdf
+
+    if not isinstance(img_bgr, np.ndarray):
+        raise TypeError("img_bgr must be a numpy.ndarray")
+    if img_bgr.ndim not in (2, 3) or img_bgr.dtype != np.uint8:
+        raise ValueError("img_bgr must be an HxW (uint8) or HxWxC (uint8) array")
 
     h, w = img_bgr.shape[:2]
     if color_mode == "gray":
@@ -246,15 +256,40 @@ def discover_font(font_path: str | None = None) -> str:
     except ImportError:
         pass
 
-    # 2. Check Windows System Fonts
+    # 2. Check System Fonts (Windows, Linux, macOS)
+    candidates = []
+
+    # Windows Fonts
     windir = os.environ.get("WINDIR") or "C:\\Windows"
-    sys_fonts = [
+    candidates.extend([
         os.path.join(windir, "Fonts", "msgothic.ttc"),
         os.path.join(windir, "Fonts", "msmincho.ttc"),
         os.path.join(windir, "Fonts", "yugothm.ttc"),
         os.path.join(windir, "Fonts", "meiryo.ttc"),
+    ])
+
+    # Linux (Ubuntu / Debian / CentOS etc.) Fonts
+    linux_paths = [
+        "/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf",
+        "/usr/share/fonts/opentype/ipafont-mincho/ipam.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/vlgothic/VL-Gothic-Regular.ttf",
+        "/usr/share/fonts/truetype/takao-gothic/TakaoGothic.ttf",
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
     ]
-    for fp in sys_fonts:
+    candidates.extend(linux_paths)
+
+    # macOS Fonts
+    macos_paths = [
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/System/Library/Fonts/PingFang.ttc",
+        "/Library/Fonts/Arial Unicode.ttf",
+    ]
+    candidates.extend(macos_paths)
+
+    for fp in candidates:
         if os.path.exists(fp):
             return fp
 
