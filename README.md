@@ -36,8 +36,7 @@
 pip install -e .[ocr,web]
 # Mac（Apple Silicon）で NDL-OCR/Yomitoku と GPU (MPS) 高速化を利用する場合
 pip install -e ".[mac-ocr,web]"
-# JBIG2を使う場合（既定のG4だけなら不要）
-pip install -e .[ocr,web,jbig2]
+# pyjbig2 は通常インストールで自動導入されます
 hokusai-press run scan.pdf --out book.pdf --device npu      # バッチ解析+生成 (Intel NPU)
 hokusai-press run scan.pdf --out book.pdf --device mps      # バッチ解析+生成 (Mac GPU 高速化)
 hokusai-press run scan.pdf --out book.pdf --layout-engine none --text-engine ppocr-v6 --runtime onnxruntime --device npu
@@ -89,7 +88,7 @@ Intel NPU で実機確認済みの Paddle 経路は `--text-engine ppocr-v6 --ru
   を使う場合、検出器（YomiToku DBNet, CC BY-NC-SA 4.0）の制約により
   **生成された PDF は非商用利用に限定**されます。商用利用が必要な場合は検出器を
   差し替え可能な構成にしてあります（content.py の OCR インターフェース）。
-- optionalのJBIG2エンコーダ [pyjbig2](https://github.com/science-education/pyjbig2)
+- JBIG2エンコーダ [pyjbig2](https://github.com/science-education/pyjbig2)
   はApache-2.0です。`jbig2enc 0.32`由来のlossless generic-region方式で、
   シンボル辞書を使わないため文字置換リスクのある非可逆JBIG2ではありません。
 
