@@ -36,7 +36,30 @@
 pip install -e .[ocr,web]
 # Mac（Apple Silicon）で NDL-OCR/Yomitoku と GPU (MPS) 高速化を利用する場合
 pip install -e ".[mac-ocr,web]"
+# 各モデル自身の検出器＋認識器を使用
+hokusai-press run scan.pdf --out yomitoku.pdf --ocr-engine yomitoku --device mps
+hokusai-press run scan.pdf --out ndlocr.pdf --ocr-engine ndlocr --device cpu
+# Yomitoku系DBNet検出＋NDL系認識、およびYomitoku図版レイアウト
+hokusai-press run scan.pdf --out hybrid.pdf --ocr-engine hybrid --device auto
+
 # pyjbig2 は通常インストールで自動導入されます
+# PaddleOCR-VL-1.6（Python 3.11〜3.13）
+pip install -e ".[paddle-vl,web]"
+hokusai-press run scan.pdf --out book.pdf --layout-engine paddle-vl-1.6 --text-engine paddle-vl-1.6 --runtime paddle --device cpu
+
+# Apple Silicon: PP-DocLayoutV3 (CPU) + PaddleOCR-VL recognition (MLX/Metal)
+pip install -e ".[mlx-vl,web]"
+mlx_vlm.server --port 8111
+hokusai-press run scan.pdf --out book.pdf \
+  --layout-engine paddle-vl-1.6 --text-engine paddle-vl-1.6 \
+  --runtime mlx --device cpu \
+  --mlx-model huggingfinger0/PaddleOCR-VL-1.6-8bit
+
+# Faster/smaller legacy model (PaddleOCR-VL v1, not v1.6)
+hokusai-press run scan.pdf --out book-v1.pdf \
+  --layout-engine paddle-vl-1.6 --text-engine paddle-vl-1.6 \
+  --runtime mlx --device cpu \
+  --mlx-model mlx-community/PaddleOCR-VL-4bit
 hokusai-press run scan.pdf --out book.pdf --device npu      # バッチ解析+生成 (Intel NPU)
 hokusai-press run scan.pdf --out book.pdf --device mps      # バッチ解析+生成 (Mac GPU 高速化)
 hokusai-press run scan.pdf --out book.pdf --layout-engine none --text-engine ppocr-v6 --runtime onnxruntime --device npu

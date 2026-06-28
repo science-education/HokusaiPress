@@ -1,12 +1,38 @@
+import sys
+import types
+
 import numpy as np
 
 from hokusai_press.content import analyze
 from hokusai_press.model import Flag, RegionKind, SourceRef
 from hokusai_press.ocr.paddle import (
+    PaddleOCRVLEngine,
     _runtime_kwargs,
     normalize_paddle_ocr_result,
     normalize_paddle_vl_result,
 )
+
+
+def test_paddle_vl_mlx_configures_recognition_server(monkeypatch):
+    captured = {}
+
+    class FakePaddleOCRVL:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    paddleocr = types.ModuleType("paddleocr")
+    paddleocr.PaddleOCRVL = FakePaddleOCRVL
+    monkeypatch.setitem(sys.modules, "paddleocr", paddleocr)
+    monkeypatch.setenv("HOKUSAI_MLX_MODEL", "mlx-community/PaddleOCR-VL-4bit")
+    monkeypatch.setenv("HOKUSAI_MLX_SERVER_URL", "http://127.0.0.1:9123/")
+
+    PaddleOCRVLEngine(device="mps", engine="mlx")
+
+    assert captured["engine"] == "paddle"
+    assert captured["device"] == "cpu"
+    assert captured["vl_rec_backend"] == "mlx-vlm-server"
+    assert captured["vl_rec_server_url"] == "http://127.0.0.1:9123/"
+    assert captured["vl_rec_api_model_name"] == "mlx-community/PaddleOCR-VL-4bit"
 
 
 def test_normalize_ppocr_v6_result_arrays():
@@ -86,6 +112,74 @@ def test_normalize_paddle_vl_dedupes_nested_ocr_lines():
 
     assert len(result["lines"]) == 1
     assert result["lines"][0]["text"] == "重複"
+
+
+def test_normalize_paddle_vl_dedupes_layout_and_parsing_image():
+    output = [{"res": {
+        "layout_det_res": {"boxes": [{
+            "label": "image", "coordinate": [20, 30, 120, 80], "score": 0.9,
+        }]},
+        "parsing_res_list": [{
+            "block_bbox": [20, 30, 120, 80],
+            "block_label": "image",
+            "block_content": "",
+        }],
+    }}]
+
+    result = normalize_paddle_vl_result(output)
+
+    assert len(result["layout_boxes"]) == 1
+    assert result["layout_boxes"][0]["label"] == "figure"
+
+
+def test_normalize_paddle_vl_16_parsing_blocks():
+    output = [{
+        "res": {
+            "parsing_res_list": [
+                {
+                    "block_bbox": np.array([10, 20, 210, 80]),
+                    "block_label": "text",
+                    "block_content": "縦書き本文",
+                    "block_score": 0.97,
+                },
+                {
+                    "block_bbox": [[20, 100], [220, 100], [220, 260], [20, 260]],
+                    "block_label": "image",
+                    "block_content": "",
+                    "block_score": 0.91,
+                },
+                {
+                    "block_bbox": [230, 300, 260, 330],
+                    "block_label": "number",
+                    "block_content": "31",
+                },
+            ]
+        }
+    }]
+
+    result = normalize_paddle_vl_result(output)
+
+    assert [line["text"] for line in result["lines"]] == ["縦書き本文", "31"]
+    assert result["lines"][0]["box"] == (10.0, 20.0, 210.0, 80.0)
+    assert result["layout_boxes"][0]["label"] == "text"
+    assert result["layout_boxes"][1]["label"] == "figure"
+    assert result["layout_boxes"][2]["label"] == "page_number"
+
+
+def test_normalize_paddle_vl_16_parsing_block_objects():
+    class FakePaddleOCRVLBlock:
+        label = "vertical_text"
+        bbox = [10, 20, 210, 80]
+        content = "オブジェクト形式の本文"
+        polygon_points = None
+
+    output = [{"res": {"parsing_res_list": [FakePaddleOCRVLBlock()]}}]
+
+    result = normalize_paddle_vl_result(output)
+
+    assert result["lines"][0]["text"] == "オブジェクト形式の本文"
+    assert result["lines"][0]["box"] == (10.0, 20.0, 210.0, 80.0)
+    assert result["layout_boxes"][0]["label"] == "text"
 
 
 def test_content_accepts_layout_boxes_from_ocr_engine(monkeypatch):

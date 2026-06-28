@@ -26,6 +26,38 @@ _LAYOUT_IMAGE_LABELS = {
     "formula",
     "algorithm",
     "seal",
+    "header_image",
+    "footer_image",
+}
+
+_LAYOUT_LABEL_MAP = {
+    "text": "text",
+    "vertical_text": "text",
+    "paragraph": "text",
+    "title": "title",
+    "doc_title": "title",
+    "section_title": "title",
+    "section_heading": "title",
+    "caption": "caption",
+    "figure_title": "caption",
+    "table_title": "caption",
+    "header": "running_head",
+    "page_header": "running_head",
+    "footer": "note",
+    "page_footer": "note",
+    "footnote": "note",
+    "aside_text": "note",
+    "number": "page_number",
+    "page_number": "page_number",
+    "image": "figure",
+    "header_image": "figure",
+    "footer_image": "figure",
+    "figure": "figure",
+    "chart": "chart",
+    "table": "table",
+    "formula": "equation",
+    "algorithm": "figure",
+    "seal": "figure",
 }
 
 
@@ -34,6 +66,10 @@ def _device_for_paddle(device: str) -> str | None:
         return None
     if device == "npu":
         return "npu:0"
+    if device == "mps":
+        # PaddlePaddle local inference on Apple Silicon is CPU-only. The
+        # accelerated Apple path is a separate MLX-VLM server backend.
+        return "cpu"
     if device in ("gpu", "xpu", "mlu", "dcu", "metax_gpu", "iluvatar_gpu"):
         return f"{device}:0"
     return device
@@ -155,6 +191,22 @@ def _dedupe_lines(lines: list[OCRLine]) -> list[OCRLine]:
     return out
 
 
+def _dedupe_layout_boxes(boxes: list[LayoutBox]) -> list[LayoutBox]:
+    seen = set()
+    out: list[LayoutBox] = []
+    for item in boxes:
+        box = item.get("box")
+        key = (
+            tuple(round(float(v), 1) for v in box) if box else None,
+            item.get("label"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
 def _build(cls, kwargs: dict[str, Any]):
     """Instantiate a Paddle class across minor API drift.
 
@@ -267,11 +319,12 @@ def _normalize_layout_boxes(data: Mapping[str, Any], source: str) -> list[Layout
     for item in boxes:
         if not isinstance(item, Mapping):
             continue
-        label = str(item.get("label", "")).lower()
+        raw_label = str(item.get("label", "")).lower()
+        label = _LAYOUT_LABEL_MAP.get(raw_label, raw_label)
         coord = item.get("coordinate") or item.get("box") or item.get("bbox")
         if not coord or len(coord) < 4:
             continue
-        if label not in _LAYOUT_IMAGE_LABELS:
+        if raw_label not in _LAYOUT_IMAGE_LABELS:
             continue
         out.append({
             "box": tuple(_to_float(v) for v in coord[:4]),  # type: ignore[typeddict-item]
@@ -280,6 +333,74 @@ def _normalize_layout_boxes(data: Mapping[str, Any], source: str) -> list[Layout
             "source": source,
         })
     return out
+
+
+def _block_box(value: Any) -> tuple[float, float, float, float] | None:
+    if value is None:
+        return None
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.size == 4:
+        return tuple(_to_float(v) for v in arr.reshape(-1))  # type: ignore[return-value]
+    if arr.ndim >= 2 and arr.shape[-1] == 2:
+        return _poly_to_box(arr)
+    return None
+
+
+def _normalize_parsing_blocks(
+    data: Mapping[str, Any], source: str
+) -> tuple[list[OCRLine], list[LayoutBox]]:
+    """Normalize PaddleOCR-VL-1.6's official ``parsing_res_list`` schema."""
+    lines: list[OCRLine] = []
+    layout_boxes: list[LayoutBox] = []
+    blocks = data.get("parsing_res_list", [])
+    if not isinstance(blocks, Iterable) or isinstance(blocks, (str, bytes, Mapping)):
+        return lines, layout_boxes
+
+    for block in blocks:
+        if isinstance(block, Mapping):
+            bbox = block.get("block_bbox", block.get("bbox"))
+            raw_label = str(
+                block.get("block_label", block.get("label", "text"))
+            ).lower()
+            content = block.get("block_content", block.get("content"))
+            score = block.get("block_score", block.get("score"))
+            polygon = block.get("polygon_points")
+        else:
+            # PaddleOCR 3.7 exposes parsing_res_list as PaddleOCRVLBlock
+            # instances. Their JSON field names differ from their attributes.
+            bbox = getattr(block, "bbox", None)
+            raw_label = str(getattr(block, "label", "text")).lower()
+            content = getattr(block, "content", None)
+            score = getattr(block, "score", None)
+            polygon = getattr(block, "polygon_points", None)
+
+        box = _block_box(bbox)
+        if box is None:
+            box = _block_box(polygon)
+        if box is None:
+            continue
+        label = _LAYOUT_LABEL_MAP.get(raw_label, raw_label)
+        layout_boxes.append({
+            "box": box,
+            "label": label,
+            "raw_label": raw_label,
+            "score": None if score is None else _to_float(score),
+            "source": source,
+        })
+
+        if content is None or raw_label in _LAYOUT_IMAGE_LABELS:
+            continue
+        text = str(content).strip()
+        if not text:
+            continue
+        lines.append({
+            "polygon": _box_to_poly(box),
+            "box": box,
+            "text": text,
+            "det_score": None if score is None else _to_float(score),
+            "source": source,
+        })
+    return lines, layout_boxes
 
 
 def normalize_paddle_ocr_result(output: Any, source: str = "ppocr-v6") -> OCRResult:
@@ -300,6 +421,9 @@ def normalize_paddle_vl_result(output: Any, source: str = "paddle-vl") -> OCRRes
         data = _result_mapping(res)
         if not data:
             continue
+        block_lines, block_layout = _normalize_parsing_blocks(data, source)
+        lines.extend(block_lines)
+        layout_boxes.extend(block_layout)
         top_lines = _normalize_lines(data, source)
         lines.extend(top_lines)
         layout_boxes.extend(_normalize_layout_boxes(data, source))
@@ -309,7 +433,11 @@ def normalize_paddle_vl_result(output: Any, source: str = "paddle-vl") -> OCRRes
                 sub = data.get(key)
                 if isinstance(sub, Mapping):
                     lines.extend(_normalize_lines(sub, source))
-    return {"lines": _dedupe_lines(lines), "layout_boxes": layout_boxes, "raw": output}
+    return {
+        "lines": _dedupe_lines(lines),
+        "layout_boxes": _dedupe_layout_boxes(layout_boxes),
+        "raw": output,
+    }
 
 
 class PPOCRv6Engine:
@@ -386,17 +514,39 @@ class PaddleOCRVLEngine:
                 "runtime='paddle', or a genai/server backend."
             )
 
+        mlx_server = engine == "mlx"
         kwargs: dict[str, Any] = {
             "pipeline_version": "v1.6",
             "use_doc_orientation_classify": False,
             "use_doc_unwarping": False,
             "use_layout_detection": True,
-            "engine": engine,
+            # MLX accelerates the VLM recognition stage through its server;
+            # PP-DocLayoutV3 still runs locally with Paddle on Apple Silicon.
+            "engine": "paddle" if mlx_server else engine,
         }
-        kwargs.update(_runtime_kwargs(engine, device))
+        kwargs.update(_runtime_kwargs("paddle" if mlx_server else engine, device))
+        if mlx_server:
+            kwargs.update({
+                "vl_rec_backend": "mlx-vlm-server",
+                "vl_rec_server_url": os.environ.get(
+                    "HOKUSAI_MLX_SERVER_URL", "http://127.0.0.1:8111/"
+                ),
+                "vl_rec_api_model_name": os.environ.get(
+                    "HOKUSAI_MLX_MODEL",
+                    "huggingfinger0/PaddleOCR-VL-1.6-8bit",
+                ),
+            })
+        # The shared default `models/` directory contains hybrid-ocr ONNX
+        # files, not Paddle models. Only opt into local Paddle weights when
+        # the caller supplies the two explicit subdirectories; otherwise let
+        # PaddleOCR download the official v1.6 models.
         if existing := _existing_model_dir(model_dir):
-            kwargs["layout_detection_model_dir"] = existing
-            kwargs["vl_rec_model_dir"] = existing
+            layout_dir = os.path.join(existing, "paddleocr-vl-layout")
+            vl_dir = os.path.join(existing, "PaddleOCR-VL-1.6")
+            if os.path.isdir(layout_dir):
+                kwargs["layout_detection_model_dir"] = layout_dir
+            if os.path.isdir(vl_dir):
+                kwargs["vl_rec_model_dir"] = vl_dir
         self._pipeline = _build(
             PaddleOCRVL,
             {k: v for k, v in kwargs.items() if v is not None},

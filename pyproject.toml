@@ -24,12 +24,24 @@ dependencies = [
 [project.optional-dependencies]
 # OCR + searchable-PDF assembly engine (detector is CC BY-NC-SA 4.0 -> output
 # is non-commercial; see README).
-ocr = ["hybrid-ocr[pdf] @ git+https://github.com/science-education/Yomitoku_NDL-OCR-Lite.git"]
+ocr = [
+    "hybrid-ocr[pdf] @ git+https://github.com/science-education/Yomitoku_NDL-OCR-Lite.git",
+    "yomitoku>=0.4.1",
+    "ndlocr-lite @ git+https://github.com/ndl-lab/ndlocr-lite.git@7fd36cd58df7df1270ac19c7231988a77ec980ab",
+]
 # Complete Mac setup: hybrid-ocr + PyTorch for MPS (GPU) acceleration
-mac-ocr = ["hybrid-ocr[pdf] @ git+https://github.com/science-education/Yomitoku_NDL-OCR-Lite.git", "torch", "torchvision"]
+mac-ocr = [
+    "hybrid-ocr[pdf] @ git+https://github.com/science-education/Yomitoku_NDL-OCR-Lite.git",
+    "yomitoku>=0.4.1",
+    "ndlocr-lite @ git+https://github.com/ndl-lab/ndlocr-lite.git@7fd36cd58df7df1270ac19c7231988a77ec980ab",
+    "torch",
+    "torchvision",
+]
 # PaddleOCR engines are optional because their runtime and accelerator wheels
 # vary by hardware. PaddleOCR-VL needs the doc-parser extra.
 paddle = ["paddleocr>=3.7.0", "paddlex[ocr]>=3.7.0"]
+paddle-vl = ["paddlepaddle>=3.2.1", "paddleocr[doc-parser]>=3.7.0"]
+mlx-vl = ["paddlepaddle>=3.2.1", "paddleocr[doc-parser]>=3.7.0", "mlx-vlm>=0.3.11"]
 paddle-structure = ["paddlepaddle"]
 # CTC digit recognizer for folio/page-number detection (nombre_reader.py).
 nombre = ["onnxruntime"]

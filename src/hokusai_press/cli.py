@@ -152,18 +152,21 @@ def main(argv=None) -> int:
                        choices=["auto", "hybrid", "yomitoku", "ndlocr",
                                 "ppocr-v6", "paddleocr-v6",
                                 "pp-structurev3", "pp-structure",
-                                "paddle-vl", "paddleocr-vl", "none"],
+                                "paddle-vl", "paddleocr-vl",
+                                "paddle-vl-1.6", "paddleocr-vl-1.6", "none"],
                        help="legacy combined engine selector. Prefer "
                             "--layout-engine and --text-engine for new runs")
     p_run.add_argument("--layout-engine", default=None,
                        choices=["none", "yomitoku", "pp-structurev3",
-                                "pp-structure", "paddle-vl", "paddleocr-vl"],
+                                "pp-structure", "paddle-vl", "paddleocr-vl",
+                                "paddle-vl-1.6", "paddleocr-vl-1.6"],
                        help="layout engine: Yomitoku RT-DETR, PP-StructureV3, "
                             "PaddleOCR-VL, or none")
     p_run.add_argument("--text-engine", default=None,
-                       choices=["none", "ndlocr", "ppocr-v6", "paddleocr-v6",
-                                "paddle-vl", "paddleocr-vl"],
-                       help="text OCR engine: NDL-OCR/hybrid, PP-OCRv6, "
+                       choices=["none", "yomitoku", "ndlocr", "ppocr-v6", "paddleocr-v6",
+                                "paddle-vl", "paddleocr-vl",
+                                "paddle-vl-1.6", "paddleocr-vl-1.6"],
+                       help="text OCR engine: Yomitoku, NDL-OCR Lite, PP-OCRv6, "
                             "PaddleOCR-VL, or none")
     p_run.add_argument("--device", default="auto", choices=["auto", "cpu", "npu", "cuda", "dml", "qnn", "mps"],
                        help="compute device for OCR. hybrid: auto|cpu|npu|cuda|dml|qnn; "
@@ -171,8 +174,17 @@ def main(argv=None) -> int:
                             "by the installed Paddle runtime")
     p_run.add_argument("--runtime", default=None,
                        choices=["auto", "openvino", "onnxruntime", "paddle",
-                                "transformers"],
+                                "transformers", "mlx"],
                        help="runtime/backend for selected engines")
+    p_run.add_argument(
+        "--mlx-model",
+        default="huggingfinger0/PaddleOCR-VL-1.6-8bit",
+        help="Hugging Face model ID served by mlx-vlm when --runtime mlx",
+    )
+    p_run.add_argument(
+        "--mlx-server-url", default="http://127.0.0.1:8111/",
+        help="mlx-vlm OpenAI-compatible server URL when --runtime mlx",
+    )
     p_run.add_argument("--paddle-engine", default=None,
                        choices=["paddle", "transformers", "onnxruntime"],
                        help="deprecated alias for --runtime")
@@ -256,6 +268,9 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "run":
+        if (args.runtime or args.paddle_engine) == "mlx":
+            os.environ["HOKUSAI_MLX_MODEL"] = args.mlx_model
+            os.environ["HOKUSAI_MLX_SERVER_URL"] = args.mlx_server_url
         sources = _expand_sources(args.source)
         if not sources:
             print("no input files matched")

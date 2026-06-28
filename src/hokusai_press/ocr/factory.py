@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gc
 import importlib.util
+import os
 import threading
 from dataclasses import dataclass
 
@@ -23,6 +24,8 @@ class OCRConfig:
     device: str
     runtime: str | None
     openvino_cache_dir: str | None
+    mlx_model: str | None
+    mlx_server_url: str | None
 
 
 _engine: OCREngine | None = None
@@ -50,6 +53,10 @@ def get_ocr_engine(
         device=device,
         runtime=runtime,
         openvino_cache_dir=openvino_cache_dir,
+        mlx_model=os.environ.get("HOKUSAI_MLX_MODEL") if runtime == "mlx" else None,
+        mlx_server_url=(
+            os.environ.get("HOKUSAI_MLX_SERVER_URL") if runtime == "mlx" else None
+        ),
     )
     if _engine is not None and _config == cfg:
         return _engine
@@ -63,7 +70,24 @@ def get_ocr_engine(
 
         # Avoid loading a heavy VLM or out-of-process worker twice when the user
         # intentionally delegates both layout and text to one backend.
-        if layout_name == "paddle-vl" and text_name == "paddle-vl":
+        if layout_name == "hybrid" and text_name == "hybrid":
+            from .hybrid import HybridOCREngine, YomitokuLayoutEngine
+
+            _engine = CompositeOCREngine(
+                text_engine=HybridOCREngine(
+                    model_dir, device, openvino_cache_dir
+                ),
+                layout_engine=YomitokuLayoutEngine(device),
+            )
+        elif layout_name == "yomitoku" and text_name == "yomitoku":
+            from .native import YomitokuOCREngine
+
+            _engine = YomitokuOCREngine(device)
+        elif layout_name == "ndlocr" and text_name == "ndlocr":
+            from .native import NdlocrLiteEngine
+
+            _engine = NdlocrLiteEngine(device)
+        elif layout_name == "paddle-vl" and text_name == "paddle-vl":
             from .paddle import PaddleOCRVLEngine
 
             _engine = PaddleOCRVLEngine(model_dir, device, runtime)
@@ -91,16 +115,18 @@ def resolve_engine_selection(
 
     legacy = _norm(legacy_engine or "hybrid")
     legacy_map = {
-        "auto": ("yomitoku", "ndlocr"),
-        "hybrid": ("yomitoku", "ndlocr"),
-        "yomitoku": ("yomitoku", "ndlocr"),
-        "ndlocr": ("yomitoku", "ndlocr"),
+        "auto": ("hybrid", "hybrid"),
+        "hybrid": ("hybrid", "hybrid"),
+        "yomitoku": ("yomitoku", "yomitoku"),
+        "ndlocr": ("ndlocr", "ndlocr"),
         "ppocr-v6": ("none", "ppocr-v6"),
         "paddleocr-v6": ("none", "ppocr-v6"),
         "pp-structurev3": ("pp-structurev3", "none"),
         "pp-structure": ("pp-structurev3", "none"),
         "paddle-vl": ("paddle-vl", "paddle-vl"),
         "paddleocr-vl": ("paddle-vl", "paddle-vl"),
+        "paddle-vl-1.6": ("paddle-vl", "paddle-vl"),
+        "paddleocr-vl-1.6": ("paddle-vl", "paddle-vl"),
         "deim-oop": ("deim-oop", "deim-oop"),
         "none": ("none", "none"),
     }
@@ -116,6 +142,8 @@ def _norm(name: str | None) -> str:
     aliases = {
         "paddleocr-v6": "ppocr-v6",
         "paddleocr-vl": "paddle-vl",
+        "paddle-vl-1.6": "paddle-vl",
+        "paddleocr-vl-1.6": "paddle-vl",
         "pp-structure": "pp-structurev3",
         "ppstructurev3": "pp-structurev3",
         "off": "none",
@@ -134,9 +162,13 @@ def _build_text_engine(
     if name == "none":
         return None
     if name == "ndlocr":
-        from .hybrid import NdlocrTextEngine
+        from .native import NdlocrLiteEngine
 
-        return NdlocrTextEngine(model_dir, device, openvino_cache_dir)
+        return NdlocrLiteEngine(device)
+    if name == "yomitoku":
+        from .native import YomitokuOCREngine
+
+        return YomitokuOCREngine(device)
     if name == "ppocr-v6":
         from .paddle import PPOCRv6Engine
 
