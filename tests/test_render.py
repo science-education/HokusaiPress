@@ -59,6 +59,26 @@ def test_margin_fill_whitens_outside_content_keeps_content():
     assert (out[:, 0:110] == 0).sum() == 0     # left margin (edge line) whitened
 
 
+def test_margin_fill_keeps_complete_glyph_crossing_tight_content_box():
+    settings = RenderSettings(target_dpi=600, output_margin_mm=0.0)
+    img = np.full((300, 300, 3), 255, dtype=np.uint8)
+    # A glyph whose detector box ends 10 px inside its rightmost stroke.
+    # The outside part is connected to real ink inside the content box.
+    img[80:160, 170:210] = 0
+    # A disconnected margin mark must still be removed.
+    img[200:220, 230:240] = 0
+    params = _params(Box(80, 70, 200, 180), dpi=600)
+    params.margin.crop = Box(50, 50, 260, 250)
+
+    out, _, _, _ = render_page_image(img, params, settings)
+
+    # crop x0=50: the complete source glyph x=170:210 maps to x=120:160.
+    assert (out[30:110, 120:160] == 0).all()
+    # The disconnected source mark x=230:240, y=200:220 maps to x=180:190,
+    # y=150:170 and remains outside the protected connected content.
+    assert (out[150:170, 180:190] == 255).all()
+
+
 def test_remove_edge_shadows_whitens_band_keeps_content():
     img = np.full((400, 300, 3), 255, dtype=np.uint8)
     img[:, 294:300] = 0          # full-height dark bar at the right edge = shadow

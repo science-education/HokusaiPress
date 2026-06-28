@@ -109,6 +109,53 @@ def _map_box(box: Box, M: np.ndarray) -> Box:
                float(out[0].max()), float(out[1].max()))
 
 
+def _expand_fill_box_to_connected_ink(
+    image_bgr: np.ndarray,
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+) -> tuple[int, int, int, int]:
+    """Keep whole ink components that cross a detected content boundary.
+
+    OCR/content boxes are intentionally tight and can end a few pixels inside
+    an antialiased glyph.  Using such a box directly as a destructive white-fill
+    boundary slices the outside edge off that glyph.  Components which have any
+    ink inside the box are real content, so grow the box to their full extent.
+    Disconnected scanner shadows and margin specks remain outside and are still
+    removed by the caller.
+    """
+    h, w = image_bgr.shape[:2]
+    if x0 >= x1 or y0 >= y1:
+        return x0, y0, x1, y1
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    ink = (gray < 200).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    if count <= 1:
+        return x0, y0, x1, y1
+
+    inside_labels = np.unique(labels[y0:y1, x0:x1])
+    inside_labels = inside_labels[inside_labels != 0]
+    if inside_labels.size == 0:
+        return x0, y0, x1, y1
+
+    selected = stats[inside_labels]
+    left = int(selected[:, cv2.CC_STAT_LEFT].min())
+    top = int(selected[:, cv2.CC_STAT_TOP].min())
+    right = int((selected[:, cv2.CC_STAT_LEFT] + selected[:, cv2.CC_STAT_WIDTH]).max())
+    bottom = int((selected[:, cv2.CC_STAT_TOP] + selected[:, cv2.CC_STAT_HEIGHT]).max())
+
+    # One extra pixel protects the lighter antialias fringe around the dark
+    # connected core without materially enlarging the retained margin.
+    return (
+        max(0, min(x0, left - 1)),
+        max(0, min(y0, top - 1)),
+        min(w, max(x1, right + 1)),
+        min(h, max(y1, bottom + 1)),
+    )
+
+
 def render_page_image(
     original_bgr: np.ndarray,
     params: PageParams,
@@ -169,6 +216,9 @@ def render_page_image(
         y0 = max(0, min(oh, int(round(b.y0))))
         x1 = max(0, min(ow, int(round(b.x1))))
         y1 = max(0, min(oh, int(round(b.y1))))
+        x0, y0, x1, y1 = _expand_fill_box_to_connected_ink(
+            out, x0, y0, x1, y1
+        )
         out[:y0, :] = 255
         out[y1:, :] = 255
         out[:, :x0] = 255

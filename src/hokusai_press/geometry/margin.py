@@ -336,18 +336,33 @@ def region_shadow_mask(gray: np.ndarray, regions) -> np.ndarray:
     for a, b in bands:
         if b - a < 1:
             continue
-        band = cv2.dilate(dark[:, a:b], gap_kernel)
+        # Include a strip on the content side while labeling. OCR boxes can end
+        # a few pixels inside a glyph; labeling only the nominal margin severs
+        # that outside sliver from the rest of the glyph and makes the sliver
+        # look exactly like a thin vertical shadow. A real shadow remains a
+        # disconnected component, whereas real ink crossing the OCR boundary
+        # is connected back into this guard strip and must be protected.
+        guard = max(32, 2 * halo + 2)
+        ea = max(0, a - guard) if a > 0 else a
+        eb = min(w, b + guard) if b < w else b
+        band = cv2.dilate(dark[:, ea:eb], gap_kernel)
         n, lbl, stats, _ = cv2.connectedComponentsWithStats(band, connectivity=8)
+        protected_labels: set[int] = set()
+        if a > ea:  # right margin: protect components reaching left into content
+            protected_labels.update(int(v) for v in np.unique(lbl[:, :a - ea]) if v)
+        if eb > b:  # left margin: protect components reaching right into content
+            protected_labels.update(int(v) for v in np.unique(lbl[:, b - ea:]) if v)
         line_labels = [
             i for i in range(1, n)
             if stats[i, 3] >= SHADOW_MIN_HEIGHT_PX
             and stats[i, 3] >= SHADOW_ASPECT_MIN * stats[i, 2]
+            and i not in protected_labels
         ]
         if not line_labels:
             continue
         comp = np.isin(lbl, line_labels)
         comp = cv2.dilate(comp.astype(np.uint8), np.ones((1, 2 * halo + 1), np.uint8)) > 0
-        out[:, a:b] |= comp
+        out[:, a:b] |= comp[:, a - ea:b - ea]
     # protect figures/photos: never whiten inside a non-text region
     for r in regions or []:
         if r.kind == RegionKind.TEXT or r.box is None:

@@ -239,3 +239,19 @@ def test_region_shadow_keeps_margin_text():
     regions = [_txt(80, 40, 250, 360)]
     out = remove_region_shadows(g, regions)
     assert (out[:, 12:20] < 128).any()    # sparse margin marks kept (not a line)
+
+
+def test_region_shadow_keeps_glyph_crossing_tight_text_boundary():
+    # A vertical glyph can extend beyond the OCR box. Looking only outside the
+    # box turns that clipped-off sliver into a tall/thin false shadow. Its
+    # connection to ink inside the box must protect the whole glyph, while a
+    # separate real margin line is still removed.
+    g = np.full((400, 300), 255, dtype=np.uint8)
+    g[80:320, 235:260] = 0                # glyph crosses right OCR edge x=250
+    g[40:360, 285:288] = 30               # disconnected right-margin shadow
+    regions = [_txt(80, 40, 250, 360)]
+
+    out = remove_region_shadows(g, regions)
+
+    assert (out[80:320, 235:260] == 0).all()
+    assert (out[40:360, 285:288] == 255).all()
