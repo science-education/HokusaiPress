@@ -455,6 +455,7 @@ def build_pdf(
             builder.add_encoded_page(_render_and_encode_page(args))
     builder.save(out_path)
     _set_physical_page_size(out_path, document.render.target_dpi)
+    _add_pdf_metadata(out_path, document)
     return out_path
 
 
@@ -477,4 +478,82 @@ def _set_physical_page_size(pdf_path: str, dpi: int) -> None:
             )
             pg.contents_add(pikepdf.Stream(pdf, b"Q"), prepend=False)
             page.MediaBox = [0, 0, round(w_px * s, 3), round(h_px * s, 3)]
+        pdf.save(deterministic_id=True)
+
+
+def _add_pdf_metadata(pdf_path: str, document: Document) -> None:
+    import pikepdf
+    from .profile import detect_writing_direction, detect_binding
+    from dataclasses import dataclass
+
+    nums = []
+    current_style = None
+    expected_next = None
+
+    for i, p in enumerate(document.pages):
+        num = p.page_number
+        text = p.nombre_text or ""
+        
+        if num is None:
+            style = "empty"
+            offset = None
+        else:
+            if any(c in "ivxIVX" for c in text):
+                style = "/r"
+            else:
+                style = "/D"
+            offset = num
+            
+        if style != current_style or (style != "empty" and offset != expected_next):
+            if style == "empty":
+                nums.extend([i, pikepdf.Dictionary()])
+            else:
+                nums.extend([i, pikepdf.Dictionary(S=pikepdf.Name(style), St=offset)])
+            current_style = style
+            
+        if style != "empty":
+            expected_next = offset + 1
+
+    @dataclass
+    class _TempRegionFeature:
+        cls: str
+        x0: float
+        y0: float
+        x1: float
+        y1: float
+
+    @dataclass
+    class _TempPageFeature:
+        page_index: int
+        nombre_cx: float | None
+        deskew_angle: float = 0.0
+        content_w: float = 0.0
+        content_h: float = 0.0
+        nombre_value: float | None = None
+        is_ocr: bool = False
+
+    r_features = []
+    p_features = []
+    for i, p in enumerate(document.pages):
+        for r in p.regions:
+            r_features.append(_TempRegionFeature(r.kind.value, r.box.x0, r.box.y0, r.box.x1, r.box.y1))
+        cx = None
+        if p.margin and p.margin.nombre_box and p.margin.page_w:
+            cx = (p.margin.nombre_box.x0 + p.margin.nombre_box.x1) / 2.0 / p.margin.page_w
+        p_features.append(_TempPageFeature(i, cx))
+        
+    wd = detect_writing_direction(r_features)
+    binding = detect_binding(p_features, wd)
+
+    with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
+        if nums:
+            pdf.Root.PageLabels = pikepdf.Dictionary(Nums=pikepdf.Array(nums))
+            
+        if binding == "right":
+            pdf.Root.ViewerPreferences = pikepdf.Dictionary(Direction=pikepdf.Name("/R2L"))
+            pdf.Root.PageLayout = pikepdf.Name("/TwoColumnRight")
+        elif binding == "left":
+            pdf.Root.ViewerPreferences = pikepdf.Dictionary(Direction=pikepdf.Name("/L2R"))
+            pdf.Root.PageLayout = pikepdf.Name("/TwoColumnLeft")
+
         pdf.save(deterministic_id=True)
