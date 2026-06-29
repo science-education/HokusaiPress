@@ -24,6 +24,7 @@ Runs only when OCR produced text; with --no-ocr the geometric box stands.
 
 from __future__ import annotations
 
+import difflib
 import os
 import re
 from collections import Counter
@@ -167,6 +168,8 @@ def _candidates(params: PageParams, page_h: float):
             continue
         if value is not None and value > 0:
             out.append((band, kind, value, region))
+        else:
+            out.append((band, "unparsed", None, region))
     for r in params.regions:
         if not r.ocr_text:
             continue
@@ -182,9 +185,15 @@ def _candidates(params: PageParams, page_h: float):
             out.append((b, "roman", rv, r))
             continue
         # number fused with the running header ('112第3部'): recover the digits
-        for v, sub in _fused_digit_candidates(r, page_h):
-            out.append((b, "num", v, Region(kind=r.kind, box=sub,
-                                            ocr_text=str(v), source=r.source)))
+        fused = _fused_digit_candidates(r, page_h)
+        if fused:
+            for v, sub in fused:
+                out.append((b, "num", v, Region(kind=r.kind, box=sub,
+                                                ocr_text=str(v), source=r.source)))
+            continue
+        
+        # Keep as unparsed for fuzzy matching fallback
+        out.append((b, "unparsed", None, r))
     return out
 
 
@@ -211,7 +220,7 @@ def _position_clustered_candidates(cands, pages, page_heights, page_widths, max_
     clusters: list[dict] = []
     for i, cl in enumerate(cands):
         for cand_i, (band, kind, v, r) in enumerate(cl):
-            if v > max_v:
+            if v is None or v > max_v:
                 continue
             x, y = _cluster_feature(r.box, page_widths[i], page_heights[i])
             best = None
@@ -330,7 +339,7 @@ def resolve(
     votes: Counter = Counter()
     for i, cl in enumerate(cands):
         for b, kind, v, _ in cl:
-            if b == band and v <= max_v:
+            if b == band and v is not None and v <= max_v:
                 votes[(kind, v - i)] += 1
     supported = {k for k, c in votes.items() if c >= min_support}
     if not supported and clustered is not None:
@@ -352,7 +361,7 @@ def resolve(
     anchors = []
     for i, cl in enumerate(assign_cands):
         for b, kind, v, r in cl:
-            if b != band or v > max_v or (kind, v - i) != dominant:
+            if b != band or v is None or v > max_v or (kind, v - i) != dominant:
                 continue
             fx, fy = _box_center_frac(r.box, page_widths[i], page_heights[i])
             anchors.append((pages[i].source.page_index, fx, fy))
@@ -372,7 +381,7 @@ def _assign_supported(pages, cands, band, votes, supported, max_v) -> list[str]:
     for i, (p, cl) in enumerate(zip(pages, cands)):
         choice, best_sup = None, -1
         for b, kind, v, r in cl:
-            if b != band or v > max_v:
+            if b != band or v is None or v > max_v:
                 continue
             key = (kind, v - i)
             if key in supported and votes[key] > best_sup:
@@ -517,9 +526,11 @@ def _in_position_candidate(p, cl, i, band, max_v, page_heights, page_widths,
     as (kind, v, r), or None."""
     best = None
     for b, kind, v, r in cl:
-        if b != band or v > max_v:
+        if b != band:
             continue
-        if not predicate(kind, v - i):
+        if v is not None and v > max_v:
+            continue
+        if not predicate(kind, v if v is not None else -1 - i):
             continue
         if _inside_position_model(
                 p.source.page_index, r.box, page_heights[i], page_widths[i],
@@ -549,7 +560,7 @@ def _assign_with_position_model(
     for i, (p, cl) in enumerate(zip(pages, cands)):
         in_model = []
         for b, kind, v, r in cl:
-            if b != band or v > max_v or (kind, v - i) not in primary:
+            if b != band or v is None or v > max_v or (kind, v - i) not in primary:
                 continue
             if _inside_position_model(
                     p.source.page_index, r.box, page_heights[i],
@@ -588,6 +599,33 @@ def _assign_with_position_model(
             lambda kind, off: kind == dom_kind)
         if cand is not None:
             chosen[i] = (dom_kind, i + dom_offset, cand[2])  # misread -> expected
+
+    # Pass 2.5: Similarity Rescue
+    # For pages that still have no valid candidate, check unparsed candidates.
+    # If an unparsed candidate sits in the correct geometric position, compute
+    # similarity to the expected number (i + dom_offset).
+    for i, (p, cl) in enumerate(zip(pages, cands)):
+        if chosen[i] is not None:
+            continue
+        expected_val = i + dom_offset
+        if expected_val <= 0:
+            continue
+        expected_str = str(expected_val)
+        best_sim_cand = None
+        best_sim = 0.0
+        for b, kind, v, r in cl:
+            if b != band or v is not None:
+                continue
+            if not _inside_position_model(p.source.page_index, r.box, page_heights[i], page_widths[i], model):
+                continue
+            if not r.ocr_text:
+                continue
+            sim = difflib.SequenceMatcher(None, expected_str, r.ocr_text).ratio()
+            if sim >= 0.7 and sim > best_sim:
+                best_sim = sim
+                best_sim_cand = r
+        if best_sim_cand is not None:
+            chosen[i] = (dom_kind, expected_val, best_sim_cand)
 
     # Pass 3 (anchor-only, no page_number): a page with no in-position primary
     # or bracketed-misread candidate -- e.g. front matter that has its own real

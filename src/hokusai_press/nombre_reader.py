@@ -38,7 +38,7 @@ IDX_TO_CHAR = {i + 1: c for i, c in enumerate(CHARSET)}
 @dataclass(frozen=True)
 class Cand:
     band: str
-    value: int
+    value: int | None
     kind: str
     box: Box
     pos: tuple[float, float, float]
@@ -89,7 +89,7 @@ def read_folio_candidates(
         # weaker method's competing misreading into the cross-page vote (it
         # regressed otsu-strong books). Per-box best-confidence lets sauvola win a
         # faint corner crop and otsu win a clean one without doubling the vote.
-        best: tuple[float, int, str, str] | None = None
+        best: tuple[float, int | None, str, str] | None = None
         for method in methods:
             text, conf = recognizer.predict(crop, method)
             value = parse_numeral(text)
@@ -98,7 +98,9 @@ def read_folio_candidates(
                 value = parse_roman(text)
                 kind = "roman"
             if value is None or value <= 0:
-                continue
+                # Keep unparsed strings for fuzzy matching later, but set value to None
+                value = None
+                kind = "unparsed"
             if best is None or conf > best[0]:
                 best = (conf, value, kind, text)
         if best is None:
