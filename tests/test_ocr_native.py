@@ -6,7 +6,9 @@ import numpy as np
 from hokusai_press.ocr.native import (
     NdlocrLiteEngine,
     YomitokuOCREngine,
+    _RecordingDetector,
 )
+from hokusai_press.ocr.crop_policy import CropPadding, expand_quad, parse_overrides
 
 
 class _Word:
@@ -99,3 +101,31 @@ def test_ndlocr_native_engine_normalizes_lines_and_layout(monkeypatch):
         "score": 0.95,
         "source": "ndlocr-lite",
     }]
+
+
+def test_crop_padding_parses_pixels_and_percent():
+    values = parse_overrides(["ndlocr=4px", "yomitoku=2%"])
+    assert values["ndlocr"] == CropPadding(pixels=4.0)
+    assert values["yomitoku"] == CropPadding(ratio=0.02)
+
+
+def test_expand_quad_uses_short_side_and_clamps():
+    result = expand_quad(
+        [[1, 2], [21, 2], [21, 12], [1, 12]],
+        (20, 30, 3), CropPadding(ratio=0.2),
+    )
+    assert result.tolist() == [[0.0, 0.0], [23.0, 0.0], [23.0, 14.0], [0.0, 14.0]]
+
+
+def test_ndl_padding_expands_text_but_not_figure():
+    class Detector:
+        def detect(self, image):
+            return [
+                {"box": [10, 20, 40, 30], "class_index": 1},
+                {"box": [10, 40, 40, 60], "class_index": 6},
+            ]
+
+    detector = _RecordingDetector(Detector(), CropPadding(pixels=2))
+    detections = detector.detect(np.zeros((100, 100, 3), dtype=np.uint8))
+    assert detections[0]["box"] == [8.0, 18.0, 42.0, 32.0]
+    assert detections[1]["box"] == [10, 40, 40, 60]

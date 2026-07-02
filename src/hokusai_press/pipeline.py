@@ -346,7 +346,22 @@ def analyze_document(
                 )
                 for c in rcands
             ]
+            params.nombre_evidence["dedicated_ocr"] = [
+                {
+                    "band": c.band, "kind": c.kind, "value": c.value,
+                    "text": c.text, "confidence": c.conf,
+                    "box": {"x0": c.box.x0, "y0": c.box.y0,
+                            "x1": c.box.x1, "y1": c.box.y1},
+                    "position": list(c.pos),
+                }
+                for c in rcands
+            ]
+    for params, h, w in zip(doc.pages, heights, widths):
+        params.nombre_evidence["main_ocr"] = nombre_mod.main_ocr_evidence(
+            params, h, w)
     warnings = nombre_mod.resolve(doc.pages, heights, widths)
+    nombre_mod.finalize_pagination(doc.pages)
+    nombre_mod.record_decisions(doc.pages)
 
     # 6. cross-page margin consistency + nombre-anchored normalization.
     # A confirmed-blank page (rendered as pure white regardless of margin/

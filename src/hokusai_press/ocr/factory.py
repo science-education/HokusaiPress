@@ -26,6 +26,7 @@ class OCRConfig:
     openvino_cache_dir: str | None
     mlx_model: str | None
     mlx_server_url: str | None
+    crop_padding: str | None
 
 
 _engine: OCREngine | None = None
@@ -57,6 +58,7 @@ def get_ocr_engine(
         mlx_server_url=(
             os.environ.get("HOKUSAI_MLX_SERVER_URL") if runtime == "mlx" else None
         ),
+        crop_padding=os.environ.get("HOKUSAI_OCR_CROP_PADDING"),
     )
     if _engine is not None and _config == cfg:
         return _engine

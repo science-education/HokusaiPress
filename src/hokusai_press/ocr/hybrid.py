@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 
+from .crop_policy import expand_quad, get_crop_padding
+
 
 class _OnnxOutputNameCompatSession:
     """Translate hybrid-ocr's legacy output name for single-output models.
@@ -38,6 +40,19 @@ def _fix_detector_output_name(engine) -> None:
         detector.session = _OnnxOutputNameCompatSession(session, output_names[0])
 
 
+class _ExpandingHybridDetector:
+    def __init__(self, detector, padding):
+        self._detector = detector
+        self._padding = padding
+
+    def detect(self, image):
+        quads, scores = self._detector.detect(image)
+        return ([expand_quad(q, image.shape, self._padding) for q in quads], scores)
+
+    def __getattr__(self, name):
+        return getattr(self._detector, name)
+
+
 class HybridOCREngine:
     def __init__(self, model_dir: str, device: str, openvino_cache_dir=None):
         from hybrid_ocr.pipeline import HybridOCR  # lazy, optional dependency
@@ -55,6 +70,9 @@ class HybridOCREngine:
             openvino_cache_dir=openvino_cache_dir,
         )
         _fix_detector_output_name(self._engine)
+        self._engine.detector = _ExpandingHybridDetector(
+            self._engine.detector, get_crop_padding("hybrid")
+        )
 
     def __call__(self, image_bgr):
         result = self._engine(image_bgr)

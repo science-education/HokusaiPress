@@ -32,7 +32,10 @@ from dataclasses import dataclass
 from statistics import median
 from typing import Optional
 
-from .model import Box, Flag, PageParams, Region  # noqa: F401
+from .model import (
+    Box, Flag, NumberingSystem, PageParams, PaginationDecision,
+    PaginationMethod, PaginationRole, PrintedFolio, Region,
+)
 
 BAND_FRAC = 0.14          # top/bottom 14% of the page is the nombre band
 MAX_NOMBRE_LEN = 6        # a page-number token is short
@@ -54,10 +57,333 @@ POS_CLUSTER_Y = 0.030
 POS_CLUSTER_MIN_SUPPORT = 3
 POS_CLUSTER_MIN_OFFSET_SUPPORT = 2
 
+# Human-estimated book-design priors. They are ranking evidence, not hard
+# exclusions: unusual books remain possible when OCR/geometry strongly agrees.
+PRIOR_COVER_UNNUMBERED = 0.99
+PRIOR_PRE_TOC_UNNUMBERED = 0.90
+PRIOR_ALTERNATING_SIDES = 0.99
+PRIOR_POSITION_CONSISTENT = 0.95
+PRIOR_HEIGHT_ALIGNED = 0.99
+PRIOR_OUTSIDE_BODY = 0.95
+
 _KANJI_DIGIT = {"〇": 0, "零": 0, "一": 1, "二": 2, "三": 3, "四": 4,
                 "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
 _KANJI_UNIT = {"十": 10, "百": 100, "千": 1000}
 _ROMAN = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}
+
+
+@dataclass(frozen=True)
+class _SequenceCandidate:
+    page: int
+    band: str
+    kind: str
+    value: int
+    region: Region
+    fx: float
+    fy: float
+    variant: str
+
+
+def _sequence_candidates(pages, page_heights, page_widths):
+    """Candidates from the main OCR only, including vertical digit reversal.
+
+    The small folio CTC model is useful as a fallback crop recognizer, but its
+    broad corner probes produce too many false positives to establish a number
+    sequence. Main OCR regions provide much stronger geometry. For vertical
+    Japanese folios OCR engines may return 12 as 21, so both orders participate
+    in sequence voting; geometry and neighbouring pages decide which one wins.
+    """
+    out: list[_SequenceCandidate] = []
+    for i, (page, h, w) in enumerate(zip(pages, page_heights, page_widths)):
+        for region in page.regions:
+            text = (region.ocr_text or "").strip()
+            band = _band(region.box, h)
+            if not text or band is None or len(text) > MAX_NOMBRE_LEN:
+                continue
+            fx, fy = _box_center_frac(region.box, w, h)
+            value = parse_numeral(text)
+            if value is not None and 0 < value <= len(pages) + 200:
+                out.append(_SequenceCandidate(
+                    i, band, "num", value, region, _cluster_x(fx), fy, "direct"))
+                normalized = text.translate(
+                    {ord("０") + n: ord("0") + n for n in range(10)})
+                if normalized.isdigit() and len(normalized) > 1:
+                    reversed_value = int(normalized[::-1])
+                    if reversed_value > 0 and reversed_value != value:
+                        out.append(_SequenceCandidate(
+                            i, band, "num", reversed_value, region,
+                            _cluster_x(fx), fy, "reversed"))
+                continue
+            value = parse_roman(text)
+            if value is not None and value > 0:
+                out.append(_SequenceCandidate(
+                    i, band, "roman", value, region,
+                    _cluster_x(fx), fy, "direct"))
+                continue
+            # OCR often joins a small folio to a running head or punctuation.
+            # These partial tokens may support a sequence but never stand alone.
+            for value, box in _fused_digit_candidates(region, h):
+                sub_fx, sub_fy = _box_center_frac(box, w, h)
+                sub = Region(kind=region.kind, box=box, source=region.source,
+                             ocr_text=str(value), ocr_conf=region.ocr_conf)
+                out.append(_SequenceCandidate(
+                    i, band, "num", value, sub,
+                    _cluster_x(sub_fx), sub_fy, "fused"))
+            for value, box in _fused_roman_candidates(region):
+                sub_fx, sub_fy = _box_center_frac(box, w, h)
+                sub = Region(kind=region.kind, box=box, source=region.source,
+                             ocr_text=text, ocr_conf=region.ocr_conf)
+                out.append(_SequenceCandidate(
+                    i, band, "roman", value, sub,
+                    _cluster_x(sub_fx), sub_fy, "fused"))
+        for band, kind, value, region in getattr(page, "_nombre_candidates", []) or []:
+            if value is None or value <= 0:
+                continue
+            fx, fy = _box_center_frac(region.box, w, h)
+            out.append(_SequenceCandidate(
+                i, band, kind, value, region, _cluster_x(fx), fy, "reader"))
+    return out
+
+
+def _candidate_tracks(candidates: list[_SequenceCandidate]):
+    tracks: list[list[_SequenceCandidate]] = []
+    for cand in sorted(candidates, key=lambda c: (c.band, c.fy, c.fx)):
+        best = None
+        best_distance = float("inf")
+        for track in tracks:
+            if track[0].band != cand.band:
+                continue
+            mx = median([c.fx for c in track])
+            my = median([c.fy for c in track])
+            dx, dy = abs(cand.fx - mx), abs(cand.fy - my)
+            if dx <= POS_CLUSTER_X and dy <= POS_CLUSTER_Y:
+                distance = dx / POS_CLUSTER_X + dy / POS_CLUSTER_Y
+                if distance < best_distance:
+                    best, best_distance = track, distance
+        if best is None:
+            tracks.append([cand])
+        else:
+            best.append(cand)
+    return tracks
+
+
+def _resolve_sequence_tracks(pages, page_heights, page_widths) -> bool:
+    """Resolve supported position-consistent sequences before noisy fallback.
+
+    Returns True when at least one trustworthy run was found. A run is founded
+    only by exact sequence votes (three Arabic pages, or two Roman pages). OCR
+    correction/inference is then limited to pages inside the run and at most two
+    following pages, and still requires ink at the same folio position.
+    """
+    tracks = _candidate_tracks(
+        _sequence_candidates(pages, page_heights, page_widths))
+    hypotheses = []
+    for track_id, track in enumerate(tracks):
+        by_key: dict[tuple[str, int], dict[int, list[_SequenceCandidate]]] = {}
+        for cand in track:
+            by_key.setdefault((cand.kind, cand.value - cand.page), {}).setdefault(
+                cand.page, []).append(cand)
+        for (kind, offset), by_page in by_key.items():
+            minimum = 2 if kind == "roman" else MIN_SUPPORT
+            # The compact CTC reader is noisy per crop, but five consecutive
+            # position-consistent readings are stronger evidence than a main
+            # OCR engine repeatedly inventing a leading stroke/digit.
+            reader_only = all(
+                all(c.variant == "reader" for c in choices)
+                for choices in by_page.values()
+            )
+            if reader_only and kind == "num":
+                minimum = 5
+            indices = sorted(by_page)
+            if len(indices) < minimum:
+                continue
+            # Split unrelated sections sharing an accidental offset.
+            runs, current = [], [indices[0]]
+            for index in indices[1:]:
+                if index - current[-1] <= 2:
+                    current.append(index)
+                else:
+                    runs.append(current)
+                    current = [index]
+            runs.append(current)
+            for run in runs:
+                if len(run) >= minimum:
+                    hypotheses.append({
+                        "track": track_id, "kind": kind, "offset": offset,
+                        "exact": run, "by_page": by_page,
+                        "edge": (median([c.fy for c in track])
+                                 if track[0].band == "bottom"
+                                 else 1.0 - median([c.fy for c in track])),
+                    })
+    if not hypotheses:
+        return False
+
+    # Stronger/longer runs claim their exact pages first. This prevents a weak
+    # alternative reading of the same glyphs from overwriting the main series.
+    def prior_score(h):
+        track = tracks[h["track"]]
+        exact = set(h["exact"])
+        chosen = []
+        for i in sorted(exact):
+            expected = i + h["offset"]
+            options = [c for c in track if c.page == i and c.kind == h["kind"]
+                       and c.value == expected]
+            if options:
+                chosen.append(options[0])
+        if not chosen:
+            return 0.0
+        # Outside-corner folios normally alternate with recto/verso. Use raw x
+        # only for this prior; track clustering itself intentionally mirrors x.
+        sides = [
+            ((c.region.box.x0 + c.region.box.x1) / 2.0) >= page_widths[c.page] / 2.0
+            for c in chosen
+        ]
+        alternating = sum(a != b for a, b in zip(sides, sides[1:]))
+        alt_rate = alternating / max(1, len(sides) - 1)
+        fx_spread = max(c.fx for c in chosen) - min(c.fx for c in chosen)
+        fy_spread = max(c.fy for c in chosen) - min(c.fy for c in chosen)
+        position = max(0.0, 1.0 - fx_spread / POS_CLUSTER_X)
+        height = max(0.0, 1.0 - fy_spread / POS_CLUSTER_Y)
+        # All candidates already lie in a top/bottom margin band. Closer to the
+        # physical edge is stronger evidence that the token is outside body text.
+        outside = sum(
+            (1.0 - c.fy if c.band == "top" else c.fy) for c in chosen
+        ) / len(chosen)
+        return (
+            PRIOR_ALTERNATING_SIDES * alt_rate
+            + PRIOR_POSITION_CONSISTENT * position
+            + PRIOR_HEIGHT_ALIGNED * height
+            + PRIOR_OUTSIDE_BODY * outside
+        )
+
+    for h in hypotheses:
+        h["prior"] = prior_score(h)
+    hypotheses.sort(key=lambda h: (
+        -len(h["exact"]), -h["prior"], -h["edge"], h["exact"][0]))
+    exact_owner = {}
+    accepted = []
+    for h in hypotheses:
+        available = [i for i in h["exact"] if i not in exact_owner]
+        minimum = 2 if h["kind"] == "roman" else MIN_SUPPORT
+        if len(available) < minimum:
+            continue
+        h = dict(h, exact=available)
+        accepted.append(h)
+        for i in available:
+            exact_owner[i] = h
+
+    assigned: dict[int, tuple[str, int, Region]] = {}
+    for h in accepted:
+        kind, offset = h["kind"], h["offset"]
+        for i in h["exact"]:
+            expected = i + offset
+            choices = [c for c in h["by_page"][i] if c.value == expected]
+            # Prefer a direct reading when both direct and reversed variants fit.
+            cand = min(choices, key=lambda c: c.variant != "direct")
+            assigned[i] = (kind, expected, cand.region)
+
+    # A front-matter Roman run ending in iii/iv establishes the preceding i/ii
+    # even when those tiny glyphs were unreadable. This inference is restricted
+    # to the first two physical pages and the canonical offset=1 sequence.
+    for h in accepted:
+        if h["kind"] != "roman" or h["offset"] != 1:
+            continue
+        start = min(h["exact"])
+        if start > 2:
+            continue
+        # Fill unread i/ii before the first anchor and holes bracketed by the
+        # same front-matter run. No physical nombre box is invented.
+        for i in range(0, max(h["exact"]) + 1):
+            if i not in assigned:
+                assigned[i] = ("roman", i + 1, None)
+
+    protected = set(exact_owner)
+    for h in accepted:
+        track = tracks[h["track"]]
+        kind, offset = h["kind"], h["offset"]
+        start, end = min(h["exact"]), max(h["exact"])
+        candidates_by_page: dict[int, list[_SequenceCandidate]] = {}
+        for cand in track:
+            if cand.kind == kind:
+                candidates_by_page.setdefault(cand.page, []).append(cand)
+        for i in range(start, min(len(pages), end + 3)):
+            if i in assigned or (i in protected and exact_owner[i] is not h):
+                continue
+            choices = candidates_by_page.get(i, [])
+            if not choices:
+                continue
+            expected = i + offset
+            if expected <= 0:
+                continue
+            # Geometry proves this is the folio position; keep the OCR text for
+            # auditability while the sequence supplies the corrected value.
+            cand = max(choices, key=lambda c: c.region.ocr_conf or 0.0)
+            assigned[i] = (kind, expected, cand.region)
+
+    if not assigned:
+        return False
+    for i, page in enumerate(pages):
+        choice = assigned.get(i)
+        if choice is None:
+            page.page_number, page.nombre_text = None, None
+            if page.margin:
+                page.margin.nombre_box = None
+            continue
+        kind, value, region = choice
+        page.page_number = value
+        page.nombre_text = (
+            region.ocr_text if region is not None
+            else _format_roman(value) if kind == "roman" else str(value)
+        )
+        if page.margin and region is not None:
+            page.margin.nombre_box = region.box
+
+    # Printed-folio geometry and logical labels are separate facts. A broad
+    # fallback probe can support the i/ii/... sequence without proving visible
+    # ink on a cover or pre-TOC leaf. Keep the logical label, but suppress that
+    # weak physical box according to the strong book-design priors.
+    toc_index = next((
+        i for i, page in enumerate(pages)
+        if any("目次" in (region.ocr_text or "") for region in page.regions)
+    ), None)
+    for i, page in enumerate(pages):
+        choice = assigned.get(i)
+        region = choice[2] if choice is not None else None
+        weak_box = region is None or region.source == "nombre_reader"
+        reader_value = None
+        if region is not None and region.source == "nombre_reader":
+            reader_value = parse_numeral(region.ocr_text or "")
+            if reader_value is None:
+                reader_value = parse_roman(region.ocr_text or "")
+        strong_reader_box = (
+            region is not None
+            and region.source == "nombre_reader"
+            and (region.ocr_conf or 0.0) >= 0.80
+            and choice is not None
+            and reader_value == choice[1]
+        )
+        cover_prior = i == 0 and PRIOR_COVER_UNNUMBERED >= 0.99
+        pre_toc_prior = (
+            toc_index is not None and 0 < i < toc_index
+            and PRIOR_PRE_TOC_UNNUMBERED >= 0.90
+        )
+        # Priors break ambiguity; they must never erase strong observed ink.
+        # The cover remains the sole near-hard exception (99% prior).
+        suppress = cover_prior or (pre_toc_prior and not strong_reader_box)
+        if page.margin and weak_box and suppress:
+            page.margin.nombre_box = None
+    return True
+
+
+def _format_roman(value: int) -> str:
+    parts = []
+    for number, token in ((1000, "m"), (900, "cm"), (500, "d"), (400, "cd"),
+                          (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
+                          (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")):
+        while value >= number:
+            parts.append(token)
+            value -= number
+    return "".join(parts)
 
 
 def parse_numeral(text: str) -> Optional[int]:
@@ -121,6 +447,32 @@ def _band(box: Box, page_h: float) -> Optional[str]:
 
 _LEAD_DIGITS = re.compile(r"^\s*([0-9０-９]{1,6})")
 _TRAIL_DIGITS = re.compile(r"([0-9０-９]{1,6})\s*$")
+_LEAD_ROMAN = re.compile(r"^\s*([ivxlcdmIVXLCDM]{1,8})(?=\s|[^A-Za-z]|$)")
+_TRAIL_ROMAN = re.compile(r"(?<![A-Za-z])([ivxlcdmIVXLCDM]{1,8})\s*$")
+
+
+def _fused_roman_candidates(r: Region):
+    """Recover a Roman folio fused with a running head, e.g. ``iii 目次``."""
+    text = r.ocr_text or ""
+    width, length = r.box.width, len(text)
+    if not text or width <= 0:
+        return []
+    out = []
+    match = _LEAD_ROMAN.match(text)
+    if match:
+        value = parse_roman(match.group(1))
+        if value:
+            frac = len(match.group(0)) / length
+            out.append((value, Box(r.box.x0, r.box.y0,
+                                   r.box.x0 + width * frac, r.box.y1)))
+    match = _TRAIL_ROMAN.search(text)
+    if match and (not out or match.start(1) > 0):
+        value = parse_roman(match.group(1))
+        if value:
+            frac = len(match.group(1)) / length
+            out.append((value, Box(r.box.x1 - width * frac, r.box.y0,
+                                   r.box.x1, r.box.y1)))
+    return out
 
 
 def _fused_digit_candidates(r: Region, page_h: float):
@@ -195,6 +547,223 @@ def _candidates(params: PageParams, page_h: float):
         # Keep as unparsed for fuzzy matching fallback
         out.append((b, "unparsed", None, r))
     return out
+
+
+def main_ocr_evidence(params: PageParams, page_h: float, page_w: float) -> list[dict]:
+    """Serializable raw folio-like candidates from the selected main OCR."""
+    evidence = []
+    for region in params.regions:
+        text = region.ocr_text or ""
+        band = _band(region.box, page_h)
+        if not text or band is None:
+            continue
+        values = []
+        value = parse_numeral(text)
+        kind = "num"
+        if value is None:
+            value = parse_roman(text)
+            kind = "roman"
+        if value is not None and value > 0:
+            values.append({"kind": kind, "value": value, "variant": "direct"})
+        normalized = text.strip().translate(
+            {ord("０") + n: ord("0") + n for n in range(10)})
+        if normalized.isdigit() and len(normalized) > 1:
+            reversed_value = int(normalized[::-1])
+            if reversed_value > 0 and reversed_value != value:
+                values.append({"kind": "num", "value": reversed_value,
+                               "variant": "reversed"})
+        for fused_value, _ in _fused_digit_candidates(region, page_h):
+            values.append({"kind": "num", "value": fused_value,
+                           "variant": "fused"})
+        for fused_value, _ in _fused_roman_candidates(region):
+            values.append({"kind": "roman", "value": fused_value,
+                           "variant": "fused"})
+        if not values:
+            continue
+        evidence.append({
+            "band": band, "text": text, "confidence": region.ocr_conf,
+            "source": region.source, "values": values,
+            "box": {"x0": region.box.x0, "y0": region.box.y0,
+                    "x1": region.box.x1, "y1": region.box.y1},
+            "position": [
+                (region.box.x0 + region.box.x1) / 2.0 / page_w,
+                (region.box.y0 + region.box.y1) / 2.0 / page_h,
+            ],
+        })
+    return evidence
+
+
+def _box_iou_dict(box: Box, raw: dict) -> float:
+    other = Box(**raw)
+    x0, y0 = max(box.x0, other.x0), max(box.y0, other.y0)
+    x1, y1 = min(box.x1, other.x1), min(box.y1, other.y1)
+    inter = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+    union = box.width * box.height + other.width * other.height - inter
+    return inter / max(1.0, union)
+
+
+def _box_containment_dict(box: Box, raw: dict) -> float:
+    """Intersection over smaller box, for folios fused into a running head."""
+    other = Box(**raw)
+    x0, y0 = max(box.x0, other.x0), max(box.y0, other.y0)
+    x1, y1 = min(box.x1, other.x1), min(box.y1, other.y1)
+    inter = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+    smaller = min(box.width * box.height, other.width * other.height)
+    return inter / max(1.0, smaller)
+
+
+def record_decisions(pages: list[PageParams]) -> None:
+    """Persist final folio choice separately from both OCR evidence streams."""
+    for page in pages:
+        box = page.margin.nombre_box if page.margin else None
+        channels = []
+        if box is not None:
+            for channel in ("main_ocr", "dedicated_ocr"):
+                if any(_box_iou_dict(box, item["box"]) >= 0.45
+                       for item in page.nombre_evidence.get(channel, [])):
+                    channels.append(channel)
+        inferred = page.page_number is not None and not channels
+        page.nombre_decision = {
+            "text": page.nombre_text,
+            "value": page.page_number,
+            "box": (None if box is None else {
+                "x0": box.x0, "y0": box.y0, "x1": box.x1, "y1": box.y1,
+            }),
+            "support_channels": channels,
+            "series_inferred": inferred,
+            "printed_folio_detected": box is not None,
+            "pagination": {
+                "logical_number": page.pagination.logical_number,
+                "numbering_system": page.pagination.numbering_system.value,
+                "role": page.pagination.role.value,
+                "method": page.pagination.method.value,
+                "confidence": page.pagination.confidence,
+                "supporting_pages": page.pagination.supporting_pages,
+                "conflict": page.pagination.conflict,
+                "predicted_number": page.pagination.predicted_number,
+                "pdf_label": page.pagination.pdf_label,
+            },
+        }
+
+
+def _evidence_folio(page: PageParams) -> Optional[PrintedFolio]:
+    """Recover the observed glyph value at the selected physical folio box.
+
+    Sequence resolution is deliberately ignored here: evidence says what ink
+    was read, while pagination says what number the book sequence assigns.
+    """
+    box = page.margin.nombre_box if page.margin else None
+    if box is None:
+        return None
+    grouped: dict[tuple[str, int], dict] = {}
+    for channel in ("main_ocr", "dedicated_ocr"):
+        for item in page.nombre_evidence.get(channel, []):
+            raw_box = item.get("box")
+            if (not raw_box
+                    or (_box_iou_dict(box, raw_box) < 0.35
+                        and _box_containment_dict(box, raw_box) < 0.70)):
+                continue
+            values = item.get("values")
+            if values is None:
+                values = [{"kind": item.get("kind"), "value": item.get("value")}]
+            for parsed in values:
+                value = parsed.get("value")
+                kind = parsed.get("kind")
+                if value is None or kind not in {"num", "roman"}:
+                    continue
+                key = (kind, int(value))
+                entry = grouped.setdefault(key, {
+                    "score": 0.0, "channels": set(), "text": item.get("text", ""),
+                    "confidence": 0.0, "source": channel,
+                })
+                # Main OCR is less probe-heavy; independent channel agreement is
+                # stronger than either confidence score by itself.
+                if channel not in entry["channels"]:
+                    entry["score"] += (1.15 if channel == "main_ocr" else 1.0)
+                    entry["channels"].add(channel)
+                conf = float(item.get("confidence") or 0.0)
+                entry["score"] += 0.15 * conf
+                if conf >= entry["confidence"]:
+                    entry.update(text=item.get("text", ""), confidence=conf,
+                                 source=channel)
+    if not grouped:
+        return None
+    predicted = page.page_number
+    key, best = max(grouped.items(), key=lambda pair: (
+        pair[1]["score"] + (0.08 if pair[0][1] == predicted else 0.0),
+        len(pair[1]["channels"]), pair[1]["confidence"],
+    ))
+    kind, value = key
+    return PrintedFolio(
+        text=best["text"], parsed_value=value,
+        numbering_system=(NumberingSystem.ROMAN if kind == "roman"
+                          else NumberingSystem.ARABIC),
+        box=box, confidence=min(1.0, best["score"] / 2.2),
+        source="+".join(sorted(best["channels"])),
+    )
+
+
+def finalize_pagination(pages: list[PageParams]) -> None:
+    """Separate printed folios from logical pagination and PDF navigation.
+
+    Unprinted pages are counted only when bracketed by two observed folios in
+    one linear sequence. This fills chapter-title holes but will not bridge a
+    colophon into a restarted appendix. Every page receives a unique PDF label.
+    """
+    predicted = [page.page_number for page in pages]
+    anchors: list[int] = []
+    for i, page in enumerate(pages):
+        page.printed_folio = _evidence_folio(page)
+        folio = page.printed_folio
+        if folio is None or folio.parsed_value is None:
+            page.pagination = PaginationDecision(
+                predicted_number=predicted[i], pdf_label=f"scan-{i + 1}")
+            continue
+        value = folio.parsed_value
+        conflict = predicted[i] is not None and predicted[i] != value
+        independently_supported = "+" in folio.source
+        logical = (predicted[i] if conflict and not independently_supported
+                   else value)
+        method = (PaginationMethod.SEQUENCE_MODEL
+                  if conflict and not independently_supported
+                  else PaginationMethod.OBSERVED)
+        page.pagination = PaginationDecision(
+            logical_number=logical, numbering_system=folio.numbering_system,
+            role=PaginationRole.PRINTED, method=method,
+            confidence=folio.confidence, supporting_pages=[i + 1],
+            conflict=conflict, predicted_number=predicted[i],
+            pdf_label=(_format_roman(logical) if folio.numbering_system
+                       == NumberingSystem.ROMAN else str(logical)),
+        )
+        if method == PaginationMethod.OBSERVED:
+            anchors.append(i)
+
+    # Only interpolate inside an observed, slope-1 sequence. Adjacent observed
+    # anchors define the boundary, so a restart (239 -> 26) remains a boundary.
+    for left, right in zip(anchors, anchors[1:]):
+        a, b = pages[left].printed_folio, pages[right].printed_folio
+        if (a is None or b is None
+                or a.numbering_system != b.numbering_system
+                or b.parsed_value - a.parsed_value != right - left):
+            continue
+        for i in range(left + 1, right):
+            value = a.parsed_value + i - left
+            label = (_format_roman(value) if a.numbering_system
+                     == NumberingSystem.ROMAN else str(value))
+            pages[i].pagination = PaginationDecision(
+                logical_number=value, numbering_system=a.numbering_system,
+                role=PaginationRole.COUNTED_UNPRINTED,
+                method=PaginationMethod.INTERPOLATED,
+                confidence=min(a.confidence, b.confidence) * 0.95,
+                supporting_pages=[left + 1, right + 1],
+                predicted_number=predicted[i], pdf_label=label,
+            )
+
+    # Legacy fields mirror the logical decision, while nombre_text remains a
+    # literal observation and is never replaced with a sequence expectation.
+    for i, page in enumerate(pages):
+        page.page_number = page.pagination.logical_number
+        page.nombre_text = page.printed_folio.text if page.printed_folio else None
 
 
 def _cluster_x(fx: float) -> float:
@@ -303,6 +872,16 @@ def resolve(
 
     Mutates each page's margin.nombre_box / page_number / nombre_text / flags.
     """
+    if _resolve_sequence_tracks(pages, page_heights, page_widths):
+        assigns = [
+            (p.source.page_index,
+             "roman" if parse_roman(p.nombre_text or "") is not None else "num",
+             p.page_number)
+            for p in pages if p.page_number is not None
+        ]
+        _clear_gap_flags(pages)
+        return _gap_warnings(assigns, {p.source.page_index: p for p in pages})
+
     raw_cands = [_candidates(p, h) for p, h in zip(pages, page_heights)]
     max_v = len(pages) + 50
     # Position clustering rejects body-text fragments but currently interacts with

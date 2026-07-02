@@ -238,3 +238,125 @@ def test_resolve_position_model_preserves_genuine_gap_warning():
 
     assert any("missing" in w for w in warnings)
     assert any(Flag.PAGE_NUMBER_GAP in p.flags for p in pages)
+
+
+def test_resolve_vertical_folios_uses_reversed_digits_and_sequence_repair():
+    # Real Japanese vertical-book pattern: OCR may reverse stacked digits
+    # (12 -> 21, 13 -> 31), then partially read later numbers (16 -> 10,
+    # 17 -> "7."). Stable alternating-corner geometry must recover 11..17.
+    texts = ["11", "21", "31", "14", "15", "10", "7."]
+    pages = []
+    for i, text in enumerate(texts):
+        x = 100 if i % 2 == 0 else 900
+        p = _page(i, text=None)
+        p.regions.append(Region(
+            kind=RegionKind.TEXT, box=_box_at(x, 45),
+            ocr_text=text, ocr_conf=0.9, source="ndlocr"))
+        pages.append(p)
+
+    nombre.resolve(pages, [1000] * len(pages), [1000] * len(pages))
+
+    assert [p.page_number for p in pages] == list(range(11, 18))
+
+
+def test_resolve_fused_roman_running_head_before_arabic_body():
+    pages = [_page(0, text=None), _page(1, text=None)]
+    pages[0].regions.append(Region(
+        kind=RegionKind.TEXT, box=_box_at(100, 45, w=1000),
+        ocr_text="iii 目次", ocr_conf=0.9, source="ndlocr"))
+    pages[1].regions.append(Region(
+        kind=RegionKind.TEXT, box=_box_at(900, 45, w=1000),
+        ocr_text="iv", ocr_conf=0.9, source="ndlocr"))
+    for i, value in enumerate(range(11, 15), start=2):
+        x = 100 if i % 2 == 0 else 900
+        p = _page(i, text=None)
+        p.regions.append(Region(
+            kind=RegionKind.TEXT, box=_box_at(x, 45),
+            ocr_text=str(value), ocr_conf=0.9, source="ndlocr"))
+        pages.append(p)
+
+    nombre.resolve(pages, [1000] * len(pages), [1000] * len(pages))
+
+    assert [p.page_number for p in pages] == [3, 4, 11, 12, 13, 14]
+    assert pages[0].nombre_text == "iii 目次"
+
+
+def test_reader_series_overrules_spurious_leading_digit_and_fills_roman_hole():
+    pages = [_page(i, text=None) for i in range(11)]
+    # Main OCR overreads a leading stroke/digit on vertical Arabic folios.
+    for i, text in enumerate(["11", "21", "31", "14", "15", "10", "17"], 4):
+        x = 100 if i % 2 == 0 else 900
+        pages[i].regions.append(Region(
+            kind=RegionKind.TEXT, box=_box_at(x, 45), ocr_text=text,
+            ocr_conf=0.9, source="ndlocr-folio"))
+    # The independent compact reader sees the stable units sequence correctly.
+    for i, value in enumerate(range(1, 8), 4):
+        x = 100 if i % 2 == 0 else 900
+        region = Region(kind=RegionKind.TEXT, box=_box_at(x, 45),
+                        ocr_text=str(value), ocr_conf=0.99,
+                        source="nombre_reader")
+        pages[i]._nombre_candidates = [("top", "num", value, region)]
+    # i/iii/iv are visible, while ii is unreadable but bracketed.
+    for i, text, value in ((0, "i", 1), (2, "iii", 3), (3, "iv", 4)):
+        x = 100 if i % 2 == 0 else 900
+        region = Region(kind=RegionKind.TEXT, box=_box_at(x, 45),
+                        ocr_text=text, ocr_conf=0.99,
+                        source="nombre_reader")
+        pages[i]._nombre_candidates = [("top", "roman", value, region)]
+
+    nombre.resolve(pages, [1000] * len(pages), [1000] * len(pages))
+
+    assert [p.page_number for p in pages] == [1, 2, 3, 4, 1, 2, 3, 4, 5, 6, 7]
+    assert [p.nombre_text for p in pages[:4]] == ["i", "ii", "iii", "iv"]
+    # Logical labels may be inferred on front matter, but a weak fallback probe
+    # must not fabricate a printed folio box on the cover.
+    assert pages[0].margin.nombre_box is None
+
+
+def test_pre_toc_prior_does_not_erase_strong_observed_bottom_folios():
+    pages = [_page(i, text=None) for i in range(7)]
+    for i, value in enumerate(range(1, 6), start=1):
+        x = 100 if i % 2 == 0 else 900
+        region = Region(kind=RegionKind.TEXT, box=_box_at(x, 950),
+                        ocr_text=str(value), ocr_conf=0.99,
+                        source="nombre_reader")
+        pages[i]._nombre_candidates = [("bottom", "num", value, region)]
+    pages[6].regions.append(Region(
+        kind=RegionKind.TEXT, box=Box(100, 100, 300, 130),
+        ocr_text="目次", source="ndlocr"))
+
+    nombre.resolve(pages, [1000] * len(pages), [1000] * len(pages))
+
+    assert [p.page_number for p in pages[1:6]] == [1, 2, 3, 4, 5]
+    assert all(p.margin.nombre_box is not None for p in pages[1:6])
+
+
+def test_finalize_pagination_interpolates_only_bracketed_holes_and_keeps_restart():
+    pages = [_page(i, text=None) for i in range(5)]
+    for page, predicted in zip(pages, [6, 7, 8, None, 10]):
+        page.page_number = predicted
+
+    def evidence(page, value, *, channel="main_ocr"):
+        box = _box_at(100 if page.source.page_index % 2 == 0 else 900, 45)
+        page.margin.nombre_box = box
+        page.nombre_evidence[channel] = [{
+            "text": str(value), "confidence": 0.95,
+            "box": {"x0": box.x0, "y0": box.y0, "x1": box.x1, "y1": box.y1},
+            "values": [{"kind": "num", "value": value, "variant": "direct"}],
+        }]
+
+    evidence(pages[0], 6)
+    evidence(pages[2], 8)
+    evidence(pages[4], 26, channel="main_ocr")
+    evidence(pages[4], 26, channel="dedicated_ocr")
+
+    nombre.finalize_pagination(pages)
+
+    assert [p.page_number for p in pages] == [6, 7, 8, None, 26]
+    assert pages[1].pagination.role.value == "counted_unprinted"
+    assert pages[1].pagination.supporting_pages == [1, 3]
+    assert pages[3].pagination.role.value == "uncounted"
+    assert pages[3].pagination.pdf_label == "scan-4"
+    assert pages[4].pagination.conflict is True
+    assert pages[4].pagination.predicted_number == 10
+    assert pages[4].nombre_text == "26"

@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 
 from .base import LayoutBox, OCRLine, OCRResult
+from .crop_policy import expand_quad, get_crop_padding
 
 
 def _box_from_polygon(points: Any) -> tuple[float, float, float, float]:
@@ -70,6 +71,9 @@ class YomitokuOCREngine:
             visualize=False,
         )
         _configure_yomitoku_runtime(self._engine, runtime_device)
+        self._engine.detector = _ExpandingYomitokuDetector(
+            self._engine.detector, get_crop_padding("yomitoku")
+        )
         self._lock = threading.Lock()
 
     def __call__(self, image_bgr) -> OCRResult:
@@ -109,13 +113,101 @@ _NDL_LAYOUT_LABELS = {
 }
 
 
-class _RecordingDetector:
-    def __init__(self, detector):
+def _clean_folio_text(text: str) -> str:
+    import re
+
+    text = (text or "").strip()
+    match = re.search(r"[0-9０-９ivxlcdmIVXLCDM一二三四五六七八九十〇]{1,8}", text)
+    return match.group(0) if match else ""
+
+
+def _recognize_ndl_folios(image_bgr, detections, recognizers) -> list[OCRLine]:
+    """Re-read DEIM folio/pillar crops omitted by ndlocr-lite's JSON lines."""
+    height, width = image_bgr.shape[:2]
+    lines = []
+    for item in detections:
+        class_id = int(item["class_index"])
+        if class_id not in {8, 9}:  # block_pillar / block_folio
+            continue
+        x0, y0, x1, y1 = (int(round(float(v))) for v in item["box"])
+        cy = (y0 + y1) / 2.0
+        if height * 0.14 < cy < height * 0.86:
+            continue
+        if class_id == 8:
+            # The folio is at the outside end of a running-head block.
+            if (x0 + x1) / 2.0 < width / 2.0:
+                x1 = min(x1, x0 + 50)
+            else:
+                x0 = max(x0, x1 - 50)
+        pad = 5
+        bx0, by0 = max(0, x0 - pad), max(0, y0 - pad)
+        bx1, by1 = min(width, x1 + pad), min(height, y1 + pad)
+        crop = image_bgr[by0:by1, bx0:bx1]
+        readings = []
+        for priority, recognizer in enumerate(recognizers):
+            if not hasattr(recognizer, "read"):
+                continue
+            try:
+                text = _clean_folio_text(recognizer.read(crop))
+            except Exception:
+                continue
+            if text:
+                readings.append((len(text), -priority, text))
+        if not readings:
+            continue
+        text = max(readings)[2]
+        polygon = [[float(bx0), float(by0)], [float(bx1), float(by0)],
+                   [float(bx1), float(by1)], [float(bx0), float(by1)]]
+        lines.append({
+            "polygon": polygon,
+            "box": (float(bx0), float(by0), float(bx1), float(by1)),
+            "text": text,
+            "det_score": float(item.get("confidence", 0.0)),
+            "source": "ndlocr-folio",
+            "layout_label": "page_number",
+        })
+    return lines
+
+
+class _ExpandingYomitokuDetector:
+    def __init__(self, detector, padding):
         self._detector = detector
+        self._padding = padding
+
+    def __call__(self, image, *args, **kwargs):
+        output = self._detector(image, *args, **kwargs)
+        result = output[0] if isinstance(output, tuple) else output
+        result.points = [
+            expand_quad(points, image.shape, self._padding).tolist()
+            for points in result.points
+        ]
+        return output
+
+    def __getattr__(self, name):
+        return getattr(self._detector, name)
+
+
+_NDL_TEXT_CLASSES = {0, 1, 2, 3, 4, 5, 8, 9, 10, 13, 14, 16}
+
+
+class _RecordingDetector:
+    def __init__(self, detector, padding=None):
+        self._detector = detector
+        self._padding = padding or get_crop_padding("ndlocr")
         self.detections = []
 
     def detect(self, image):
-        self.detections = self._detector.detect(image)
+        self.detections = []
+        for original in self._detector.detect(image):
+            item = dict(original)
+            if int(item["class_index"]) in _NDL_TEXT_CLASSES:
+                x0, y0, x1, y1 = item["box"]
+                quad = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+                padded = expand_quad(quad, image.shape, self._padding)
+                low, high = padded.min(axis=0), padded.max(axis=0)
+                item["box"] = [float(low[0]), float(low[1]),
+                               float(high[0]), float(high[1])]
+            self.detections.append(item)
         return self.detections
 
     def __getattr__(self, name):
@@ -193,6 +285,10 @@ class NdlocrLiteEngine:
                 "det_score": float(item.get("confidence", 0.0)),
                 "source": "ndlocr-lite",
             })
+        lines.extend(_recognize_ndl_folios(
+            image_bgr, self._detector.detections,
+            (self._recognizer30, self._recognizer50, self._recognizer100),
+        ))
 
         layout_boxes: list[LayoutBox] = []
         for item in self._detector.detections:

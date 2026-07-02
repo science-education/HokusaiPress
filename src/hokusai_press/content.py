@@ -124,7 +124,7 @@ def analyze(
                     poly = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
                 poly = np.array(poly, dtype=np.int32)
                 cv2.fillPoly(text_mask, [poly], 1)
-                layout_label = _matching_layout_label(
+                layout_label = ln.get("layout_label") or _matching_layout_label(
                     (float(x0), float(y0), float(x1), float(y1)),
                     text_layout_boxes,
                 )
@@ -176,6 +176,7 @@ def analyze(
                     box=Box(x0 * inv_scale, y0 * inv_scale,
                             x1 * inv_scale, y1 * inv_scale),
                     source=lb.get("source", ocr_engine),
+                    layout_label=label,
                 ))
 
     # layout-model figure/photo regions (optional, e.g. RT-DETRv2)

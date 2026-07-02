@@ -212,5 +212,6 @@ def test_content_accepts_layout_boxes_from_ocr_engine(monkeypatch):
 
     assert regions[0].source == "paddle-vl"
     assert regions[0].kind == RegionKind.PHOTO
+    assert regions[0].layout_label == "image"
     assert regions[0].box.x0 == 50
     assert Flag.OCR_LOW_COVERAGE not in flags
