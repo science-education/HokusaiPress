@@ -1,3 +1,6 @@
+## 2026-07-02: WP-31 能動学習キューの順位付け
+- レビュー待ちページを、類似する待ちページ数の降順で順位付けする機能を追加。
+- テスト: `tests/test_queue_rank.py`、全体 pytest ともに green。
 ## 2026-07-02: WP-22 修正の波及エンジン
 - 構造が似たページへの page_kind 自動適用とレビュー投入を追加。
 - テスト: `tests/test_propagate.py`、全体 pytest ともに green。
