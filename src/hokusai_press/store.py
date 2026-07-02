@@ -33,6 +33,13 @@ CREATE TABLE IF NOT EXISTS pages (
 );
 CREATE INDEX IF NOT EXISTS idx_pages_status ON pages(review_status);
 
+CREATE VIRTUAL TABLE IF NOT EXISTS page_search USING fts5(
+    doc_id UNINDEXED,
+    page_index UNINDEXED,
+    text,
+    tokenize='trigram'
+);
+
 CREATE TABLE IF NOT EXISTS decisions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     doc_id      TEXT NOT NULL,
@@ -127,6 +134,13 @@ class PageRow:
     flags: list[str]
 
 
+@dataclass
+class SearchHit:
+    doc_id: str
+    page_index: int
+    snippet: str
+
+
 class Store:
     def __init__(self, db_path: str = "hokusai.db"):
         # check_same_thread=False lets the review web UI serve sync endpoints
@@ -166,6 +180,57 @@ class Store:
                     json.dumps([f.value for f in params.flags]),
                     time.time(),
                 ),
+            )
+            self.conn.execute(
+                "DELETE FROM page_search WHERE doc_id=? AND page_index=?",
+                (doc_id, page_index),
+            )
+            text = params.reading_text()
+            if text:
+                self.conn.execute(
+                    "INSERT INTO page_search(doc_id, page_index, text) VALUES(?,?,?)",
+                    (doc_id, page_index, text),
+                )
+            self.conn.commit()
+
+    def search(self, query: str, limit: int = 50) -> list[SearchHit]:
+        with self._lock:
+            if len(query) >= 3:
+                rows = self.conn.execute(
+                    "SELECT doc_id, page_index, "
+                    "snippet(page_search, 2, '', '', '…', 32) AS snippet "
+                    "FROM page_search WHERE page_search MATCH ? "
+                    "ORDER BY bm25(page_search) LIMIT ?",
+                    (query, limit),
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT doc_id, page_index, text FROM page_search "
+                    "WHERE text LIKE ? ORDER BY doc_id, page_index LIMIT ?",
+                    (f"%{query}%", limit),
+                ).fetchall()
+
+        if len(query) >= 3:
+            return [SearchHit(r["doc_id"], r["page_index"], r["snippet"]) for r in rows]
+        return [
+            SearchHit(r["doc_id"], r["page_index"], _like_snippet(r["text"], query))
+            for r in rows
+        ]
+
+    def reindex_all(self) -> None:
+        with self._lock:
+            self.conn.execute("DELETE FROM page_search")
+            rows = self.conn.execute(
+                "SELECT doc_id, page_index, params_json FROM pages"
+            ).fetchall()
+            indexed = []
+            for row in rows:
+                text = _decode_page(json.loads(row["params_json"])).reading_text()
+                if text:
+                    indexed.append((row["doc_id"], row["page_index"], text))
+            self.conn.executemany(
+                "INSERT INTO page_search(doc_id, page_index, text) VALUES(?,?,?)",
+                indexed,
             )
             self.conn.commit()
 
@@ -347,6 +412,15 @@ def _page_to_dict(params: PageParams) -> dict:
     from .model import _enc
 
     return json.loads(json.dumps(asdict(params), default=_enc))
+
+
+def _like_snippet(text: str, query: str, context: int = 40) -> str:
+    match = text.find(query)
+    if match < 0:
+        return text[: context * 2]
+    start = max(0, match - context)
+    end = min(len(text), match + len(query) + context)
+    return ("…" if start else "") + text[start:end] + ("…" if end < len(text) else "")
 
 
 def _row_to_page(row: sqlite3.Row) -> PageRow:

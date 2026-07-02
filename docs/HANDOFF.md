@@ -1,5 +1,10 @@
 # HokusaiPress 引き継ぎ (Handoff)
 
+## 2026-07-02: WP-01 FTS5 全文検索
+- 保存済みページの OCR テキスト検索、自動同期、全件再索引を実装。
+- `src/hokusai_press/store.py` に `SearchHit`、`Store.search()`、`Store.reindex_all()` を追加。
+- テスト: `tests/test_search.py`（8 passed）、全体 pytest（回帰なし）。
+
 最終更新 2026-07-01 / branch `feat/pdf-metadata-export` / 221 tests green。
 
 ## 2026-07-01: WP-01 / WP-11a 契約テストと委譲ブリーフを配置
