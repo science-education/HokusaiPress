@@ -1,3 +1,6 @@
+## 2026-07-02: WP-22 修正の波及エンジン
+- 構造が似たページへの page_kind 自動適用とレビュー投入を追加。
+- テスト: `tests/test_propagate.py`、全体 pytest ともに green。
 ## 2026-07-02: WP-21 ページ類似度
 - `src/hokusai_press/similarity.py` に特徴ベクトル化と類似ページ順位付けを追加。
 - テスト: `tests/test_similarity.py`、全体 pytest ともに green。
