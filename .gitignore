@@ -16,3 +16,8 @@ out/
 *.pdf
 !docs/**/*.pdf
 .DS_Store
+
+# 旧試作スクラッチ (HANDOFF.md 参照 / 正式経路ではない)
+run_export.py
+test_export.md
+tmp/

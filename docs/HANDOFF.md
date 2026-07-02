@@ -1,6 +1,27 @@
 # HokusaiPress 引き継ぎ (Handoff)
 
-最終更新 2026-06-23 / HEAD `ea892ef` (branch `param-profile`) / 170 tests green。
+最終更新 2026-06-29 / branch `feat/pdf-metadata-export` / 221 tests green。
+
+## 2026-06-29: PDFナビゲーションと構造化エクスポート
+
+- `render._set_physical_page_size()`の既存pikepdfパス内で、物理サイズ変更と同時に
+  `/PageLabels`、`/ViewerPreferences /Direction`、`/PageLayout`を書き込む。
+- PageLabelsは無番、`I/V/X/L/C/D/M`の大小Roman numeral、算用数字、番号の不連続に対応。
+- `profile.extract_features()`と既存のwriting direction/binding判定を再利用。
+  右綴じはPDF 1.5の`/TwoPageRight`、左綴じは`/TwoPageLeft`。
+- `hokusai-press export --doc ... --out ...`で保存DBからMD/HTML/JSONを生成。
+  領域順、OCRテキスト、layout label、bbox、confidence、sourceを保持し、画像リンクは捏造しない。
+- テスト: `tests/test_pdf_metadata_export.py`。全体`221 passed`。
+- 実検証成果物: `tmp/pdfs/metadata_export_verify/book.pdf|md|html|json`。
+
+注意:
+
+- 論理ページラベルの品質は、保存済み`page_number`/`nombre_text`の品質に依存する。
+- 構造化出力は画像アセットを抽出しない。図・写真・表は意味とbboxで表現する。
+- 作業ツリーの`run_export.py`と`test_export.md`は旧試作の未追跡ファイルであり、正式経路ではない。
+
+以下は2026-06-23以前の履歴資料。
+
 リポジトリ: `C:\Users\user\dev\HokusaiPress`（github.com/science-education/HokusaiPress, GPLv3）。
 **PR**: [#1](https://github.com/science-education/HokusaiPress/pull/1)（`param-profile` → `main`, CI green）。
 

@@ -26,7 +26,7 @@
   geometry/     deskew（確信度つき）/ 内容ボックス・ノンブル基準マージン
   content.py    選択OCRの行認識 + レイアウト検出 → 残差写真から字/図/写真を峻別
   pipeline.py   パラメータ確定 + 低確信ページにフラグ → SQLite 保存
-  render.py     元画像から1パスでワープ → 検索可能PDF（G4/JBIG2 + 透明文字層）
+  render.py     元画像から1パスでワープ → 検索可能PDF + PageLabels/見開き設定
   webui/        フラグ付きページのみレビュー → 上書き → 判断ログ → 再生成
 ```
 
@@ -60,6 +60,22 @@ pip install -e ".[mlx-vl,web]"
 YomitokuとNDL-OCRは、それぞれ自身の検出器と認識器を使用します。`hybrid` は
 Yomitoku系の文字検出とNDL系の文字認識を組み合わせ、Yomitokuの図版レイアウト検出も
 実行します。
+
+文字検出枠はモデルごとにタイトさが異なるため、認識前に元画像側へ文字枠を拡張します。
+既定値は NDL-OCR `3%`、Yomitoku `1%`、Hybrid `3%`（検出行の短辺比）です。
+図・表領域には適用しません。必要ならモデル別に上書きできます。
+
+```bash
+hokusai-press run scan.pdf --out book.pdf --ocr-engine ndlocr \
+  --ocr-crop-padding ndlocr=4px
+
+# 同じオプションを繰り返して複数指定できます
+hokusai-press run scan.pdf --out book.pdf --ocr-engine yomitoku \
+  --ocr-crop-padding yomitoku=2% --ocr-crop-padding hybrid=4%
+```
+
+`px` は片側の画素数、`%` は検出行の短辺に対する片側の比率です。大きすぎる値は
+隣接行を取り込みやすいため、通常は `1–5%` 程度に留めます。
 
 ```bash
 # 既定: Hybrid
@@ -113,6 +129,25 @@ hokusai-press remargin scan.pdf --out remargin.pdf --db hokusai.db
 # 0始まりのページ指定でプレビュー処理、段階別時間も表示
 hokusai-press run scan.pdf --out preview.pdf --pages 20-39 --profile
 ```
+
+## PDFナビゲーションと構造化出力
+
+PDF生成時に、保存済みの`page_number`と`nombre_text`から論理ページラベルを作成します。
+無番、前付けのRoman numeral、本文の算用数字、途中の番号不連続を`/PageLabels`へ記録する
+ため、対応ビューアでは論理ページ番号を指定して移動できます。綴じ方向は既存の
+writing directionと奇偶ページのノンブル位置から判定し、右綴じなら`/Direction /R2L`と
+`/TwoPageRight`、左綴じなら`/TwoPageLeft`を設定します。
+
+保存済みOCR・レイアウト領域は、PDFを再解析せずMarkdown、HTML、JSONへ出力できます。
+
+```bash
+hokusai-press export --db hokusai.db --doc scan.pdf --out scan.md
+hokusai-press export --db hokusai.db --doc scan.pdf --out scan.html
+hokusai-press export --db hokusai.db --doc scan.pdf --out scan.json
+```
+
+出力は保存された領域順を維持します。図・写真・表は実在しない画像リンクを生成せず、
+種類、layout label、bboxを構造として記録します。画像アセットの切り出しは行いません。
 
 `--no-ocr` で OCR を省略し幾何処理＋ヒューリスティック分離のみでも動作します。
 OCR/レイアウトは `--layout-engine` と `--text-engine` で別々に選択できます。
@@ -178,5 +213,6 @@ Intel NPU で実機確認済みの Paddle 経路は `--text-engine ppocr-v6 --ru
 - 写真領域・内容枠・ノンブル枠のドラッグ編集、領域削除、OCRなしの余白再計算
 - 判断ログからの page-kind 学習（最近傍重心、依存追加なし）→ 自動判定へ反映
 - 検索可能テキスト層
+- 論理PageLabels、右綴じ/左綴じの見開き表示、MD/HTML/JSON構造化出力
 
 次段: ノンブル基準マージンの綴じ方向対応（spine 整列）の本格 C++ 移植。
