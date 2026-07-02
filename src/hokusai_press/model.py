@@ -50,6 +50,52 @@ class DecidedBy(str, Enum):
     AI = "ai"
 
 
+class NumberingSystem(str, Enum):
+    ARABIC = "arabic"
+    ROMAN = "roman"
+    NONE = "none"
+
+
+class PaginationRole(str, Enum):
+    PRINTED = "printed"
+    COUNTED_UNPRINTED = "counted_unprinted"
+    UNCOUNTED = "uncounted"
+
+
+class PaginationMethod(str, Enum):
+    OBSERVED = "observed"
+    INTERPOLATED = "interpolated"
+    SEQUENCE_MODEL = "sequence_model"
+    MANUAL = "manual"
+
+
+@dataclass
+class PrintedFolio:
+    """Physical ink observed on the page, independent of sequence inference."""
+
+    text: str
+    parsed_value: Optional[int]
+    numbering_system: NumberingSystem
+    box: Box
+    confidence: float = 0.0
+    source: str = ""
+
+
+@dataclass
+class PaginationDecision:
+    """Book-level logical pagination; may exist without a printed folio."""
+
+    logical_number: Optional[int] = None
+    numbering_system: NumberingSystem = NumberingSystem.NONE
+    role: PaginationRole = PaginationRole.UNCOUNTED
+    method: PaginationMethod = PaginationMethod.SEQUENCE_MODEL
+    confidence: float = 0.0
+    supporting_pages: list[int] = field(default_factory=list)
+    conflict: bool = False
+    predicted_number: Optional[int] = None
+    pdf_label: Optional[str] = None
+
+
 # Flag reasons that send a page to the review queue. Keep these stable; they
 # are logged and later feed the decision-learning model.
 class Flag(str, Enum):
@@ -165,6 +211,14 @@ class PageParams:
     # page number read from the nombre region (OCR), and its parsed integer
     nombre_text: Optional[str] = None
     page_number: Optional[int] = None
+    # Auditable folio pipeline: raw candidates stay separated by recognizer;
+    # the final decision records which channel(s) and sequence rules supported it.
+    nombre_evidence: dict = field(default_factory=dict)
+    nombre_decision: dict = field(default_factory=dict)
+    # Canonical pagination model. Legacy nombre_text/page_number remain mirrored
+    # for stored-project and API compatibility.
+    printed_folio: Optional[PrintedFolio] = None
+    pagination: PaginationDecision = field(default_factory=PaginationDecision)
     # OCR found no content and the page has no real ink -> render as blank white
     # (rejects show-through). Only set when OCR ran, so it never erases text.
     blank: bool = False
@@ -246,6 +300,8 @@ def _decode_region(d) -> Region:
 
 def _decode_page(d) -> PageParams:
     margin = d.get("margin")
+    printed = d.get("printed_folio")
+    pagination = d.get("pagination") or {}
     return PageParams(
         source=SourceRef(**d["source"]),
         dpi=d.get("dpi"),
@@ -269,6 +325,30 @@ def _decode_page(d) -> PageParams:
         decided_by=None if d.get("decided_by") is None else DecidedBy(d["decided_by"]),
         nombre_text=d.get("nombre_text"),
         page_number=d.get("page_number"),
+        nombre_evidence=d.get("nombre_evidence", {}),
+        nombre_decision=d.get("nombre_decision", {}),
+        printed_folio=(None if printed is None else PrintedFolio(
+            text=printed.get("text", ""),
+            parsed_value=printed.get("parsed_value"),
+            numbering_system=NumberingSystem(
+                printed.get("numbering_system", "none")),
+            box=_box(printed["box"]),
+            confidence=printed.get("confidence", 0.0),
+            source=printed.get("source", ""),
+        )),
+        pagination=PaginationDecision(
+            logical_number=pagination.get("logical_number", d.get("page_number")),
+            numbering_system=NumberingSystem(
+                pagination.get("numbering_system", "none")),
+            role=PaginationRole(pagination.get("role", "uncounted")),
+            method=PaginationMethod(
+                pagination.get("method", "sequence_model")),
+            confidence=pagination.get("confidence", 0.0),
+            supporting_pages=list(pagination.get("supporting_pages", [])),
+            conflict=pagination.get("conflict", False),
+            predicted_number=pagination.get("predicted_number"),
+            pdf_label=pagination.get("pdf_label"),
+        ),
         blank=d.get("blank", False),
     )
 

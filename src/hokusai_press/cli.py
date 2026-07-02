@@ -203,6 +203,11 @@ def main(argv=None) -> int:
     p_run.add_argument("--pages", default=None,
                        help="process only these 0-based pages, e.g. '9,52,236-237'"
                             " (fast for debugging)")
+    p_run.add_argument(
+        "--ocr-crop-padding", action="append", default=[], metavar="MODEL=VALUE",
+        help="expand detector boxes before recognition; repeatable, e.g. "
+             "ndlocr=4px, yomitoku=2%%, hybrid=3%%",
+    )
 
     p_queue = sub.add_parser("queue", help="list pages awaiting review")
     p_queue.add_argument("--db", default="hokusai.db")
@@ -236,6 +241,17 @@ def main(argv=None) -> int:
     p_learn.add_argument("--db", default="hokusai.db")
     p_learn.add_argument("--out", default="hokusai_model.json")
 
+    p_export = sub.add_parser(
+        "export", help="export stored OCR/layout data as Markdown, HTML, or JSON"
+    )
+    p_export.add_argument("--doc", required=True, help="doc id (source basename)")
+    p_export.add_argument("--out", required=True, help="output .md, .html, or .json")
+    p_export.add_argument("--db", default="hokusai.db")
+    p_export.add_argument(
+        "--format", choices=["markdown", "html", "json"], default=None,
+        help="output format (default: infer from --out extension)",
+    )
+
     p_remargin = sub.add_parser(
         "remargin",
         help="re-run shadow/margin/content-box detection from STORED OCR "
@@ -268,6 +284,17 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "run":
+        if args.ocr_crop_padding:
+            from .ocr.crop_policy import parse_overrides
+
+            try:
+                parse_overrides(args.ocr_crop_padding)
+            except ValueError as exc:
+                print(f"error: {exc}")
+                return 1
+            os.environ["HOKUSAI_OCR_CROP_PADDING"] = ",".join(
+                args.ocr_crop_padding
+            )
         if (args.runtime or args.paddle_engine) == "mlx":
             os.environ["HOKUSAI_MLX_MODEL"] = args.mlx_model
             os.environ["HOKUSAI_MLX_SERVER_URL"] = args.mlx_server_url
@@ -415,6 +442,31 @@ def main(argv=None) -> int:
         learn.save(model, args.out)
         print(f"[OK] trained page-kind model -> {args.out} "
               f"(classes: {model['counts']})")
+        return 0
+
+    if args.command == "export":
+        from .export_md import write_export
+        from .model import Document
+        from .store import Store
+
+        store = Store(args.db)
+        try:
+            rows = store.list_pages(args.doc)
+        finally:
+            store.close()
+        if not rows:
+            print(f"error: no stored pages for doc id {args.doc}")
+            return 1
+        document = Document(
+            source_path=args.doc,
+            pages=[row.params for row in rows],
+        )
+        try:
+            out = write_export(document, args.out, args.format)
+        except ValueError as exc:
+            print(f"error: {exc}")
+            return 1
+        print(f"[OK] exported {len(rows)} pages -> {out}")
         return 0
 
     return 1

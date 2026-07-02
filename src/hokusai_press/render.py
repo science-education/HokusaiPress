@@ -454,12 +454,108 @@ def build_pdf(
         for args in worker_args:
             builder.add_encoded_page(_render_and_encode_page(args))
     builder.save(out_path)
-    _set_physical_page_size(out_path, document.render.target_dpi)
-    _add_pdf_metadata(out_path, document)
+    _set_physical_page_size(
+        out_path,
+        document.render.target_dpi,
+        document=document,
+        originals=originals,
+    )
     return out_path
 
 
-def _set_physical_page_size(pdf_path: str, dpi: int) -> None:
+def _page_label_segments(
+    document: Document,
+) -> list[tuple[int, str, int, str | None]]:
+    """Return PageLabels ranges as (page index, style, start, prefix).
+
+    Every physical page is addressable. Logical pages use their book number;
+    uncounted leaves use unique ``scan-N`` labels.
+    """
+    import re
+    import unicodedata
+
+    segments: list[tuple[int, str, int, str | None]] = []
+    current_key: tuple[str, str | None] | object = object()
+    expected: int | None = None
+    has_numbered_page = False
+
+    for index, page in enumerate(document.pages):
+        decision = getattr(page, "pagination", None)
+        number = (decision.logical_number if decision is not None
+                  and decision.logical_number is not None else page.page_number)
+        if number is None or int(number) < 1:
+            style, start, prefix = "/D", index + 1, "scan-"
+        else:
+            has_numbered_page = True
+            system = getattr(decision, "numbering_system", None)
+            raw = unicodedata.normalize("NFKC", page.nombre_text or "").strip()
+            raw = raw.strip(".,;:()[]{}")
+            if getattr(system, "value", system) == "roman" or re.fullmatch(
+                    r"[ivxlcdm]+", raw, flags=re.IGNORECASE):
+                style = "/R" if raw.isupper() else "/r"
+            else:
+                style = "/D"
+            start = int(number)
+            prefix = None
+
+        key = (style, prefix)
+        if key != current_key or start != expected:
+            segments.append((index, style, start, prefix))
+            current_key = key
+        expected = start + 1
+
+    return segments if has_numbered_page else []
+
+
+def _detect_pdf_binding(document: Document, originals: list[np.ndarray]) -> str:
+    """Use the same normalized profile features as the analysis pipeline."""
+    from .profile import detect_binding, detect_writing_direction, extract_features
+
+    widths = [float(image.shape[1]) for image in originals]
+    heights = [float(image.shape[0]) for image in originals]
+    page_features, region_features = extract_features(document.pages, widths, heights)
+    writing_direction = detect_writing_direction(region_features)
+    return detect_binding(page_features, writing_direction)
+
+
+def _apply_pdf_navigation(pdf, document: Document, originals: list[np.ndarray]) -> bool:
+    """Add logical labels and facing-page preferences; return PDF-1.5 need."""
+    import pikepdf
+
+    segments = _page_label_segments(document)
+    if segments:
+        nums = pikepdf.Array()
+        for index, style, start, prefix in segments:
+            nums.append(index)
+            entry = pikepdf.Dictionary(S=pikepdf.Name(style), St=start)
+            if prefix is not None:
+                entry.P = prefix
+            nums.append(entry)
+        pdf.Root.PageLabels = pikepdf.Dictionary(Nums=nums)
+
+    binding = _detect_pdf_binding(document, originals)
+    if binding not in {"right", "left"}:
+        return False
+
+    preferences = pdf.Root.get("/ViewerPreferences")
+    if preferences is None:
+        preferences = pikepdf.Dictionary()
+        pdf.Root.ViewerPreferences = preferences
+    if binding == "right":
+        preferences.Direction = pikepdf.Name("/R2L")
+        pdf.Root.PageLayout = pikepdf.Name("/TwoPageRight")
+    else:
+        preferences.Direction = pikepdf.Name("/L2R")
+        pdf.Root.PageLayout = pikepdf.Name("/TwoPageLeft")
+    return True
+
+
+def _set_physical_page_size(
+    pdf_path: str,
+    dpi: int,
+    document: Document | None = None,
+    originals: list[np.ndarray] | None = None,
+) -> None:
     """Rewrite each page's MediaBox from pixels (1px=1pt) to physical points
     at `dpi`, wrapping the content in a scale so the image still fills the
     page and the searchable-text layer stays aligned. Without this an ebook
@@ -478,82 +574,10 @@ def _set_physical_page_size(pdf_path: str, dpi: int) -> None:
             )
             pg.contents_add(pikepdf.Stream(pdf, b"Q"), prepend=False)
             page.MediaBox = [0, 0, round(w_px * s, 3), round(h_px * s, 3)]
-        pdf.save(deterministic_id=True)
-
-
-def _add_pdf_metadata(pdf_path: str, document: Document) -> None:
-    import pikepdf
-    from .profile import detect_writing_direction, detect_binding
-    from dataclasses import dataclass
-
-    nums = []
-    current_style = None
-    expected_next = None
-
-    for i, p in enumerate(document.pages):
-        num = p.page_number
-        text = p.nombre_text or ""
-        
-        if num is None:
-            style = "empty"
-            offset = None
-        else:
-            if any(c in "ivxIVX" for c in text):
-                style = "/r"
-            else:
-                style = "/D"
-            offset = num
-            
-        if style != current_style or (style != "empty" and offset != expected_next):
-            if style == "empty":
-                nums.extend([i, pikepdf.Dictionary()])
-            else:
-                nums.extend([i, pikepdf.Dictionary(S=pikepdf.Name(style), St=offset)])
-            current_style = style
-            
-        if style != "empty":
-            expected_next = offset + 1
-
-    @dataclass
-    class _TempRegionFeature:
-        cls: str
-        x0: float
-        y0: float
-        x1: float
-        y1: float
-
-    @dataclass
-    class _TempPageFeature:
-        page_index: int
-        nombre_cx: float | None
-        deskew_angle: float = 0.0
-        content_w: float = 0.0
-        content_h: float = 0.0
-        nombre_value: float | None = None
-        is_ocr: bool = False
-
-    r_features = []
-    p_features = []
-    for i, p in enumerate(document.pages):
-        for r in p.regions:
-            r_features.append(_TempRegionFeature(r.kind.value, r.box.x0, r.box.y0, r.box.x1, r.box.y1))
-        cx = None
-        if p.margin and p.margin.nombre_box and p.margin.page_w:
-            cx = (p.margin.nombre_box.x0 + p.margin.nombre_box.x1) / 2.0 / p.margin.page_w
-        p_features.append(_TempPageFeature(i, cx))
-        
-    wd = detect_writing_direction(r_features)
-    binding = detect_binding(p_features, wd)
-
-    with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
-        if nums:
-            pdf.Root.PageLabels = pikepdf.Dictionary(Nums=pikepdf.Array(nums))
-            
-        if binding == "right":
-            pdf.Root.ViewerPreferences = pikepdf.Dictionary(Direction=pikepdf.Name("/R2L"))
-            pdf.Root.PageLayout = pikepdf.Name("/TwoColumnRight")
-        elif binding == "left":
-            pdf.Root.ViewerPreferences = pikepdf.Dictionary(Direction=pikepdf.Name("/L2R"))
-            pdf.Root.PageLayout = pikepdf.Name("/TwoColumnLeft")
-
-        pdf.save(deterministic_id=True)
+        needs_pdf_15 = False
+        if document is not None and originals is not None:
+            needs_pdf_15 = _apply_pdf_navigation(pdf, document, originals)
+        save_options = {"deterministic_id": True}
+        if needs_pdf_15:
+            save_options["min_version"] = "1.5"
+        pdf.save(**save_options)
