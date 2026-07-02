@@ -1,3 +1,6 @@
+## 2026-07-02: WP-21 ページ類似度
+- `src/hokusai_press/similarity.py` に特徴ベクトル化と類似ページ順位付けを追加。
+- テスト: `tests/test_similarity.py`、全体 pytest ともに green。
 ## 2026-07-02: WP-13 書庫画面（一覧＋全文検索）
 - `src/hokusai_press/webui/app.py` に `GET /library` を追加。蔵書一覧と全文検索の実装。
 - テスト: 全体 pytest ともに green。
