@@ -1,3 +1,7 @@
+## 2026-07-02: WP-11 読書モード UI追加
+- 何を・どのルートに: `src/hokusai_press/webui/app.py` に `GET /read/{doc_id}` を追加
+- 確認方法: `python -m hokusai_press.webui --db hokusai.db` 起動後、ブラウザで `/read/<doc_id>` を開き目視とスクリーンショットで確認。
+
 # 2026-07-02: WP-11a 読書モードAPI
 - 全ページ一覧APIと読者報告APIを追加し、報告を教師信号として記録。
 - テスト: `tests/test_webui_reading.py`、全体pytestともにgreen。

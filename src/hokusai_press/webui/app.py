@@ -333,6 +333,197 @@ async function delRegion(i){{
 setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
 </script>"""
 
+    @app.get("/read/{doc_id}", response_class=HTMLResponse)
+    def read_view(doc_id: str):
+        return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Read {doc_id}</title>
+<style>
+  body {{ margin: 0; background: #e0e0e0; display: flex; flex-direction: column; align-items: center; font-family: sans-serif; }}
+  .page-container {{
+    position: relative;
+    margin: 20px 0;
+    background: #fff;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    min-height: 600px;
+    width: 800px;
+    max-width: 100%;
+  }}
+  .page-container img {{
+    display: block;
+    width: 100%;
+    height: auto;
+  }}
+  .marker {{
+    position: absolute;
+    left: 0;
+    top: 20px;
+    width: 6px;
+    height: 40px;
+    background: #e00;
+  }}
+  .marker.reported {{
+    background: #0a0;
+  }}
+  .controls {{
+    position: absolute;
+    right: -140px;
+    top: 20px;
+    width: 120px;
+  }}
+  .report-btn {{
+    padding: 6px 12px;
+    cursor: pointer;
+    background: #fff;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 13px;
+  }}
+  .feedback {{
+    color: #0a0;
+    font-size: 13px;
+    opacity: 0;
+    transition: opacity 1s;
+    margin-top: 6px;
+  }}
+  .feedback.show {{
+    opacity: 1;
+    transition: opacity 0.1s;
+  }}
+</style>
+</head>
+<body>
+<div id="pages"></div>
+<script>
+const DOC_ID = "{doc_id}";
+let currentGen = 0;
+const MAX_CONCURRENT = 3;
+let activeLoads = 0;
+let loadQueue = [];
+
+async function init() {{
+    currentGen++;
+    const myGen = currentGen;
+    
+    const res = await fetch(`/api/doc/${{DOC_ID}}/pages`);
+    const pages = await res.json();
+    
+    if (myGen !== currentGen) return; // 世代管理
+    
+    const container = document.getElementById('pages');
+    
+    pages.forEach(p => {{
+        const div = document.createElement('div');
+        div.className = 'page-container';
+        div.dataset.pageIndex = p.page_index;
+        
+        if (p.needs_review) {{
+            const marker = document.createElement('div');
+            marker.className = 'marker';
+            marker.id = 'marker-' + p.page_index;
+            div.appendChild(marker);
+        }}
+        
+        const controls = document.createElement('div');
+        controls.className = 'controls';
+        
+        const btn = document.createElement('button');
+        btn.className = 'report-btn';
+        btn.innerText = 'このページを報告';
+        btn.onclick = () => reportPage(p.page_index, btn);
+        controls.appendChild(btn);
+        
+        const fb = document.createElement('div');
+        fb.className = 'feedback';
+        fb.id = 'fb-' + p.page_index;
+        fb.innerText = '報告しました';
+        controls.appendChild(fb);
+        
+        div.appendChild(controls);
+        container.appendChild(div);
+        
+        observer.observe(div);
+    }});
+}}
+
+async function reportPage(pageIndex, btn) {{
+    btn.disabled = true;
+    try {{
+        const res = await fetch(`/api/page/${{DOC_ID}}/${{pageIndex}}/report`, {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: JSON.stringify({{decided_by: 'human'}})
+        }});
+        if (res.ok) {{
+            const marker = document.getElementById('marker-' + pageIndex);
+            if (marker) marker.classList.add('reported');
+            
+            const fb = document.getElementById('fb-' + pageIndex);
+            fb.classList.add('show');
+            setTimeout(() => fb.classList.remove('show'), 1000); // 1秒でフェード
+        }}
+    }} finally {{
+        btn.disabled = false;
+    }}
+}}
+
+function processQueue() {{
+    if (activeLoads >= MAX_CONCURRENT || loadQueue.length === 0) return;
+    
+    const taskIndex = loadQueue.findIndex(t => t.isIntersecting);
+    if (taskIndex === -1) return; // viewport内になければロードしない
+    
+    const task = loadQueue.splice(taskIndex, 1)[0];
+    activeLoads++;
+    
+    const img = document.createElement('img');
+    const myGen = currentGen;
+    
+    img.onload = img.onerror = () => {{
+        if (myGen !== currentGen) return; // 古い世代のコールバックは破棄
+        activeLoads--;
+        processQueue();
+    }};
+    
+    img.src = `/img/${{DOC_ID}}/${{task.pageIndex}}/output.png`;
+    task.div.appendChild(img);
+    
+    // 他の待機タスクも再帰的にチェック
+    processQueue();
+}}
+
+const observer = new IntersectionObserver((entries) => {{
+    let changed = false;
+    entries.forEach(entry => {{
+        const div = entry.target;
+        const pageIndex = div.dataset.pageIndex;
+        
+        let task = loadQueue.find(t => t.pageIndex === pageIndex);
+        
+        if (entry.isIntersecting) {{
+            if (!div.querySelector('img') && !task) {{
+                loadQueue.push({{div, pageIndex, isIntersecting: true}});
+                changed = true;
+            }} else if (task) {{
+                task.isIntersecting = true;
+                changed = true;
+            }}
+        }} else {{
+            if (task) {{
+                task.isIntersecting = false;
+            }}
+        }}
+    }});
+    if (changed) processQueue();
+}}, {{ rootMargin: '100% 0px' }});
+
+init();
+</script>
+</body>
+</html>"""
+
     @app.get("/img/{doc_id}/{page_index}/analysis.png")
     def analysis_png(doc_id: str, page_index: int):
         from ..preview import analysis_overlay
