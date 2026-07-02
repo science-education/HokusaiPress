@@ -48,6 +48,10 @@ class BoxEdit(BaseModel):       # for content / nombre overrides
     decided_by: str = "human"
 
 
+class ReaderReport(BaseModel):
+    decided_by: str
+
+
 def create_app(db_path: str):
     from fastapi import FastAPI, HTTPException
     from fastapi.responses import HTMLResponse, Response
@@ -359,6 +363,16 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
             for r in store.review_queue()
         ]
 
+    @app.get("/api/doc/{doc_id}/pages")
+    def list_pages(doc_id: str):
+        return [
+            {
+                "page_index": row.page_index,
+                "needs_review": row.review_status == ReviewStatus.NEEDS_REVIEW,
+            }
+            for row in store.list_pages(doc_id)
+        ]
+
     @app.get("/api/page/{doc_id}/{page_index}")
     def get_page(doc_id: str, page_index: int):
         row = store.get_page(doc_id, page_index)
@@ -400,6 +414,22 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
                                "finish", None, True, features)
         store.upsert_page(doc_id, page_index, params)
         return {"status": params.review_status.value}
+
+    @app.post("/api/page/{doc_id}/{page_index}/report")
+    def report_page(doc_id: str, page_index: int, report: ReaderReport):
+        from ..learn import page_features
+
+        row = store.get_page(doc_id, page_index)
+        if row is None:
+            raise HTTPException(404, "page not found")
+        params = row.params
+        old_status = params.review_status.value
+        params.review_status = ReviewStatus.NEEDS_REVIEW
+        features = page_features(params)
+        store.upsert_page(doc_id, page_index, params)
+        store.log_decision(doc_id, page_index, report.decided_by,
+                           "reader_report", old_status, "needs_review", features)
+        return {"status": "flagged"}
 
     @app.post("/api/page/{doc_id}/{page_index}/region")
     def add_region(doc_id: str, page_index: int, edit: RegionEdit):

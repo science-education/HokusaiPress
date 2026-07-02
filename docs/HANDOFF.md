@@ -1,3 +1,6 @@
+# 2026-07-02: WP-11a 読書モードAPI
+- 全ページ一覧APIと読者報告APIを追加し、報告を教師信号として記録。
+- テスト: `tests/test_webui_reading.py`、全体pytestともにgreen。
 # HokusaiPress 引き継ぎ (Handoff)
 
 ## 2026-07-02: WP-01 FTS5 全文検索
