@@ -554,6 +554,31 @@ init();
             for r in store.review_queue()
         ]
 
+    @app.get("/api/library")
+    def library():
+        rows = []
+        for doc_id in store.doc_ids():
+            book = store.get_book(doc_id)
+            rows.append({
+                "doc_id": doc_id,
+                "page_count": len(store.list_pages(doc_id)),
+                "title": book["title"] if book else None,
+            })
+        return rows
+
+    @app.get("/api/search")
+    def search(q: str = "", limit: int = 50):
+        if q == "":
+            return []
+        return [
+            {
+                "doc_id": hit.doc_id,
+                "page_index": hit.page_index,
+                "snippet": hit.snippet,
+            }
+            for hit in store.search(q, limit)
+        ]
+
     @app.get("/api/doc/{doc_id}/pages")
     def list_pages(doc_id: str):
         return [

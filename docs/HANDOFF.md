@@ -1,3 +1,6 @@
+## 2026-07-02: WP-13a 書庫・検索 HTTP API
+- `GET /api/library` と `GET /api/search` を追加。
+- テスト: `tests/test_webui_library.py`、全体 pytest ともに green。
 ## 2026-07-02: WP-02 書誌読み取り API と search CLI
 - `Store.list_books/get_book/search_books` と `hokusai-press search` を追加。
 - テスト: `tests/test_library.py`、全体 pytest ともに green。
