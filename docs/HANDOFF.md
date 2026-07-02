@@ -1,6 +1,14 @@
 # HokusaiPress 引き継ぎ (Handoff)
 
-最終更新 2026-06-29 / branch `feat/pdf-metadata-export` / 221 tests green。
+最終更新 2026-07-01 / branch `feat/pdf-metadata-export` / 221 tests green。
+
+## 2026-07-01: 閲覧・書庫・学習ループ計画の確定
+
+- `docs/VIEWER_LIBRARY_PLAN.md` を新規作成。ビューア方式の判断（webui拡張が本線、
+  pdf2clipboard は技術移植のみ、Calibre プラグインは不採用で OPF 同梱出力の疎結合）、
+  レイヤ構成 [A]〜[G]、WP-01〜51 の作業パッケージ、Codex/Antigravity/Claude の実装分担、
+  Antigravity 向けの契約先渡し運用を定義。実装未着手。次の一手は WP-01（FTS5 検索）の
+  契約テスト作成から。
 
 ## 2026-06-29: PDFナビゲーションと構造化エクスポート
 
