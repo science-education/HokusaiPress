@@ -524,6 +524,149 @@ init();
 </body>
 </html>"""
 
+    @app.get("/library", response_class=HTMLResponse)
+    def library_view():
+        return """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Library</title>
+<style>
+  body { margin: 0; background: #e0e0e0; display: flex; flex-direction: column; align-items: center; font-family: sans-serif; padding: 20px; }
+  .container {
+    background: #fff;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    width: 800px;
+    max-width: 100%;
+    padding: 20px;
+    box-sizing: border-box;
+  }
+  .search-box {
+    margin-bottom: 20px;
+  }
+  .search-box input {
+    width: 300px;
+    padding: 8px;
+    font-size: 16px;
+  }
+  .search-box button {
+    padding: 8px 16px;
+    font-size: 16px;
+    cursor: pointer;
+  }
+  .doc-card {
+    border: 1px solid #ccc;
+    padding: 10px;
+    margin-bottom: 10px;
+    border-radius: 4px;
+  }
+  .doc-card a {
+    text-decoration: none;
+    color: #06c;
+    font-size: 18px;
+    font-weight: bold;
+  }
+  .doc-card a:hover {
+    text-decoration: underline;
+  }
+  .hit-card {
+    border: 1px solid #ccc;
+    padding: 10px;
+    margin-bottom: 10px;
+    border-radius: 4px;
+  }
+  .hit-card a {
+    text-decoration: none;
+    color: #06c;
+    font-weight: bold;
+  }
+  .snippet {
+    margin-top: 8px;
+    font-size: 14px;
+    color: #333;
+    white-space: pre-wrap;
+    background: #f9f9f9;
+    padding: 8px;
+    border: 1px solid #eee;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Library</h1>
+  
+  <div class="search-box">
+    <input type="text" id="searchInput" placeholder="Search..." onkeydown="if(event.key==='Enter') doSearch()">
+    <button onclick="doSearch()">Search</button>
+  </div>
+
+  <div id="results"></div>
+</div>
+
+<script>
+async function init() {
+    const res = await fetch('/api/library');
+    const docs = await res.json();
+    
+    const results = document.getElementById('results');
+    results.innerHTML = '<h2>Books</h2>';
+    
+    docs.forEach(doc => {
+        const div = document.createElement('div');
+        div.className = 'doc-card';
+        const title = doc.title ? doc.title : doc.doc_id;
+        div.innerHTML = `<a href="/read/${doc.doc_id}">${escapeHtml(title)}</a> <span>(${doc.page_count} pages)</span>`;
+        results.appendChild(div);
+    });
+}
+
+async function doSearch() {
+    const q = document.getElementById('searchInput').value.trim();
+    if (!q) {
+        init();
+        return;
+    }
+    
+    const res = await fetch('/api/search?q=' + encodeURIComponent(q));
+    const hits = await res.json();
+    
+    const results = document.getElementById('results');
+    results.innerHTML = `<h2>Search Results for "${escapeHtml(q)}"</h2>`;
+    
+    if (hits.length === 0) {
+        results.innerHTML += '<p>No results found.</p>';
+        return;
+    }
+    
+    hits.forEach(hit => {
+        const div = document.createElement('div');
+        div.className = 'hit-card';
+        div.innerHTML = `
+            <div><a href="/read/${hit.doc_id}">Document: ${escapeHtml(hit.doc_id)} - Page ${hit.page_index}</a></div>
+            <div class="snippet">${escapeHtml(hit.snippet)}</div>
+        `;
+        results.appendChild(div);
+    });
+}
+
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str).replace(/[&<>"']/g, function(m) {
+        return {
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            '"': '&quot;',
+            "'": '&#39;'
+        }[m];
+    });
+}
+
+init();
+</script>
+</body>
+</html>"""
+
     @app.get("/img/{doc_id}/{page_index}/analysis.png")
     def analysis_png(doc_id: str, page_index: int):
         from ..preview import analysis_overlay
