@@ -1,3 +1,6 @@
+## 2026-07-02: WP-41 OPF 書誌出力（Calibre 連携）
+- `src/hokusai_press/export_opf.py` に Dublin Core の OPF 2.0 書誌出力を追加。
+- テスト: `tests/test_opf.py`、全体 pytest ともに green。
 ## 2026-07-02: WP-31 能動学習キューの順位付け
 - レビュー待ちページを、類似する待ちページ数の降順で順位付けする機能を追加。
 - テスト: `tests/test_queue_rank.py`、全体 pytest ともに green。
