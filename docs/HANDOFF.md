@@ -2,6 +2,19 @@
 
 最終更新 2026-07-01 / branch `feat/pdf-metadata-export` / 221 tests green。
 
+## 2026-07-01: WP-01 / WP-11a 契約テストと委譲ブリーフを配置
+
+- 実装を Codex/Antigravity へ委譲するための「契約先渡し」を開始。契約テストは
+  未実装の間 skip（実装されると自動で有効化）なので全体は green を維持。
+- `tests/test_search.py` — WP-01（store.py に FTS5 全文検索 `Store.search`/`SearchHit`）。
+  trigram トークナイザ＋3文字未満は LIKE フォールバック、という設計判断まで契約に固定。
+- `tests/test_webui_reading.py` — WP-11a（読書モードのバックエンド:
+  `GET /api/doc/{id}/pages`、`POST /api/page/{id}/{i}/report`）。
+- 委譲ブリーフ: `docs/tasks/WP-01-codex.md`（Codex）、`WP-11a-codex.md`（Codex）、
+  `WP-11-antigravity.md`（Antigravity フロント）。各ブリーフに検証コマンドと
+  変更禁止ファイルを明記。現状 `229 passed, 4 skipped`。
+- 次: Codex に WP-01 → WP-11a、Antigravity に WP-11 を渡す。実装が入ると skip が実テストに変わる。
+
 ## 2026-07-01: 閲覧・書庫・学習ループ計画の確定
 
 - `docs/VIEWER_LIBRARY_PLAN.md` を新規作成。ビューア方式の判断（webui拡張が本線、
