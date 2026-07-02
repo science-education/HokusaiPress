@@ -333,6 +333,29 @@ class Store:
             )
             self.conn.commit()
 
+    def list_books(self) -> list[dict]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM book ORDER BY title"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_book(self, book_id: str) -> Optional[dict]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM book WHERE book_id=?", (book_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def search_books(self, query: str) -> list[dict]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM book WHERE title LIKE ? OR author LIKE ? "
+                "OR publisher LIKE ? ORDER BY title",
+                (f"%{query}%",) * 3,
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def save_scan_profile(self, book_id: str, scanner_sig, front_end, body_end,
                           page_count, ocr_pages, profile_json: str) -> None:
         with self._lock:

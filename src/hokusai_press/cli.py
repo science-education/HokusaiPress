@@ -252,6 +252,11 @@ def main(argv=None) -> int:
         help="output format (default: infer from --out extension)",
     )
 
+    p_search = sub.add_parser("search", help="search stored OCR text")
+    p_search.add_argument("query", help="text to search for")
+    p_search.add_argument("--db", default="hokusai.db")
+    p_search.add_argument("--limit", type=int, default=50)
+
     p_remargin = sub.add_parser(
         "remargin",
         help="re-run shadow/margin/content-box detection from STORED OCR "
@@ -467,6 +472,18 @@ def main(argv=None) -> int:
             print(f"error: {exc}")
             return 1
         print(f"[OK] exported {len(rows)} pages -> {out}")
+        return 0
+
+    if args.command == "search":
+        from .store import Store
+
+        store = Store(args.db)
+        try:
+            hits = store.search(args.query, args.limit)
+        finally:
+            store.close()
+        for hit in hits:
+            print(f"{hit.doc_id}:{hit.page_index}  {hit.snippet}")
         return 0
 
     return 1
