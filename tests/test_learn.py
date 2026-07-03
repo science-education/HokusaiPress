@@ -54,6 +54,34 @@ def test_page_features_extracts_photo_area():
     assert f["deskew_conf"] == 3.0
 
 
+def test_train_is_field_agnostic_not_hardcoded_to_page_kind_labels():
+    # WP-51: any string label works as a class, not just bw/gray/color.
+    left = [_decision({"n_text": 10, "n_photo": 0}, "left_bound")
+            for _ in range(3)]
+    right = [_decision({"n_text": 1, "n_photo": 5}, "right_bound")
+             for _ in range(3)]
+    model = learn.train(left + right)
+    assert model is not None
+    assert set(model["counts"]) == {"left_bound", "right_bound"}
+
+    label, conf = learn.predict(model, {"n_text": 9, "n_photo": 0})
+    assert label == "left_bound" and learn.is_confident(conf)
+
+
+def test_train_skips_non_string_labels_like_region_edits():
+    # A "region" decision logs a dict new_value (per-region edit against
+    # page-level features) -- granularity mismatch, must be skipped, not
+    # force-fit as a class.
+    region_like = [_decision({"n_photo": 1}, {"kind": "photo", "tone": None})
+                   for _ in range(5)]
+    bw = [_decision({"n_photo": 0}, "bw") for _ in range(3)]
+    color = [_decision({"n_photo": 5}, "color") for _ in range(3)]
+
+    model = learn.train(region_like + bw + color)
+    assert model is not None
+    assert set(model["counts"]) == {"bw", "color"}  # dict labels excluded
+
+
 def test_save_load_round_trip(tmp_path):
     model = learn.train(
         [_decision({"n_photo": 0}, "bw") for _ in range(3)]

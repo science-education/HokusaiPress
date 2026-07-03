@@ -1,13 +1,27 @@
-"""Learn page-kind decisions from the review log.
+"""Learn categorical page-level decisions from the review log.
 
-Once enough humans/AI have corrected page kinds, the hand-tuned auto
-thresholds can be replaced by a model fit to those decisions. To stay
-dependency-free this uses a normalized nearest-centroid classifier (numpy
-only): each decided class gets a centroid in feature space, prediction picks
-the nearest, and confidence is the normalized margin to the runner-up.
+Once enough humans/AI have corrected some page-level field (page_kind today;
+any future field whose decisions log a plain string new_value works the same
+way), the hand-tuned auto thresholds can be replaced by a model fit to those
+decisions. To stay dependency-free this uses a normalized nearest-centroid
+classifier (numpy only): each decided class gets a centroid in feature space,
+prediction picks the nearest, and confidence is the normalized margin to the
+runner-up.
 
 Feature vector per page (also used by the review UI):
   deskew_angle, deskew_conf, margin_conf, n_text, n_photo, photo_area_frac.
+
+train()/predict() are field-agnostic: the caller selects which decisions to
+learn from (typically via `store.decisions_for_training(field)`), and any
+string label is accepted as a class — nothing here is hardcoded to page_kind's
+bw/gray/color values. This intentionally covers only *page-level categorical*
+decisions. Decisions whose new_value is not a single string (e.g. "region"
+edits, which log a per-region {"kind","tone","box"} dict against page-level
+features) are a granularity mismatch — per-region features don't exist yet —
+so they are skipped rather than force-fit, matching the "never a silent wrong
+guess" policy below. Continuous corrections (deskew angle, margin/nombre box
+coordinates) are out of scope for this centroid classifier; they need a
+regression-style model, not attempted here.
 
 The model is a plain JSON blob, so it ships in the repo / db trivially and is
 inspectable. When the model is absent or unsure, the pipeline keeps the
@@ -52,7 +66,13 @@ def _vec(features: dict) -> np.ndarray:
 
 
 def train(decisions: list[dict]) -> Optional[dict]:
-    """decisions: rows with 'features' (JSON) and 'new_value' (JSON page kind).
+    """decisions: rows with 'features' (JSON) and 'new_value' (JSON string label).
+
+    Field-agnostic: any decision whose decoded new_value is a plain string is
+    treated as a class label (e.g. page_kind's "bw"/"gray"/"color", or any
+    other page-level categorical field logged the same way). Decisions whose
+    new_value is not a string (dict/list/number/None -- e.g. "region" edits)
+    are skipped: this classifier only fits page-level categorical fields.
 
     Returns a model dict or None if there isn't enough labeled data.
     """
@@ -65,7 +85,7 @@ def train(decisions: list[dict]) -> Optional[dict]:
                 else d["new_value"]
         except (json.JSONDecodeError, TypeError):
             continue
-        if label in ("bw", "gray", "color"):
+        if isinstance(label, str):
             by_class.setdefault(label, []).append(_vec(feats))
 
     classes = {c: np.array(v) for c, v in by_class.items() if len(v) >= MIN_PER_CLASS}

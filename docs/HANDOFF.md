@@ -1,3 +1,14 @@
+## 2026-07-03: WP-51 learn.py の決定タイプ一般化(Claude直担当)
+- `train()`のラベル判定を`page_kind`固有の`bw/gray/color`白名単から、任意の文字列ラベルを
+  クラスとして受け付ける field-agnostic な形に一般化。`decisions_for_training(field)`で
+  フィルタ済みの任意ページレベル・カテゴリカル決定を学習できる。
+- `region`決定（per-region dictをpage-level featuresへ紐づける粒度不一致）や連続値決定
+  （deskew角・margin/nombreボックス座標）は意図的に対象外のまま。理由をdocstringに明記
+  （「無言の誤った当て推量をしない」方針の延長）。
+- テスト: `tests/test_learn.py`にfield-agnosticであることの証明（page_kind以外のラベルで
+  学習可）と、dictラベル(region相当)が正しくスキップされることの2件を追加（6 passed）。
+  全体pytest 268 passed、回帰なし。delicateなstore/pipeline統合を伴わない安全な変更。
+
 ## 2026-07-03: WP-32 レビューキューの能動学習順位
 - `GET /api/queue` を文書ごとの `rank_pending` 順にし、`rank_score` を追加。
 - テスト: `tests/test_webui_queue_ranked.py`（2 passed）、全体 pytest（266 passed）ともに green。
