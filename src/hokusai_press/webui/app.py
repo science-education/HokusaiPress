@@ -1355,9 +1355,11 @@ setInterval(pollJobs, 3000);
     return app
 
 
-def serve(db_path: str, host: str = "127.0.0.1", port: int = 8765) -> None:
+def serve(db_path: str, host: str = "127.0.0.1", port: int = 8765,
+          require_auth: bool = True) -> None:
     import uvicorn
 
-    app = create_app(db_path)
-    print(f"HokusaiPress review UI -> http://{host}:{port}")
+    app = create_app(db_path, require_auth=require_auth)
+    print(f"HokusaiPress review UI -> http://{host}:{port}"
+          + (" (login required)" if require_auth else " (no auth -- local use only)"))
     uvicorn.run(app, host=host, port=port)

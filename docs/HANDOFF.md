@@ -1,3 +1,11 @@
+## 2026-07-03: CLI に --no-auth フラグを配線（Claude直担当・小規模機械的変更）
+- `hokusai-press review` に `--no-auth` を追加。既定は認証必須（`serve(require_auth=True)`
+  が既定）。付けた場合のみ `require_auth=False`（単一ユーザー・ローカル利用専用、
+  `--host 0.0.0.0` と併用しないよう help に明記）。
+- 全体 pytest 301 passed、回帰なし。
+- 次: WP-75（Antigravity）でログイン画面・ナビのユーザー表示/ログアウト・
+  管理者用ユーザー追加画面を実装。
+
 ## 2026-07-03: WP-74 蔵書所有権の閲覧・一覧系ルート配線（Codex担当）
 - 取込完了時の所有権割当と、library/queue/search/read/page/img の所有権フィルタ・アクセス制御を追加。
 - 編集系エンドポイント（decide/region/content/nombre 等）の所有権チェックは未実装（次 WP 対象）。

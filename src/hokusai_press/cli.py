@@ -217,6 +217,10 @@ def main(argv=None) -> int:
     p_web.add_argument("--db", default="hokusai.db")
     p_web.add_argument("--host", default="127.0.0.1")
     p_web.add_argument("--port", type=int, default=8765)
+    p_web.add_argument(
+        "--no-auth", action="store_true",
+        help="disable login (single-user/local use only -- never combine "
+             "with --host 0.0.0.0 on a network reachable by others)")
 
     p_re = sub.add_parser("rebuild",
                           help="regenerate a PDF from stored (corrected) params")
@@ -385,7 +389,8 @@ def main(argv=None) -> int:
     if args.command == "review":
         from .webui.app import serve
 
-        serve(args.db, host=args.host, port=args.port)
+        serve(args.db, host=args.host, port=args.port,
+              require_auth=not args.no_auth)
         return 0
 
     if args.command == "rebuild":
