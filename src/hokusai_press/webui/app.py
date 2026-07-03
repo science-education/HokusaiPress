@@ -56,16 +56,18 @@ class IngestRequest(BaseModel):
     path: str
 
 
-def create_app(db_path: str, runner=None):
+def create_app(db_path: str, runner=None, upload_dir=None):
     import os
     import threading
     import uuid
 
-    from fastapi import FastAPI, HTTPException
+    from fastapi import FastAPI, File, HTTPException, UploadFile
     from fastapi.responses import HTMLResponse, Response
 
     app = FastAPI(title="HokusaiPress review")
     store = Store(db_path)
+    if upload_dir is None:
+        upload_dir = os.path.join(os.path.dirname(db_path) or ".", "uploads")
 
     if runner is None:
         def runner(path, out_pdf, db_path):
@@ -867,12 +869,8 @@ setInterval(pollJobs, 3000);
             if (doc_id, page_index) in pending
         ]
 
-    @app.post("/api/ingest")
-    def ingest(request: IngestRequest):
-        if not os.path.isfile(request.path):
-            raise HTTPException(400, "file not found")
-
-        doc_id = os.path.basename(request.path)
+    def _start_ingest_job(path: str) -> dict:
+        doc_id = os.path.basename(path)
         job_id = str(uuid.uuid4())
         job = {
             "job_id": job_id,
@@ -886,7 +884,7 @@ setInterval(pollJobs, 3000);
         def execute():
             try:
                 os.makedirs("out", exist_ok=True)
-                runner(request.path, os.path.join("out", doc_id), db_path)
+                runner(path, os.path.join("out", doc_id), db_path)
             except Exception as exc:
                 with jobs_lock:
                     job["status"] = "error"
@@ -897,6 +895,20 @@ setInterval(pollJobs, 3000);
 
         threading.Thread(target=execute, daemon=True).start()
         return {"job_id": job_id, "doc_id": doc_id}
+
+    @app.post("/api/ingest")
+    def ingest(request: IngestRequest):
+        if not os.path.isfile(request.path):
+            raise HTTPException(400, "file not found")
+        return _start_ingest_job(request.path)
+
+    @app.post("/api/upload")
+    def upload(file: UploadFile = File(...)):
+        os.makedirs(upload_dir, exist_ok=True)
+        path = os.path.join(upload_dir, file.filename)
+        with open(path, "wb") as destination:
+            destination.write(file.file.read())
+        return _start_ingest_job(path)
 
     @app.get("/api/jobs")
     def list_jobs():

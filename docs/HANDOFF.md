@@ -1,3 +1,6 @@
+## 2026-07-03: WP-63a アップロード API（Codex担当）
+- `POST /api/upload` でファイルを保存し、既存の取込ジョブを起動するよう対応。
+- `/api/ingest` とジョブ起動ロジックを共通化し、既存インターフェースを維持。
 ## 2026-07-03: WP-62 UI統合 (Antigravity担当)
 - `app.py` に共通シェル `_shell` を追加し、 `/library`, `/ingest`, `/`, `/read/{doc_id}` のUIを刷新・統合。
 - テスト: `pytest -q` 全て green（API挙動不変）。
