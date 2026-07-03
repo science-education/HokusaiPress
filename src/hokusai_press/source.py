@@ -126,6 +126,32 @@ _ROTATE_CV2 = {
 }
 
 
+def _image_matrix_rotation(img_obj) -> int | None:
+    """Axis-aligned rotation (deg, /Rotate sense) already baked into the image
+    object's placement matrix, or None when the placement is skewed/unknown.
+
+    Some producers store upright pixels and rotate them INTO the page with the
+    CTM (then /Rotate turns the page back); others store sideways pixels with
+    an upright CTM and let /Rotate alone fix the display. Only the NET of both
+    rotations tells how the raw bitmap relates to the displayed page.
+    """
+    try:
+        m = img_obj.get_matrix()
+        a, b = float(m.a), float(m.b)
+    except Exception:
+        return None
+    eps = 1e-3 * max(abs(a), abs(b), 1.0)
+    if abs(b) <= eps and a > 0:
+        return 0
+    if abs(a) <= eps and b < 0:
+        return 90
+    if abs(b) <= eps and a < 0:
+        return 180
+    if abs(a) <= eps and b > 0:
+        return 270
+    return None
+
+
 def _extract_original(page, doc, index: int) -> tuple[np.ndarray, float | None, str | None]:
     """Prefer the single embedded full-page image (lossless original). Fall
     back to a 300 dpi rasterization when a page is not a simple scan."""
@@ -135,13 +161,13 @@ def _extract_original(page, doc, index: int) -> tuple[np.ndarray, float | None, 
     images = [obj for obj in page.get_objects()
               if obj.type == pdfium_c.FPDF_PAGEOBJ_IMAGE]
     # get_size() already reflects /Rotate (it's the page's DISPLAY size), but
-    # the embedded image bytes are in the page's own unrotated frame -- e.g. a
-    # wide table scanned sideways and tagged /Rotate=270 so it displays as a
-    # tall page (the reader turns the BOOK, not the table). Apply that same
-    # rotation to the extracted bitmap (a lossless 90 deg permutation, not a
-    # resample) so the original matches what every viewer/the rest of the
-    # pipeline treats as "this page", instead of staying landscape while
-    # every other page in the book is portrait.
+    # the embedded image bytes are in the page's own coordinate frame. To make
+    # the extracted bitmap match what a viewer shows, apply the NET rotation:
+    # the placement-matrix rotation (how the pixels were drawn into the page)
+    # composed with /Rotate (how the page is displayed). A sideways scan with
+    # an upright CTM needs the full /Rotate; a producer that pre-rotated the
+    # pixels via the CTM and tagged /Rotate to undo it needs none (net 0) --
+    # applying /Rotate alone would turn every upright page on its side.
     page_w_pt, page_h_pt = page.get_size()
     rotation = page.get_rotation() % 360
 
@@ -151,7 +177,10 @@ def _extract_original(page, doc, index: int) -> tuple[np.ndarray, float | None, 
             pil = img_obj.get_bitmap(render=False).to_pil()
             arr = np.array(pil.convert("RGB"))
             bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-            cv2_rot = _ROTATE_CV2.get(rotation)
+            matrix_rot = _image_matrix_rotation(img_obj)
+            net = rotation if matrix_rot is None \
+                else (matrix_rot + rotation) % 360
+            cv2_rot = _ROTATE_CV2.get(net)
             if cv2_rot is not None:
                 bgr = cv2.rotate(bgr, cv2_rot)
             # dpi from embedded pixel size vs page point size (both now in

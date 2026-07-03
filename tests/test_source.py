@@ -51,3 +51,35 @@ def test_load_single_is_thread_safe(tmp_path):
         t.join()
     assert not errors, errors[0]
     assert len(set(shapes)) == 1  # every extraction identical
+
+
+class _FakeMatrix:
+    def __init__(self, a, b):
+        self.a, self.b = a, b
+
+
+class _FakeImgObj:
+    def __init__(self, a, b):
+        self._m = _FakeMatrix(a, b)
+
+    def get_matrix(self):
+        return self._m
+
+
+def test_image_matrix_rotation_axis_cases():
+    # Net-rotation regression (90-deg-left bug): a producer that pre-rotates
+    # pixels via the CTM and undoes it with /Rotate must yield net 0.
+    from hokusai_press.source import _image_matrix_rotation
+
+    assert _image_matrix_rotation(_FakeImgObj(592.0, 0.0)) == 0     # upright CTM
+    assert _image_matrix_rotation(_FakeImgObj(0.0, -399.1)) == 90   # pre-rotated
+    assert _image_matrix_rotation(_FakeImgObj(-592.0, 0.0)) == 180
+    assert _image_matrix_rotation(_FakeImgObj(0.0, 399.1)) == 270
+    # skewed placement -> unknown -> caller falls back to /Rotate alone
+    assert _image_matrix_rotation(_FakeImgObj(100.0, 100.0)) is None
+
+    class _Broken:
+        def get_matrix(self):
+            raise RuntimeError("no matrix")
+
+    assert _image_matrix_rotation(_Broken()) is None
