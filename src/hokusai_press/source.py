@@ -103,6 +103,21 @@ def load_page(
             doc.close()
 
 
+_USER_ROTATE_CV2 = {
+    90: cv2.ROTATE_90_CLOCKWISE,
+    180: cv2.ROTATE_180,
+    270: cv2.ROTATE_90_COUNTERCLOCKWISE,
+}
+
+
+def apply_user_rotation(img: np.ndarray, rotation: int) -> np.ndarray:
+    """Apply a PageParams.rotation (clockwise 90-deg steps) to a loaded
+    original. Every loader must call this so stored boxes (which live in the
+    rotation-applied frame) stay aligned with the pixels."""
+    rot = _USER_ROTATE_CV2.get(rotation % 360)
+    return img if rot is None else cv2.rotate(img, rot)
+
+
 def load_single(path: str, page_index: int) -> tuple[np.ndarray, float | None]:
     """Re-extract one page's original image (for the review UI / re-render)."""
     ext = os.path.splitext(path)[1].lower()

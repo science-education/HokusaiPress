@@ -538,6 +538,10 @@ def rebuild(doc_id: str, source_path: str, out_pdf: str,
                 lambda a: load_single(*a), load_args)]
     else:
         originals = [load_single(*a)[0] for a in load_args]
+    # stored boxes live in the rotation-applied frame (model.rotate_page_params)
+    from .source import apply_user_rotation
+    originals = [apply_user_rotation(o, row.params.rotation)
+                 for o, row in zip(originals, rows)]
     # rebuild makes a fresh Document, so the shadow-band model isn't carried in
     # the stored per-page params -- recompute it from the originals (same
     # document-level detector as analyze) so render applies the identical bands.
@@ -573,9 +577,10 @@ def recompute_margins(store: Store, doc_id: str,
 
 def _load_and_compute_margin(args):
     source_path, p = args
-    from .source import load_single
+    from .source import apply_user_rotation, load_single
 
     original, _ = load_single(source_path, p.source.page_index)
+    original = apply_user_rotation(original, p.rotation)
     return compute_margin(original, p.deskew, p.regions)
 
 

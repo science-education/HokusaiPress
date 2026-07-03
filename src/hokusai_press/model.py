@@ -222,6 +222,11 @@ class PageParams:
     # OCR found no content and the page has no real ink -> render as blank white
     # (rejects show-through). Only set when OCR ran, so it never erases text.
     blank: bool = False
+    # Human orientation correction: clockwise degrees (0/90/180/270) applied to
+    # the loaded original before any other processing. All stored boxes are in
+    # the rotation-APPLIED frame (rotate_page_params keeps them in sync), so
+    # every loader of this page's original must apply this rotation first.
+    rotation: int = 0
 
     def needs_review(self) -> bool:
         return self.review_status == ReviewStatus.NEEDS_REVIEW
@@ -325,6 +330,7 @@ def _decode_page(d) -> PageParams:
         decided_by=None if d.get("decided_by") is None else DecidedBy(d["decided_by"]),
         nombre_text=d.get("nombre_text"),
         page_number=d.get("page_number"),
+        rotation=int(d.get("rotation", 0)),
         nombre_evidence=d.get("nombre_evidence", {}),
         nombre_decision=d.get("nombre_decision", {}),
         printed_folio=(None if printed is None else PrintedFolio(
@@ -359,3 +365,119 @@ def _decode_document(d) -> Document:
         pages=[_decode_page(p) for p in d.get("pages", [])],
         render=RenderSettings(**d.get("render", {})),
     )
+
+
+# --- human-readable flag descriptions (review UI) ---------------------------
+# label: short name shown in lists; desc: what the batch detected;
+# check: what the reviewer should look at on the page.
+FLAG_INFO: dict = {
+    Flag.DESKEW_LOW_CONF.value: {
+        "label": "傾き検出が不確か",
+        "desc": "ページの傾き角の自動測定に自信がありません。",
+        "check": "行が水平か確認し、傾いていれば角度を調整してください。",
+    },
+    Flag.MARGIN_NOT_FOUND.value: {
+        "label": "本文領域が見つからない",
+        "desc": "本文の範囲(余白との境界)を自動検出できませんでした。",
+        "check": "本文を囲む枠をドラッグで指定してください。",
+    },
+    Flag.MARGIN_INCONSISTENT.value: {
+        "label": "本文領域が前後とずれ",
+        "desc": "検出した本文範囲が前後のページと大きく異なります。",
+        "check": "本文枠が正しいか確認し、必要なら修正してください。",
+    },
+    Flag.KIND_BORDERLINE.value: {
+        "label": "ページ種別が判定困難",
+        "desc": "白黒/グレー/カラーのどれで出力すべきか自信がありません。",
+        "check": "写真や色の有無を見て、ページ種別を選んでください。",
+    },
+    Flag.OCR_LOW_COVERAGE.value: {
+        "label": "文字認識が部分的",
+        "desc": "ページの一部しか文字を認識できていない可能性があります。",
+        "check": "本文の量に対して認識領域が少なくないか確認してください。",
+    },
+    Flag.OCR_DROPOUT_RETRY.value: {
+        "label": "文字認識を再試行した",
+        "desc": "最初の認識で欠落があり、再試行が行われました。",
+        "check": "文字領域の枠が本文を覆えているか確認してください。",
+    },
+    Flag.DETECTION_DENSITY.value: {
+        "label": "検出数が異常",
+        "desc": "検出された領域の数が前後のページと比べて不自然です。",
+        "check": "誤検出の枠や、見落とされた本文がないか確認してください。",
+    },
+    Flag.NO_TEXT.value: {
+        "label": "文字が見つからない",
+        "desc": "このページから文字が検出されませんでした。",
+        "check": "白紙・図版ページなら問題ありません。本文があるなら要修正です。",
+    },
+    Flag.OCR_FAILED.value: {
+        "label": "文字認識エラー",
+        "desc": "このページの文字認識が途中で失敗しました。",
+        "check": "画像の乱れがないか確認してください。再処理が必要な場合があります。",
+    },
+    Flag.NOMBRE_UNREADABLE.value: {
+        "label": "ページ番号が読めない",
+        "desc": "ページ番号(ノンブル)を読み取れませんでした。",
+        "check": "番号が印刷されていれば、その位置を枠で指定してください。",
+    },
+    Flag.PAGE_NUMBER_GAP.value: {
+        "label": "ページ番号が飛んでいる",
+        "desc": "前後のページ番号がつながっていません(読み違いの可能性)。",
+        "check": "実際の印刷番号と照らして、誤読があれば修正してください。",
+    },
+    Flag.PAGE_REORIENTED.value: {
+        "label": "向きを自動補正した",
+        "desc": "他のページに合わせて縦横の向きを自動で変更しました。",
+        "check": "向きが正しいか確認してください。誤っていれば回転で戻せます。",
+    },
+    Flag.CONTENT_SCALED_DOWN.value: {
+        "label": "サイズを自動縮小した",
+        "desc": "他より極端に大きいページを、本の判型に合わせて縮小しました。",
+        "check": "縮小後も内容が読めるか確認してください。",
+    },
+}
+
+
+def _rotate_box(b: Optional[Box], delta: int, w: float, h: float) -> Optional[Box]:
+    """Exact box coordinates after rotating a w x h image `delta` deg clockwise."""
+    if b is None:
+        return None
+    if delta == 90:      # (x,y) -> (h - y, x)
+        return Box(h - b.y1, b.x0, h - b.y0, b.x1)
+    if delta == 180:     # (x,y) -> (w - x, h - y)
+        return Box(w - b.x1, h - b.y1, w - b.x0, h - b.y0)
+    if delta == 270:     # (x,y) -> (y, w - x)
+        return Box(b.y0, w - b.x1, b.y1, w - b.x0)
+    return Box(b.x0, b.y0, b.x1, b.y1)
+
+
+def rotate_page_params(params: PageParams, delta: int, width: float, height: float) -> None:
+    """Apply a clockwise 90-deg-step rotation to a page IN PLACE.
+
+    `width`/`height` are the dimensions of the CURRENT original frame (i.e.
+    with params.rotation already applied). Every stored box is permuted
+    exactly (no resampling, no information loss), params.rotation accumulates,
+    and page_w/page_h swap for odd quarter turns. The deskew angle was
+    measured against the old axes, so it is reset for 90/270 (meaningless
+    there) and kept for 180 (a baseline at theta stays at theta).
+    """
+    delta = delta % 360
+    if delta not in (90, 180, 270):
+        return
+    for r in params.regions:
+        r.box = _rotate_box(r.box, delta, width, height)
+    if params.printed_folio is not None:
+        params.printed_folio.box = _rotate_box(
+            params.printed_folio.box, delta, width, height)
+    m = params.margin
+    if m is not None:
+        m.content = _rotate_box(m.content, delta, width, height)
+        m.crop = _rotate_box(m.crop, delta, width, height)
+        m.nombre_box = _rotate_box(m.nombre_box, delta, width, height)
+        if delta in (90, 270):
+            m.page_w, m.page_h = m.page_h, m.page_w
+            m.target_w, m.target_h = m.target_h, m.target_w
+    if delta in (90, 270):
+        params.deskew.angle_deg = 0.0
+    params.rotation = (params.rotation + delta) % 360

@@ -182,13 +182,16 @@ def create_app(db_path: str, runner=None, upload_dir=None, require_auth=False):
     _ORIG_CACHE_MAX = 4
 
     def _load_original(params):
-        from ..source import load_single
+        from ..source import apply_user_rotation, load_single
 
-        key = (params.source.path, params.source.page_index)
+        # rotation is part of the key: a rotate correction must invalidate
+        # the cached, differently-oriented pixels
+        key = (params.source.path, params.source.page_index, params.rotation)
         if key in _orig_cache:
             _orig_cache.move_to_end(key)
             return _orig_cache[key]
-        original, _ = load_single(*key)
+        original, _ = load_single(key[0], key[1])
+        original = apply_user_rotation(original, params.rotation)
         _orig_cache[key] = original
         while len(_orig_cache) > _ORIG_CACHE_MAX:
             _orig_cache.popitem(last=False)
