@@ -48,6 +48,16 @@ class BoxEdit(BaseModel):       # for content / nombre overrides
     decided_by: str = "human"
 
 
+class RotateEdit(BaseModel):
+    delta: int
+    decided_by: str = "human"
+
+
+class DeskewEdit(BaseModel):
+    angle_deg: float
+    decided_by: str = "human"
+
+
 class ReaderReport(BaseModel):
     decided_by: str
 
@@ -1347,6 +1357,50 @@ setInterval(pollJobs, 3000);
             }
             for row in store.list_pages(doc_id)
         ]
+
+    @app.get("/api/flags")
+    def flags():
+        from ..model import FLAG_INFO
+
+        return FLAG_INFO
+
+    @app.post("/api/page/{doc_id}/{page_index}/rotate")
+    def rotate_page(doc_id: str, page_index: int, edit: RotateEdit):
+        from ..learn import page_features
+        from ..model import rotate_page_params
+
+        row = store.get_page(doc_id, page_index)
+        if row is None:
+            raise HTTPException(404, "page not found")
+        if edit.delta not in (90, 180, 270):
+            raise HTTPException(400, "delta must be 90, 180, or 270")
+        params = row.params
+        old_rotation = params.rotation
+        h, w = _load_original(params).shape[:2]
+        rotate_page_params(params, edit.delta, w, h)
+        store.log_decision(doc_id, page_index, edit.decided_by, "rotation",
+                           old_rotation, params.rotation, page_features(params))
+        store.upsert_page(doc_id, page_index, params)
+        return {"status": params.review_status.value,
+                "rotation": params.rotation}
+
+    @app.post("/api/page/{doc_id}/{page_index}/deskew")
+    def deskew_page(doc_id: str, page_index: int, edit: DeskewEdit):
+        from ..learn import page_features
+
+        row = store.get_page(doc_id, page_index)
+        if row is None:
+            raise HTTPException(404, "page not found")
+        if abs(edit.angle_deg) > 15:
+            raise HTTPException(400, "angle_deg must be between -15 and 15")
+        params = row.params
+        old_angle = params.deskew.angle_deg
+        params.deskew.angle_deg = edit.angle_deg
+        store.log_decision(doc_id, page_index, edit.decided_by, "deskew",
+                           old_angle, edit.angle_deg, page_features(params))
+        store.upsert_page(doc_id, page_index, params)
+        return {"status": params.review_status.value,
+                "angle_deg": params.deskew.angle_deg}
 
     @app.get("/api/page/{doc_id}/{page_index}")
     def get_page(doc_id: str, page_index: int):

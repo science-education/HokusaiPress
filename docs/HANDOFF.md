@@ -1,3 +1,6 @@
+## 2026-07-03: WP-64a 回転・傾き調整 API とフラグ説明 API（Codex担当）
+- `/api/flags`、ページ回転・傾き補正 API を追加し、座標変換と decision log 保存を実装。
+- `tests/test_webui_adjust.py` と全体 pytest で回帰確認済み。
 ## 2026-07-03: WP-75 ログイン画面・ナビのユーザー表示・管理者用ユーザー追加 (Antigravity担当)
 - `app.py` に `/login` と `/admin/users` を追加し、初回セットアップ/ログイン画面と管理者用ユーザー管理画面を実装。ミドルウェア例外にも追加。
 - `_shell` 内で `/api/me` を fetch し、全画面のナビ右端にユーザー名とログアウトボタンを動的表示するよう改修。
