@@ -56,13 +56,23 @@ class IngestRequest(BaseModel):
     path: str
 
 
-def create_app(db_path: str, runner=None, upload_dir=None):
+class AuthRequest(BaseModel):
+    username: str
+    password: str
+
+
+class UserCreateRequest(AuthRequest):
+    role: str
+
+
+def create_app(db_path: str, runner=None, upload_dir=None, require_auth=False):
     import os
+    import secrets
     import threading
     import uuid
 
-    from fastapi import FastAPI, File, HTTPException, UploadFile
-    from fastapi.responses import HTMLResponse, Response
+    from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+    from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
     app = FastAPI(title="HokusaiPress review")
     store = Store(db_path)
@@ -77,6 +87,90 @@ def create_app(db_path: str, runner=None, upload_dir=None):
 
     jobs = {}
     jobs_lock = threading.Lock()
+    sessions: dict[str, str] = {}
+    sessions_lock = threading.Lock()
+
+    def _session_user(request: Request):
+        token = request.cookies.get("hp_session")
+        if not token:
+            return None
+        with sessions_lock:
+            username = sessions.get(token)
+        return store.get_user(username) if username else None
+
+    def _start_session(response: Response, username: str) -> None:
+        token = secrets.token_urlsafe(32)
+        with sessions_lock:
+            sessions[token] = username
+        response.set_cookie("hp_session", token, httponly=True)
+
+    @app.middleware("http")
+    async def require_session(request: Request, call_next):
+        if (not require_auth
+                or request.url.path in {"/api/login", "/api/setup"}
+                or _session_user(request) is not None):
+            return await call_next(request)
+        if request.url.path.startswith("/api/"):
+            return JSONResponse(
+                {"detail": "authentication required"}, status_code=401
+            )
+        return RedirectResponse("/login", status_code=302)
+
+    @app.post("/api/setup")
+    def setup(auth: AuthRequest, response: Response):
+        if store.list_users():
+            raise HTTPException(403, "setup already completed")
+        store.create_user(auth.username, auth.password, role="admin")
+        _start_session(response, auth.username)
+        return {"username": auth.username, "role": "admin"}
+
+    @app.post("/api/login")
+    def login(auth: AuthRequest, response: Response):
+        user = store.verify_user(auth.username, auth.password)
+        if user is None:
+            raise HTTPException(401, "invalid username or password")
+        _start_session(response, user["username"])
+        return {"username": user["username"], "role": user["role"]}
+
+    @app.post("/api/logout")
+    def logout(request: Request, response: Response):
+        token = request.cookies.get("hp_session")
+        if token:
+            with sessions_lock:
+                sessions.pop(token, None)
+        response.delete_cookie("hp_session", httponly=True)
+        return {"status": "logged_out"}
+
+    @app.get("/api/me")
+    def me(request: Request):
+        user = _session_user(request)
+        if user is None:
+            raise HTTPException(401, "authentication required")
+        return {"username": user["username"], "role": user["role"]}
+
+    def _require_admin(request: Request):
+        user = _session_user(request)
+        if user is None or user["role"] != "admin":
+            raise HTTPException(403, "admin required")
+        return user
+
+    @app.post("/api/users")
+    def create_user(user: UserCreateRequest, request: Request):
+        _require_admin(request)
+        store.create_user(user.username, user.password, role=user.role)
+        return {"status": "created"}
+
+    @app.get("/api/users")
+    def list_users(request: Request):
+        _require_admin(request)
+        return [
+            {
+                "username": user["username"],
+                "role": user["role"],
+                "created_at": user["created_at"],
+            }
+            for user in store.list_users()
+        ]
 
     # Small cache of extracted originals: a single page view fires analysis.png
     # and output.png back to back, both needing the same original. Re-extracting

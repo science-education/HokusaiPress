@@ -1,3 +1,6 @@
+## 2026-07-03: WP-73 セッション認証（Codex担当）
+- `create_app(..., require_auth=False)` の後方互換性を保ちつつ、ログイン・初期セットアップ・ログアウト・ルート保護を追加。
+- 管理者専用のユーザー作成・一覧 API を追加し、認証テストと全体テストで回帰がないことを確認。
 ## 2026-07-03: WP-72 蔵書所有権スキーマ（Claude直担当・delicate）
 - `store.py` に `doc_owner` テーブル（doc_id→username, 1対1）と
   `set_doc_owner`/`get_doc_owner`/`doc_ids_for_user` を追加。
