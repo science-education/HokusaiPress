@@ -98,19 +98,118 @@ def create_app(db_path: str, runner=None):
             _orig_cache.popitem(last=False)
         return original
 
+    def _shell(title: str, body: str, active_path: str = "/") -> str:
+        nav_links = [
+            ("/library", "📚 書庫"),
+            ("/ingest", "📥 取込"),
+            ("/", "✏️ レビュー"),
+        ]
+        nav_html = "".join(
+            f'<a href="{path}" class="nav-link {"active" if path == active_path else ""}">{label}</a>'
+            for path, label in nav_links
+        )
+        return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{title} - HokusaiPress</title>
+<style>
+  :root {{
+    --accent: #3b82f6;
+    --accent-hover: #2563eb;
+    --bg: #f8fafc;
+    --surface: #ffffff;
+    --text: #334155;
+    --text-light: #64748b;
+    --border: #e2e8f0;
+  }}
+  body {{
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, sans-serif;
+    line-height: 1.5;
+  }}
+  .navbar {{
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    padding: 0 24px; display: flex; align-items: center; height: 60px; gap: 16px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05); position: sticky; top: 0; z-index: 100;
+  }}
+  .navbar-brand {{ font-weight: 700; color: #0f172a; margin-right: 16px; font-size: 1.1rem; }}
+  .nav-link {{
+    text-decoration: none; color: var(--text-light); font-weight: 500;
+    padding: 8px 12px; border-radius: 6px; transition: 0.2s;
+  }}
+  .nav-link:hover {{ background: #f1f5f9; color: #0f172a; }}
+  .nav-link.active {{ background: #eff6ff; color: var(--accent); }}
+  .container {{ max-width: 1000px; margin: 32px auto; padding: 0 24px; }}
+  .card {{
+    background: var(--surface); border-radius: 12px;
+    box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05), 0 2px 4px -2px rgba(0,0,0,0.05);
+    padding: 24px; border: 1px solid #f1f5f9;
+  }}
+  .btn {{
+    display: inline-flex; align-items: center; justify-content: center;
+    background: var(--accent); color: white; border: none; padding: 8px 16px;
+    border-radius: 6px; font-size: 14px; font-weight: 500; cursor: pointer;
+    text-decoration: none; transition: 0.2s;
+  }}
+  .btn:hover {{ background: var(--accent-hover); }}
+  .btn:disabled {{ opacity: 0.6; cursor: not-allowed; }}
+  .btn-outline {{
+    background: transparent; border: 1px solid var(--border); color: var(--text);
+  }}
+  .btn-outline:hover {{ background: #f1f5f9; }}
+  input[type="text"] {{
+    padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px;
+    font-size: 14px; outline: none; transition: border-color 0.2s;
+  }}
+  input[type="text"]:focus {{ border-color: var(--accent); }}
+  table {{ width: 100%; border-collapse: collapse; }}
+  th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid var(--border); }}
+  th {{ color: var(--text-light); font-weight: 500; font-size: 14px; }}
+</style>
+</head>
+<body>
+  <div class="navbar">
+    <div class="navbar-brand">HokusaiPress</div>
+    {nav_html}
+  </div>
+  <div class="container">
+    {body}
+  </div>
+</body>
+</html>"""
+
     @app.get("/", response_class=HTMLResponse)
     def index():
-        rows = store.review_queue()
-        items = "".join(
-            f'<li><a href="/page/{r.doc_id}/{r.page_index}">{r.doc_id} '
-            f"p{r.page_index}</a> &mdash; {', '.join(r.flags)}</li>"
-            for r in rows
-        )
-        return (
-            "<h2>review queue</h2>"
-            f"<p>{len(rows)} pages awaiting review</p>"
-            f"<ul>{items or '<li>empty</li>'}</ul>"
-        )
+        return _shell("レビューキュー", """
+<div class="card">
+  <h2>レビューキュー</h2>
+  <div id="queue-container">読み込み中...</div>
+</div>
+<script>
+async function loadQueue() {
+    const res = await fetch('/api/queue');
+    const rows = await res.json();
+    const container = document.getElementById('queue-container');
+    if (rows.length === 0) {
+        container.innerHTML = '<div style="text-align:center;padding:40px;color:var(--text-light)">レビュー待ちはありません 🎉</div>';
+        return;
+    }
+    let html = '<table><thead><tr><th>ページ</th><th>Doc ID</th><th>Flags</th><th>類似ページ数 (Rank Score)</th></tr></thead><tbody>';
+    rows.forEach(r => {
+        html += `<tr>
+            <td><a href="/page/${r.doc_id}/${r.page_index}" class="btn btn-outline" style="padding:4px 8px">確認する</a></td>
+            <td>${r.doc_id} p.${r.page_index}</td>
+            <td>${r.flags.join(', ')}</td>
+            <td>${r.rank_score.toFixed(2)}</td>
+        </tr>`;
+    });
+    html += '</tbody></table>';
+    container.innerHTML = html;
+}
+loadQueue();
+</script>
+""", active_path="/")
 
     @app.get("/page/{doc_id}/{page_index}", response_class=HTMLResponse)
     def page_view(doc_id: str, page_index: int):
@@ -352,18 +451,14 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
 
     @app.get("/read/{doc_id}", response_class=HTMLResponse)
     def read_view(doc_id: str):
-        return f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Read {doc_id}</title>
+        body = f"""
 <style>
-  body {{ margin: 0; background: #e0e0e0; display: flex; flex-direction: column; align-items: center; font-family: sans-serif; }}
+  .pages-wrapper {{ display: flex; flex-direction: column; align-items: center; }}
   .page-container {{
     position: relative;
     margin: 20px 0;
     background: #fff;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
     min-height: 600px;
     width: 800px;
     max-width: 100%;
@@ -394,12 +489,14 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
     padding: 6px 12px;
     cursor: pointer;
     background: #fff;
-    border: 1px solid #ccc;
+    border: 1px solid var(--border);
     border-radius: 4px;
     font-size: 13px;
+    color: var(--text);
   }}
+  .report-btn:hover {{ background: #f1f5f9; }}
   .feedback {{
-    color: #0a0;
+    color: #16a34a;
     font-size: 13px;
     opacity: 0;
     transition: opacity 1s;
@@ -409,10 +506,12 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
     opacity: 1;
     transition: opacity 0.1s;
   }}
+  .read-header {{ text-align: center; margin-bottom: 24px; }}
 </style>
-</head>
-<body>
-<div id="pages"></div>
+<div class="read-header">
+  <h2>{doc_id}</h2>
+</div>
+<div class="pages-wrapper" id="pages"></div>
 <script>
 const DOC_ID = "{doc_id}";
 let currentGen = 0;
@@ -538,151 +637,190 @@ const observer = new IntersectionObserver((entries) => {{
 
 init();
 </script>
-</body>
-</html>"""
+"""
+        return _shell(f"Read {doc_id}", body, active_path="")
 
     @app.get("/library", response_class=HTMLResponse)
     def library_view():
-        return """<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Library</title>
+        body = """
 <style>
-  body { margin: 0; background: #e0e0e0; display: flex; flex-direction: column; align-items: center; font-family: sans-serif; padding: 20px; }
-  .container {
-    background: #fff;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-    width: 800px;
-    max-width: 100%;
-    padding: 20px;
-    box-sizing: border-box;
-  }
-  .search-box {
-    margin-bottom: 20px;
-  }
-  .search-box input {
-    width: 300px;
-    padding: 8px;
-    font-size: 16px;
-  }
-  .search-box button {
-    padding: 8px 16px;
-    font-size: 16px;
-    cursor: pointer;
-  }
-  .doc-card {
-    border: 1px solid #ccc;
-    padding: 10px;
-    margin-bottom: 10px;
-    border-radius: 4px;
-  }
-  .doc-card a {
-    text-decoration: none;
-    color: #06c;
-    font-size: 18px;
-    font-weight: bold;
-  }
-  .doc-card a:hover {
-    text-decoration: underline;
-  }
-  .hit-card {
-    border: 1px solid #ccc;
-    padding: 10px;
-    margin-bottom: 10px;
-    border-radius: 4px;
-  }
-  .hit-card a {
-    text-decoration: none;
-    color: #06c;
-    font-weight: bold;
-  }
-  .snippet {
-    margin-top: 8px;
-    font-size: 14px;
-    color: #333;
-    white-space: pre-wrap;
-    background: #f9f9f9;
-    padding: 8px;
-    border: 1px solid #eee;
-  }
+.search-bar { display: flex; gap: 8px; margin-bottom: 24px; }
+.search-bar input { flex: 1; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 16px; }
+.book-card { display: flex; flex-direction: column; gap: 12px; }
+.book-title { font-weight: bold; font-size: 16px; }
+.book-meta { color: var(--text-light); font-size: 14px; }
+.hit-card { margin-bottom: 16px; }
+.snippet { margin-top: 8px; font-size: 14px; color: var(--text); background: var(--bg); padding: 12px; border-radius: 6px; border: 1px solid var(--border); white-space: pre-wrap; }
+mark { background-color: #fef08a; padding: 0 4px; border-radius: 2px; }
 </style>
-</head>
-<body>
-<div class="container">
-  <h1>Library</h1>
-  
-  <div class="search-box">
-    <input type="text" id="searchInput" placeholder="Search..." onkeydown="if(event.key==='Enter') doSearch()">
-    <button onclick="doSearch()">Search</button>
+<div class="card" style="margin-bottom: 24px;">
+  <div class="search-bar">
+    <input type="text" id="searchInput" placeholder="検索..." onkeydown="if(event.key==='Enter') doSearch()">
+    <button class="btn" onclick="doSearch()">検索</button>
   </div>
-
-  <div id="results"></div>
 </div>
-
+<div id="results"></div>
 <script>
 async function init() {
     const res = await fetch('/api/library');
     const docs = await res.json();
-    
     const results = document.getElementById('results');
-    results.innerHTML = '<h2>Books</h2>';
     
+    let html = '<h2>書籍一覧</h2><div class="grid">';
     docs.forEach(doc => {
-        const div = document.createElement('div');
-        div.className = 'doc-card';
         const title = doc.title ? doc.title : doc.doc_id;
-        div.innerHTML = `<a href="/read/${doc.doc_id}">${escapeHtml(title)}</a> <span>(${doc.page_count} pages)</span>`;
-        results.appendChild(div);
+        html += `<div class="card book-card">
+            <div class="book-title">${escapeHtml(title)}</div>
+            <div class="book-meta">${doc.page_count} ページ</div>
+            <div style="margin-top:auto"><a href="/read/${doc.doc_id}" class="btn" style="width:100%;box-sizing:border-box">📖 読む</a></div>
+        </div>`;
     });
+    html += '</div>';
+    results.innerHTML = html;
 }
 
 async function doSearch() {
     const q = document.getElementById('searchInput').value.trim();
-    if (!q) {
-        init();
-        return;
-    }
+    if (!q) { init(); return; }
     
     const res = await fetch('/api/search?q=' + encodeURIComponent(q));
     const hits = await res.json();
-    
     const results = document.getElementById('results');
-    results.innerHTML = `<h2>Search Results for "${escapeHtml(q)}"</h2>`;
     
+    let html = `<h2>"${escapeHtml(q)}" の検索結果</h2>`;
     if (hits.length === 0) {
-        results.innerHTML += '<p>No results found.</p>';
-        return;
+        html += '<p style="color:var(--text-light)">見つかりませんでした。</p>';
+    } else {
+        hits.forEach(hit => {
+            const safeSnippet = escapeHtml(hit.snippet).replace(/\\[\\.\\.\\.\\]/g, '<mark>[...]</mark>');
+            html += `<div class="card hit-card">
+                <div style="margin-bottom:8px"><a href="/read/${hit.doc_id}" style="color:var(--accent);text-decoration:none;font-weight:bold">${escapeHtml(hit.doc_id)} - ページ ${hit.page_index}</a></div>
+                <div class="snippet">${safeSnippet}</div>
+            </div>`;
+        });
     }
-    
-    hits.forEach(hit => {
-        const div = document.createElement('div');
-        div.className = 'hit-card';
-        div.innerHTML = `
-            <div><a href="/read/${hit.doc_id}">Document: ${escapeHtml(hit.doc_id)} - Page ${hit.page_index}</a></div>
-            <div class="snippet">${escapeHtml(hit.snippet)}</div>
-        `;
-        results.appendChild(div);
-    });
+    results.innerHTML = html;
 }
 
 function escapeHtml(str) {
     if (!str) return '';
     return String(str).replace(/[&<>"']/g, function(m) {
-        return {
-            '&': '&amp;',
-            '<': '&lt;',
-            '>': '&gt;',
-            '"': '&quot;',
-            "'": '&#39;'
-        }[m];
+        return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[m];
+    });
+}
+init();
+</script>
+"""
+        return _shell("書庫", body, active_path="/library")
+
+    @app.get("/ingest", response_class=HTMLResponse)
+    def ingest_view():
+        body = """
+<style>
+.ingest-form { display: flex; gap: 8px; margin-bottom: 24px; }
+.ingest-form input { flex: 1; }
+.job-card { display: flex; align-items: center; gap: 16px; margin-bottom: 12px; padding: 16px; }
+.job-status { font-weight: bold; display: flex; align-items: center; gap: 8px; width: 120px; }
+.status-running { color: #d97706; }
+.status-done { color: #16a34a; }
+.status-error { color: #dc2626; }
+.spinner { animation: spin 1s linear infinite; display: inline-block; }
+@keyframes spin { 100% { transform: rotate(360deg); } }
+.job-info { flex: 1; }
+.job-error { color: #dc2626; font-size: 14px; margin-top: 4px; }
+</style>
+<div class="card">
+  <h2>新規取込</h2>
+  <div class="ingest-form">
+    <input type="text" id="pathInput" placeholder="サーバ上のファイルパス (例: /path/to/book.pdf)" onkeydown="if(event.key==='Enter') submitIngest()">
+    <button class="btn" id="submitBtn" onclick="submitIngest()">取込開始</button>
+  </div>
+  <div id="errorMsg" style="color:#dc2626;margin-bottom:16px;display:none"></div>
+</div>
+<h3 style="margin-top:32px">ジョブ一覧</h3>
+<div id="jobsList">読み込み中...</div>
+<script>
+async function submitIngest() {
+    const path = document.getElementById('pathInput').value.trim();
+    if (!path) return;
+    const btn = document.getElementById('submitBtn');
+    const errMsg = document.getElementById('errorMsg');
+    btn.disabled = true;
+    errMsg.style.display = 'none';
+    
+    try {
+        const res = await fetch('/api/ingest', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({path: path})
+        });
+        if (!res.ok) {
+            const data = await res.json();
+            errMsg.textContent = data.detail || 'エラーが発生しました';
+            errMsg.style.display = 'block';
+        } else {
+            document.getElementById('pathInput').value = '';
+            pollJobs();
+        }
+    } catch(e) {
+        errMsg.textContent = e.toString();
+        errMsg.style.display = 'block';
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+async function pollJobs() {
+    try {
+        const res = await fetch('/api/jobs');
+        const jobs = await res.json();
+        const container = document.getElementById('jobsList');
+        if (jobs.length === 0) {
+            container.innerHTML = '<p style="color:var(--text-light)">ジョブはありません</p>';
+            return;
+        }
+        
+        let html = '';
+        jobs.forEach(job => {
+            let statusHtml = '';
+            let actionHtml = '';
+            if (job.status === 'running') {
+                statusHtml = '<span class="status-running"><span class="spinner">⏳</span> 処理中</span>';
+            } else if (job.status === 'done') {
+                statusHtml = '<span class="status-done">✅ 完了</span>';
+                actionHtml = `<a href="/read/${job.doc_id}" class="btn btn-outline" style="padding:4px 8px">📖 読む</a>`;
+            } else if (job.status === 'error') {
+                statusHtml = '<span class="status-error">❌ エラー</span>';
+            }
+            
+            html += `<div class="card job-card">
+                <div class="job-status">${statusHtml}</div>
+                <div class="job-info">
+                    <div style="font-weight:bold">${escapeHtml(job.doc_id)}</div>
+                    ${job.error ? `<div class="job-error">${escapeHtml(job.error)}</div>` : ''}
+                </div>
+                <div>${actionHtml}</div>
+            </div>`;
+        });
+        container.innerHTML = html;
+    } catch(e) {
+        console.error(e);
+    }
+}
+
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str).replace(/[&<>"']/g, function(m) {
+        return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[m];
     });
 }
 
-init();
+pollJobs();
+setInterval(pollJobs, 3000);
 </script>
-</body>
-</html>"""
+"""
+        return _shell("取込", body, active_path="/ingest")
 
     @app.get("/img/{doc_id}/{page_index}/analysis.png")
     def analysis_png(doc_id: str, page_index: int):

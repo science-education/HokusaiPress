@@ -1,3 +1,7 @@
+## 2026-07-03: WP-62 UI統合 (Antigravity担当)
+- `app.py` に共通シェル `_shell` を追加し、 `/library`, `/ingest`, `/`, `/read/{doc_id}` のUIを刷新・統合。
+- テスト: `pytest -q` 全て green（API挙動不変）。
+
 ## 2026-07-03: WP-61a 取込 API（Codex担当）
 - `POST /api/ingest` でバックグラウンド取込を開始し、`GET /api/jobs` で進捗を返す。
 - `create_app(db_path, runner=None)` によりテスト用 runner の注入と既定 pipeline の遅延 import に対応。
