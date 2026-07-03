@@ -308,7 +308,11 @@ loadQueue();
 """, active_path="/")
 
     @app.get("/page/{doc_id}/{page_index}", response_class=HTMLResponse)
-    def page_view(doc_id: str, page_index: int):
+    def page_view(doc_id: str, page_index: int, request: Request):
+        user = _session_user(request)
+        owner = store.get_doc_owner(doc_id)
+        if user is not None and owner is not None and owner != user["username"]:
+            raise HTTPException(403)
         row = store.get_page(doc_id, page_index)
         if row is None:
             raise HTTPException(404, "page not found")
@@ -546,7 +550,11 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
 </script>"""
 
     @app.get("/read/{doc_id}", response_class=HTMLResponse)
-    def read_view(doc_id: str):
+    def read_view(doc_id: str, request: Request):
+        user = _session_user(request)
+        owner = store.get_doc_owner(doc_id)
+        if user is not None and owner is not None and owner != user["username"]:
+            raise HTTPException(403)
         body = f"""
 <style>
   .pages-wrapper {{ display: flex; flex-direction: column; align-items: center; }}
@@ -990,9 +998,13 @@ setInterval(pollJobs, 3000);
         return _shell("取込", body, active_path="/ingest")
 
     @app.get("/img/{doc_id}/{page_index}/analysis.png")
-    def analysis_png(doc_id: str, page_index: int):
+    def analysis_png(doc_id: str, page_index: int, request: Request):
         from ..preview import analysis_overlay
 
+        user = _session_user(request)
+        owner = store.get_doc_owner(doc_id)
+        if user is not None and owner is not None and owner != user["username"]:
+            raise HTTPException(403)
         row = store.get_page(doc_id, page_index)
         if row is None:
             raise HTTPException(404, "page not found")
@@ -1001,10 +1013,14 @@ setInterval(pollJobs, 3000);
                         headers={"Cache-Control": "no-store"})
 
     @app.get("/img/{doc_id}/{page_index}/output.png")
-    def output_png(doc_id: str, page_index: int):
+    def output_png(doc_id: str, page_index: int, request: Request):
         from ..model import RenderSettings
         from ..preview import output_preview
 
+        user = _session_user(request)
+        owner = store.get_doc_owner(doc_id)
+        if user is not None and owner is not None and owner != user["username"]:
+            raise HTTPException(403)
         row = store.get_page(doc_id, page_index)
         if row is None:
             raise HTTPException(404, "page not found")
@@ -1013,9 +1029,10 @@ setInterval(pollJobs, 3000);
                         headers={"Cache-Control": "no-store"})
 
     @app.get("/api/queue")
-    def queue():
+    def queue(request: Request):
         from .. import queue_rank
 
+        user = _session_user(request)
         pending = {
             (r.doc_id, r.page_index): r
             for r in store.review_queue()
@@ -1028,13 +1045,15 @@ setInterval(pollJobs, 3000);
                 "rank_score": score,
             }
             for doc_id in store.doc_ids()
+            if (user is None or store.get_doc_owner(doc_id) is None
+                or store.get_doc_owner(doc_id) == user["username"])
             for page_index, score in queue_rank.rank_pending(
                 store, doc_id, similar_threshold=0.5
             )
             if (doc_id, page_index) in pending
         ]
 
-    def _start_ingest_job(path: str) -> dict:
+    def _start_ingest_job(path: str, username: str | None = None) -> dict:
         doc_id = os.path.basename(path)
         job_id = str(uuid.uuid4())
         job = {
@@ -1055,6 +1074,8 @@ setInterval(pollJobs, 3000);
                     job["status"] = "error"
                     job["error"] = str(exc)
             else:
+                if username is not None:
+                    store.set_doc_owner(doc_id, username)
                 with jobs_lock:
                     job["status"] = "done"
 
@@ -1062,18 +1083,24 @@ setInterval(pollJobs, 3000);
         return {"job_id": job_id, "doc_id": doc_id}
 
     @app.post("/api/ingest")
-    def ingest(request: IngestRequest):
-        if not os.path.isfile(request.path):
+    def ingest(body: IngestRequest, request: Request):
+        if not os.path.isfile(body.path):
             raise HTTPException(400, "file not found")
-        return _start_ingest_job(request.path)
+        user = _session_user(request)
+        return _start_ingest_job(
+            body.path, user["username"] if user is not None else None
+        )
 
     @app.post("/api/upload")
-    def upload(file: UploadFile = File(...)):
+    def upload(request: Request, file: UploadFile = File(...)):
         os.makedirs(upload_dir, exist_ok=True)
         path = os.path.join(upload_dir, file.filename)
         with open(path, "wb") as destination:
             destination.write(file.file.read())
-        return _start_ingest_job(path)
+        user = _session_user(request)
+        return _start_ingest_job(
+            path, user["username"] if user is not None else None
+        )
 
     @app.get("/api/jobs")
     def list_jobs():
@@ -1081,9 +1108,16 @@ setInterval(pollJobs, 3000);
             return [dict(job) for job in reversed(jobs.values())]
 
     @app.get("/api/library")
-    def library():
+    def library(request: Request):
+        user = _session_user(request)
+        owned_doc_ids = (
+            set(store.doc_ids_for_user(user["username"])) if user is not None else set()
+        )
         rows = []
         for doc_id in store.doc_ids():
+            if (user is not None and doc_id not in owned_doc_ids
+                    and store.get_doc_owner(doc_id) is not None):
+                continue
             book = store.get_book(doc_id)
             rows.append({
                 "doc_id": doc_id,
@@ -1093,9 +1127,10 @@ setInterval(pollJobs, 3000);
         return rows
 
     @app.get("/api/search")
-    def search(q: str = "", limit: int = 50):
+    def search(request: Request, q: str = "", limit: int = 50):
         if q == "":
             return []
+        user = _session_user(request)
         return [
             {
                 "doc_id": hit.doc_id,
@@ -1103,6 +1138,8 @@ setInterval(pollJobs, 3000);
                 "snippet": hit.snippet,
             }
             for hit in store.search(q, limit)
+            if (user is None or store.get_doc_owner(hit.doc_id) is None
+                or store.get_doc_owner(hit.doc_id) == user["username"])
         ]
 
     @app.get("/api/doc/{doc_id}/pages")
