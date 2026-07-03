@@ -722,6 +722,12 @@ init();
 <style>
 .ingest-form { display: flex; gap: 8px; margin-bottom: 24px; }
 .ingest-form input { flex: 1; }
+.drop-zone { border: 2px dashed var(--border); border-radius: 8px; padding: 32px; text-align: center; cursor: pointer; margin-bottom: 24px; transition: all 0.2s; background: var(--bg); }
+.drop-zone.dragover { border-color: var(--accent); background: #eff6ff; }
+.drop-zone-icon { font-size: 32px; margin-bottom: 8px; }
+.drop-zone-text { color: var(--text-light); font-size: 14px; }
+.upload-progress { margin-top: 12px; text-align: left; font-size: 14px; }
+.upload-item { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid var(--border); }
 .job-card { display: flex; align-items: center; gap: 16px; margin-bottom: 12px; padding: 16px; }
 .job-status { font-weight: bold; display: flex; align-items: center; gap: 8px; width: 120px; }
 .status-running { color: #d97706; }
@@ -734,6 +740,13 @@ init();
 </style>
 <div class="card">
   <h2>新規取込</h2>
+  <div id="dropZone" class="drop-zone" onclick="document.getElementById('fileInput').click()">
+    <div class="drop-zone-icon">📄</div>
+    <div class="drop-zone-text">ここにファイルをドラッグ、またはクリックして選択</div>
+    <input type="file" id="fileInput" style="display:none" multiple accept=".pdf">
+    <div id="uploadProgress" class="upload-progress"></div>
+  </div>
+  <h3 style="font-size:14px;color:var(--text-light);margin-bottom:12px;margin-top:0">またはサーバ上のパスを指定</h3>
   <div class="ingest-form">
     <input type="text" id="pathInput" placeholder="サーバ上のファイルパス (例: /path/to/book.pdf)" onkeydown="if(event.key==='Enter') submitIngest()">
     <button class="btn" id="submitBtn" onclick="submitIngest()">取込開始</button>
@@ -743,6 +756,64 @@ init();
 <h3 style="margin-top:32px">ジョブ一覧</h3>
 <div id="jobsList">読み込み中...</div>
 <script>
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+const uploadProgress = document.getElementById('uploadProgress');
+
+['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+    dropZone.addEventListener(eventName, e => { e.preventDefault(); e.stopPropagation(); }, false);
+});
+['dragenter', 'dragover'].forEach(eventName => {
+    dropZone.addEventListener(eventName, () => dropZone.classList.add('dragover'), false);
+});
+['dragleave', 'drop'].forEach(eventName => {
+    dropZone.addEventListener(eventName, () => dropZone.classList.remove('dragover'), false);
+});
+dropZone.addEventListener('drop', e => handleFiles(e.dataTransfer.files), false);
+fileInput.addEventListener('change', e => handleFiles(e.target.files), false);
+
+async function handleFiles(files) {
+    if (!files || files.length === 0) return;
+    const errMsg = document.getElementById('errorMsg');
+    errMsg.style.display = 'none';
+    uploadProgress.innerHTML = '';
+    
+    for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const item = document.createElement('div');
+        item.className = 'upload-item';
+        item.innerHTML = `<span>${escapeHtml(file.name)}</span><span id="up-status-${i}">⏳ アップロード中...</span>`;
+        uploadProgress.appendChild(item);
+        
+        try {
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            const res = await fetch('/api/upload', {
+                method: 'POST',
+                body: formData
+            });
+            
+            if (!res.ok) {
+                const data = await res.json().catch(() => ({}));
+                document.getElementById(`up-status-${i}`).innerHTML = '❌ エラー';
+                document.getElementById(`up-status-${i}`).style.color = '#dc2626';
+                errMsg.textContent = data.detail || `アップロードエラー: ${file.name}`;
+                errMsg.style.display = 'block';
+            } else {
+                document.getElementById(`up-status-${i}`).innerHTML = '✅ 完了';
+                document.getElementById(`up-status-${i}`).style.color = '#16a34a';
+                pollJobs();
+            }
+        } catch (e) {
+            document.getElementById(`up-status-${i}`).innerHTML = '❌ エラー';
+            document.getElementById(`up-status-${i}`).style.color = '#dc2626';
+            errMsg.textContent = e.toString();
+            errMsg.style.display = 'block';
+        }
+    }
+}
+
 async function submitIngest() {
     const path = document.getElementById('pathInput').value.trim();
     if (!path) return;
