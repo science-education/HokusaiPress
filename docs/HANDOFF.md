@@ -1,3 +1,6 @@
+## 2026-07-03: WP-32 レビューキューの能動学習順位
+- `GET /api/queue` を文書ごとの `rank_pending` 順にし、`rank_score` を追加。
+- テスト: `tests/test_webui_queue_ranked.py`（2 passed）、全体 pytest（266 passed）ともに green。
 ## 2026-07-02: WP-41 OPF 書誌出力（Calibre 連携）
 - `src/hokusai_press/export_opf.py` に Dublin Core の OPF 2.0 書誌出力を追加。
 - テスト: `tests/test_opf.py`、全体 pytest ともに green。

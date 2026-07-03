@@ -692,9 +692,24 @@ init();
 
     @app.get("/api/queue")
     def queue():
-        return [
-            {"doc_id": r.doc_id, "page_index": r.page_index, "flags": r.flags}
+        from .. import queue_rank
+
+        pending = {
+            (r.doc_id, r.page_index): r
             for r in store.review_queue()
+        }
+        return [
+            {
+                "doc_id": doc_id,
+                "page_index": page_index,
+                "flags": pending[(doc_id, page_index)].flags,
+                "rank_score": score,
+            }
+            for doc_id in store.doc_ids()
+            for page_index, score in queue_rank.rank_pending(
+                store, doc_id, similar_threshold=0.5
+            )
+            if (doc_id, page_index) in pending
         ]
 
     @app.get("/api/library")
