@@ -484,12 +484,31 @@ loadUsers();
     @app.get("/", response_class=HTMLResponse)
     def index():
         return _shell("レビューキュー", """
+<style>
+.flag-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    background: #e2e8f0;
+    color: #334155;
+    border-radius: 12px;
+    font-size: 12px;
+    margin-right: 4px;
+    cursor: help;
+    white-space: nowrap;
+}
+</style>
 <div class="card">
   <h2>レビューキュー</h2>
   <div id="queue-container">読み込み中...</div>
 </div>
 <script>
+let FLAGS = {};
 async function loadQueue() {
+    try {
+        const flagsRes = await fetch('/api/flags');
+        FLAGS = await flagsRes.json();
+    } catch(e) {}
     const res = await fetch('/api/queue');
     const rows = await res.json();
     const container = document.getElementById('queue-container');
@@ -499,10 +518,14 @@ async function loadQueue() {
     }
     let html = '<table><thead><tr><th>ページ</th><th>Doc ID</th><th>Flags</th><th>類似ページ数 (Rank Score)</th></tr></thead><tbody>';
     rows.forEach(r => {
+        let flagsHtml = r.flags.map(f => {
+            let info = FLAGS[f] || {label: f, desc: f, check: ''};
+            return `<span class="flag-badge" title="${info.desc}">${info.label}</span>`;
+        }).join('');
         html += `<tr>
             <td><a href="/page/${r.doc_id}/${r.page_index}" class="btn btn-outline" style="padding:4px 8px">確認する</a></td>
             <td>${r.doc_id} p.${r.page_index}</td>
-            <td>${r.flags.join(', ')}</td>
+            <td>${flagsHtml}</td>
             <td>${r.rank_score.toFixed(2)}</td>
         </tr>`;
     });
@@ -617,7 +640,146 @@ loadQueue();
         # cache-busting token so a reload after an edit refetches the previews
         # instead of showing the browser-cached image at the same URL
         import time
+        import json
         v = int(time.time() * 1000)
+        
+        flags_json = json.dumps(row.flags)
+        current_deskew = row.params.deskew.angle_deg if row.params.deskew else 0.0
+        cbox = row.params.margin.content if row.params.margin and row.params.margin.content else None
+        cbox_json = json.dumps({"x0": cbox.x0, "y0": cbox.y0, "x1": cbox.x1, "y1": cbox.y1} if cbox else None)
+
+        panels_html = """
+<div id="problems-panel" class="card" style="display:none; margin-bottom: 16px; border-left: 4px solid #f59e0b;">
+  <h3 style="margin-top:0; color: #b45309;">このページの問題点</h3>
+  <ul id="problems-list" style="margin-bottom:0; padding-left: 20px;"></ul>
+</div>
+
+<div class="card" style="margin-bottom: 16px;">
+  <h3 style="margin-top:0; margin-bottom: 12px;">調整</h3>
+  <div style="display:flex; gap: 32px; flex-wrap: wrap;">
+    <!-- 回転 -->
+    <div>
+      <strong style="display:block; margin-bottom:4px;">回転:</strong>
+      <button class="btn btn-outline" onclick="doRotate(270)">↺90°</button>
+      <button class="btn btn-outline" onclick="doRotate(90)">↻90°</button>
+      <button class="btn btn-outline" onclick="doRotate(180)">180°</button>
+    </div>
+    <!-- 傾き -->
+    <div>
+      <strong style="display:block; margin-bottom:4px;">傾き: <span id="deskew-val">__DESKEW_FORMATTED__</span>°</strong>
+      <div style="display:flex; align-items:center; gap:8px;">
+        <button class="btn btn-outline" onclick="adjDeskew(-0.1)">-0.1</button>
+        <input type="range" id="deskew-slider" min="-2" max="2" step="0.05" value="__DESKEW__" oninput="document.getElementById('deskew-val').innerText = parseFloat(this.value).toFixed(2)">
+        <button class="btn btn-outline" onclick="adjDeskew(0.1)">+0.1</button>
+        <button class="btn" onclick="doDeskew()">適用</button>
+      </div>
+    </div>
+    <!-- 本文枠 -->
+    <div>
+      <strong style="display:block; margin-bottom:4px;">本文枠(マージン):</strong>
+      <div style="display:flex; align-items:center; gap:4px;" id="margin-controls">
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const PAGE_FLAGS = __FLAGS_JSON__;
+const CBOX = __CBOX_JSON__;
+
+async function loadProblems() {
+    if (PAGE_FLAGS.length === 0) return;
+    try {
+        const res = await fetch('/api/flags');
+        const FLAGS = await res.json();
+        const list = document.getElementById('problems-list');
+        PAGE_FLAGS.forEach(f => {
+            const info = FLAGS[f] || {label: f, desc: f, check: ''};
+            const li = document.createElement('li');
+            li.innerHTML = `<strong>${info.label}</strong> — ${info.desc} / 👉 ${info.check}`;
+            list.appendChild(li);
+        });
+        document.getElementById('problems-panel').style.display = 'block';
+    } catch(e) {}
+}
+loadProblems();
+
+function renderMarginControls() {
+    const mc = document.getElementById('margin-controls');
+    if (!CBOX) {
+        mc.innerHTML = '<span style="color:#888; font-size:13px;">本文枠がありません（ドラッグで追加可能）</span>';
+        return;
+    }
+    mc.innerHTML = `
+        <button class="btn btn-outline" onclick="adjMargin('top', -5)">上-5</button>
+        <button class="btn btn-outline" onclick="adjMargin('top', 5)">上+5</button>
+        <span style="margin:0 4px;color:#ccc">|</span>
+        <button class="btn btn-outline" onclick="adjMargin('bottom', -5)">下-5</button>
+        <button class="btn btn-outline" onclick="adjMargin('bottom', 5)">下+5</button>
+        <span style="margin:0 4px;color:#ccc">|</span>
+        <button class="btn btn-outline" onclick="adjMargin('left', -5)">左-5</button>
+        <button class="btn btn-outline" onclick="adjMargin('left', 5)">左+5</button>
+        <span style="margin:0 4px;color:#ccc">|</span>
+        <button class="btn btn-outline" onclick="adjMargin('right', -5)">右-5</button>
+        <button class="btn btn-outline" onclick="adjMargin('right', 5)">右+5</button>
+    `;
+}
+window.addEventListener('DOMContentLoaded', renderMarginControls);
+
+async function doRotate(delta) {
+    try {
+        const res = await fetch('/api/page/__DOC_ID__/__PAGE_INDEX__/rotate', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({delta: delta, decided_by: 'human'})
+        });
+        if (!res.ok) throw new Error('Rotation failed');
+        location.reload();
+    } catch (e) { alert(e); }
+}
+
+function adjDeskew(diff) {
+    const sl = document.getElementById('deskew-slider');
+    let val = parseFloat(sl.value) + diff;
+    if (val < -2) val = -2;
+    if (val > 2) val = 2;
+    sl.value = val;
+    document.getElementById('deskew-val').innerText = parseFloat(val).toFixed(2);
+}
+
+async function doDeskew() {
+    const val = parseFloat(document.getElementById('deskew-slider').value);
+    try {
+        const res = await fetch('/api/page/__DOC_ID__/__PAGE_INDEX__/deskew', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({angle_deg: val, decided_by: 'human'})
+        });
+        if (!res.ok) throw new Error('Deskew failed');
+        location.reload();
+    } catch (e) { alert(e); }
+}
+
+async function adjMargin(side, diff) {
+    if (!CBOX) return;
+    let {x0, y0, x1, y1} = CBOX;
+    if (side === 'top') y0 += diff;
+    if (side === 'bottom') y1 += diff;
+    if (side === 'left') x0 += diff;
+    if (side === 'right') x1 += diff;
+    try {
+        const res = await fetch('/api/page/__DOC_ID__/__PAGE_INDEX__/content', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({x0, y0, x1, y1, decided_by: 'human'})
+        });
+        if (!res.ok) throw new Error('Margin adjust failed');
+        location.reload();
+    } catch (e) { alert(e); }
+}
+</script>
+""".replace("__FLAGS_JSON__", flags_json).replace("__CBOX_JSON__", cbox_json).replace("__DESKEW__", str(current_deskew)).replace("__DESKEW_FORMATTED__", f"{current_deskew:.2f}").replace("__DOC_ID__", doc_id).replace("__PAGE_INDEX__", str(page_index))
+
         return f"""
 <style>
 .rbox{{position:absolute;background:transparent;cursor:pointer;
@@ -633,6 +795,7 @@ button{{padding:3px 8px}}
   &nbsp;&nbsp;
   <button onclick="backToQueue()">キューに戻る</button>
 </p>
+{panels_html}
 <div style="display:flex;gap:16px;flex-wrap:wrap">
   <div>
     <h3>analysis <span style="font-weight:normal;font-size:80%">

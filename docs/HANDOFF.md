@@ -1,3 +1,7 @@
+## 2026-07-03: WP-64 レビューUIの調整パネルとフラグの平易表示 (Antigravity担当)
+- `app.py` の `index()` でフラグをバッジ表示化し、`page_view()` に「問題点」リストと「調整」パネル（回転・傾き・本文枠のUI）を追加。
+- pytest で全テストパスを確認。
+
 ## 2026-07-03: WP-64a 回転・傾き調整 API とフラグ説明 API（Codex担当）
 - `/api/flags`、ページ回転・傾き補正 API を追加し、座標変換と decision log 保存を実装。
 - `tests/test_webui_adjust.py` と全体 pytest で回帰確認済み。
