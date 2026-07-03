@@ -133,6 +133,16 @@ CREATE TABLE IF NOT EXISTS user (
     role TEXT NOT NULL DEFAULT 'user',
     created_at REAL NOT NULL
 );
+
+-- Per-doc ownership for the home-server multi-user setup: each doc belongs
+-- to exactly one user, and library/queue/search listings are filtered to the
+-- requesting user's docs. Assigned once, at ingest time, and never
+-- reassigned silently (see set_doc_owner).
+CREATE TABLE IF NOT EXISTS doc_owner (
+    doc_id     TEXT PRIMARY KEY,
+    username   TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
 """
 
 
@@ -361,6 +371,39 @@ class Store:
                 "SELECT * FROM user ORDER BY username"
             ).fetchall()
         return [dict(row) for row in rows]
+
+    # --- doc ownership (home-server multi-user; each doc has one owner) ---
+
+    def set_doc_owner(self, doc_id: str, username: str) -> None:
+        """Assign doc_id to username, once. A doc already owned by someone
+        else is left untouched (ownership is never silently reassigned);
+        re-calling with the same owner is a no-op."""
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO doc_owner(doc_id, username, created_at) "
+                "VALUES(?,?,?) ON CONFLICT(doc_id) DO NOTHING",
+                (doc_id, username, time.time()),
+            )
+            self.conn.commit()
+
+    def get_doc_owner(self, doc_id: str) -> Optional[str]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT username FROM doc_owner WHERE doc_id=?", (doc_id,)
+            ).fetchone()
+        return row["username"] if row else None
+
+    def doc_ids_for_user(self, username: str) -> list[str]:
+        """doc_ids() filtered to docs owned by username. A doc with no
+        owner row (e.g. ingested before multi-user was enabled) is not
+        visible to anyone via this filter -- call set_doc_owner at ingest
+        time to keep every doc claimed."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT doc_id FROM doc_owner WHERE username=? ORDER BY doc_id",
+                (username,),
+            ).fetchall()
+        return [r["doc_id"] for r in rows]
 
     # --- parameter profile (docs/PARAM_PROFILE_PLAN.md) ---
 

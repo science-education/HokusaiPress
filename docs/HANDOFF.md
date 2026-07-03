@@ -1,3 +1,12 @@
+## 2026-07-03: WP-72 蔵書所有権スキーマ（Claude直担当・delicate）
+- `store.py` に `doc_owner` テーブル（doc_id→username, 1対1）と
+  `set_doc_owner`/`get_doc_owner`/`doc_ids_for_user` を追加。
+- 所有権は ingest 時に一度だけ割り当て、既に別ユーザーが所有する doc は
+  上書きしない（`ON CONFLICT DO NOTHING`）。完全分離方式（家族間で蔵書を共有しない）。
+- テスト: `tests/test_doc_owner.py`（5 passed）。全体 pytest 287 passed、回帰なし。
+- 次: WP-73（Codex）でセッション認証ミドルウェア＋全ルート保護＋ingest時の
+  `set_doc_owner` 呼び出し＋library/queue/searchの所有権フィルタを配線。
+
 ## 2026-07-03: WP-71 ローカルユーザーアカウント（Codex担当）
 - `store.py` にユーザーテーブルと PBKDF2-SHA256 による作成・取得・検証・一覧機能を追加。
 - テスト: `tests/test_users.py`、全体 pytest ともに green。
