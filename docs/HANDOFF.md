@@ -1,3 +1,6 @@
+## 2026-07-03: WP-61a 取込 API（Codex担当）
+- `POST /api/ingest` でバックグラウンド取込を開始し、`GET /api/jobs` で進捗を返す。
+- `create_app(db_path, runner=None)` によりテスト用 runner の注入と既定 pipeline の遅延 import に対応。
 ## 2026-07-03: WP-51 learn.py の決定タイプ一般化(Claude直担当)
 - `train()`のラベル判定を`page_kind`固有の`bw/gray/color`白名単から、任意の文字列ラベルを
   クラスとして受け付ける field-agnostic な形に一般化。`decisions_for_training(field)`で

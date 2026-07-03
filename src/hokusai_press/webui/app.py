@@ -52,12 +52,29 @@ class ReaderReport(BaseModel):
     decided_by: str
 
 
-def create_app(db_path: str):
+class IngestRequest(BaseModel):
+    path: str
+
+
+def create_app(db_path: str, runner=None):
+    import os
+    import threading
+    import uuid
+
     from fastapi import FastAPI, HTTPException
     from fastapi.responses import HTMLResponse, Response
 
     app = FastAPI(title="HokusaiPress review")
     store = Store(db_path)
+
+    if runner is None:
+        def runner(path, out_pdf, db_path):
+            from ..pipeline import run
+
+            return run(path, out_pdf, db_path)
+
+    jobs = {}
+    jobs_lock = threading.Lock()
 
     # Small cache of extracted originals: a single page view fires analysis.png
     # and output.png back to back, both needing the same original. Re-extracting
@@ -711,6 +728,42 @@ init();
             )
             if (doc_id, page_index) in pending
         ]
+
+    @app.post("/api/ingest")
+    def ingest(request: IngestRequest):
+        if not os.path.isfile(request.path):
+            raise HTTPException(400, "file not found")
+
+        doc_id = os.path.basename(request.path)
+        job_id = str(uuid.uuid4())
+        job = {
+            "job_id": job_id,
+            "doc_id": doc_id,
+            "status": "running",
+            "error": None,
+        }
+        with jobs_lock:
+            jobs[job_id] = job
+
+        def execute():
+            try:
+                os.makedirs("out", exist_ok=True)
+                runner(request.path, os.path.join("out", doc_id), db_path)
+            except Exception as exc:
+                with jobs_lock:
+                    job["status"] = "error"
+                    job["error"] = str(exc)
+            else:
+                with jobs_lock:
+                    job["status"] = "done"
+
+        threading.Thread(target=execute, daemon=True).start()
+        return {"job_id": job_id, "doc_id": doc_id}
+
+    @app.get("/api/jobs")
+    def list_jobs():
+        with jobs_lock:
+            return [dict(job) for job in reversed(jobs.values())]
 
     @app.get("/api/library")
     def library():
