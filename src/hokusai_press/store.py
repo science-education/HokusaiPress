@@ -11,8 +11,11 @@ Two tables:
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import sqlite3
 import threading
 import time
@@ -121,6 +124,14 @@ CREATE TABLE IF NOT EXISTS bucket_profile (
     n          INTEGER,
     updated_at REAL NOT NULL,
     PRIMARY KEY (scanner, fmt, genre, writing, binding, param_name)
+);
+
+CREATE TABLE IF NOT EXISTS user (
+    username TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    salt TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'user',
+    created_at REAL NOT NULL
 );
 """
 
@@ -310,6 +321,46 @@ class Store:
                     "SELECT field, features, new_value FROM decisions"
                 ).fetchall()
         return [dict(r) for r in rows]
+
+    def create_user(
+        self, username: str, password: str, role: str = "user"
+    ) -> None:
+        salt = secrets.token_hex(16)
+        password_hash = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), salt.encode(), 200_000
+        ).hex()
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO user(username,password_hash,salt,role,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (username, password_hash, salt, role, time.time()),
+            )
+            self.conn.commit()
+
+    def get_user(self, username: str) -> Optional[dict]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM user WHERE username=?", (username,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def verify_user(self, username: str, password: str) -> Optional[dict]:
+        user = self.get_user(username)
+        if user is None:
+            return None
+        password_hash = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), user["salt"].encode(), 200_000
+        ).hex()
+        if hmac.compare_digest(password_hash, user["password_hash"]):
+            return user
+        return None
+
+    def list_users(self) -> list[dict]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM user ORDER BY username"
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     # --- parameter profile (docs/PARAM_PROFILE_PLAN.md) ---
 

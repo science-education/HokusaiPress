@@ -1,3 +1,6 @@
+## 2026-07-03: WP-71 ローカルユーザーアカウント（Codex担当）
+- `store.py` にユーザーテーブルと PBKDF2-SHA256 による作成・取得・検証・一覧機能を追加。
+- テスト: `tests/test_users.py`、全体 pytest ともに green。
 ## 2026-07-03: WP-63 /ingest 画面にドラッグ&ドロップ取込を追加 (Antigravity担当)
 - `app.py` の `ingest_view()` にドラッグ&ドロップとクリックファイル選択領域を追加し、`/api/upload` への順次アップロード機能を追加。
 - テスト: `pytest -q` 全て green（API挙動不変）。
