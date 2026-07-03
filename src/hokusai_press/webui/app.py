@@ -107,7 +107,7 @@ def create_app(db_path: str, runner=None, upload_dir=None, require_auth=False):
     @app.middleware("http")
     async def require_session(request: Request, call_next):
         if (not require_auth
-                or request.url.path in {"/api/login", "/api/setup"}
+                or request.url.path in {"/api/login", "/api/setup", "/login"}
                 or _session_user(request) is not None):
             return await call_next(request)
         if request.url.path.startswith("/api/"):
@@ -268,12 +268,205 @@ def create_app(db_path: str, runner=None, upload_dir=None, require_auth=False):
   <div class="navbar">
     <div class="navbar-brand">HokusaiPress</div>
     {nav_html}
+    <div id="userMenu" style="margin-left: auto; display: flex; align-items: center; gap: 12px;"></div>
   </div>
   <div class="container">
     {body}
   </div>
+  <script>
+  async function _loadUser() {{
+      try {{
+          const res = await fetch('/api/me');
+          if (res.ok) {{
+              const data = await res.json();
+              document.getElementById('userMenu').innerHTML = `
+                  <span style="font-size: 14px; color: var(--text-light)">👤 ${{data.username}}</span>
+                  <button class="btn btn-outline" style="padding: 4px 8px; font-size: 13px;" onclick="_doLogout()">ログアウト</button>
+              `;
+          }}
+      }} catch (e) {{}}
+  }}
+  async function _doLogout() {{
+      await fetch('/api/logout', {{method: 'POST'}});
+      window.location.href = '/login';
+  }}
+  _loadUser();
+  </script>
 </body>
 </html>"""
+
+    @app.get("/login", response_class=HTMLResponse)
+    def login_view():
+        return """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Login - HokusaiPress</title>
+<style>
+  :root {
+    --accent: #3b82f6; --accent-hover: #2563eb; --bg: #f8fafc;
+    --surface: #ffffff; --text: #334155; --border: #e2e8f0;
+  }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; }
+  .card { background: var(--surface); border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); padding: 32px; width: 100%; max-width: 360px; border: 1px solid #f1f5f9; }
+  h2 { margin-top: 0; margin-bottom: 24px; text-align: center; }
+  .form-group { margin-bottom: 16px; }
+  .form-group label { display: block; margin-bottom: 8px; font-size: 14px; font-weight: 500; }
+  input[type="text"], input[type="password"] { width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid var(--border); border-radius: 6px; font-size: 14px; outline: none; }
+  input[type="text"]:focus, input[type="password"]:focus { border-color: var(--accent); }
+  .btn { width: 100%; box-sizing: border-box; background: var(--accent); color: white; border: none; padding: 10px; border-radius: 6px; font-size: 14px; font-weight: 500; cursor: pointer; margin-top: 8px; }
+  .btn:hover { background: var(--accent-hover); }
+  .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+  .toggle-link { display: block; text-align: center; margin-top: 16px; font-size: 13px; color: var(--accent); text-decoration: none; cursor: pointer; }
+  .toggle-link:hover { text-decoration: underline; }
+  #errorMsg { color: #dc2626; font-size: 14px; margin-bottom: 16px; display: none; text-align: center; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h2 id="formTitle">ログイン</h2>
+    <div id="errorMsg"></div>
+    <div class="form-group">
+      <label>ユーザー名</label>
+      <input type="text" id="username" onkeydown="if(event.key==='Enter') submitForm()">
+    </div>
+    <div class="form-group">
+      <label>パスワード</label>
+      <input type="password" id="password" onkeydown="if(event.key==='Enter') submitForm()">
+    </div>
+    <button class="btn" id="submitBtn" onclick="submitForm()">ログイン</button>
+    <a class="toggle-link" id="toggleMode" onclick="toggleMode()">初回セットアップの方はこちら</a>
+  </div>
+<script>
+let mode = 'login';
+function toggleMode() {
+    mode = mode === 'login' ? 'setup' : 'login';
+    document.getElementById('formTitle').innerText = mode === 'login' ? 'ログイン' : '初期管理者を作成';
+    document.getElementById('submitBtn').innerText = mode === 'login' ? 'ログイン' : '作成';
+    document.getElementById('toggleMode').innerText = mode === 'login' ? '初回セットアップの方はこちら' : 'ログイン画面に戻る';
+    document.getElementById('errorMsg').style.display = 'none';
+}
+async function submitForm() {
+    const u = document.getElementById('username').value.trim();
+    const p = document.getElementById('password').value;
+    if (!u || !p) return;
+    
+    const btn = document.getElementById('submitBtn');
+    const err = document.getElementById('errorMsg');
+    btn.disabled = true;
+    err.style.display = 'none';
+    
+    try {
+        const res = await fetch(mode === 'login' ? '/api/login' : '/api/setup', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({username: u, password: p})
+        });
+        
+        if (res.ok) {
+            window.location.href = '/library';
+        } else {
+            const status = res.status;
+            if (mode === 'setup' && status === 403) {
+                err.innerText = '既にセットアップ済みです。ログインしてください。';
+                toggleMode();
+            } else {
+                err.innerText = mode === 'login' ? 'ログインに失敗しました' : 'エラーが発生しました';
+            }
+            err.style.display = 'block';
+        }
+    } catch(e) {
+        err.innerText = '通信エラーが発生しました';
+        err.style.display = 'block';
+    } finally {
+        btn.disabled = false;
+    }
+}
+</script>
+</body>
+</html>"""
+
+    @app.get("/admin/users", response_class=HTMLResponse)
+    def admin_users_view():
+        body = """
+<style>
+.form-card { margin-bottom: 24px; padding: 16px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
+.form-group { margin-bottom: 12px; }
+.form-group label { display: block; font-size: 13px; margin-bottom: 4px; font-weight: 500; }
+.form-group input, .form-group select { padding: 8px; width: 200px; border: 1px solid var(--border); border-radius: 4px; box-sizing: border-box; }
+#errorMsg { color: #dc2626; font-size: 14px; margin-bottom: 12px; display: none; }
+</style>
+<div class="card">
+  <h2>ユーザー管理</h2>
+  <div id="adminContent">読み込み中...</div>
+</div>
+<script>
+async function loadUsers() {
+    const res = await fetch('/api/users');
+    const content = document.getElementById('adminContent');
+    if (res.status === 403) {
+        content.innerHTML = '<p>管理者のみアクセスできます</p>';
+        return;
+    }
+    const users = await res.json();
+    let html = `
+    <div class="form-card">
+      <h3 style="margin-top:0;font-size:15px">新規ユーザー追加</h3>
+      <div id="errorMsg"></div>
+      <div style="display:flex; gap:16px; align-items:flex-end; flex-wrap:wrap;">
+        <div class="form-group"><label>ユーザー名</label><input type="text" id="newUsername"></div>
+        <div class="form-group"><label>パスワード</label><input type="password" id="newPassword"></div>
+        <div class="form-group"><label>ロール</label>
+          <select id="newRole"><option value="user">user</option><option value="admin">admin</option></select>
+        </div>
+        <button class="btn" style="margin-bottom:12px; width:auto; padding:8px 16px;" onclick="addUser()">追加</button>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>ユーザー名</th><th>ロール</th><th>作成日時</th></tr></thead>
+      <tbody>
+    `;
+    users.forEach(u => {
+        html += `<tr><td>${escapeHtml(u.username)}</td><td>${escapeHtml(u.role)}</td><td>${escapeHtml(u.created_at)}</td></tr>`;
+    });
+    html += '</tbody></table>';
+    content.innerHTML = html;
+}
+async function addUser() {
+    const u = document.getElementById('newUsername').value.trim();
+    const p = document.getElementById('newPassword').value;
+    const r = document.getElementById('newRole').value;
+    if (!u || !p) return;
+    const err = document.getElementById('errorMsg');
+    err.style.display = 'none';
+    
+    try {
+        const res = await fetch('/api/users', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({username: u, password: p, role: r})
+        });
+        if (res.ok) {
+            loadUsers();
+        } else {
+            err.innerText = 'エラーが発生しました';
+            err.style.display = 'block';
+        }
+    } catch (e) {
+        err.innerText = '通信エラーが発生しました';
+        err.style.display = 'block';
+    }
+}
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str).replace(/[&<>"']/g, function(m) {
+        return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[m];
+    });
+}
+loadUsers();
+</script>
+"""
+        return _shell("ユーザー管理", body, active_path="")
 
     @app.get("/", response_class=HTMLResponse)
     def index():
