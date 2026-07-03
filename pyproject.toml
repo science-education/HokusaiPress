@@ -48,7 +48,7 @@ nombre = ["onnxruntime"]
 # Backward-compatible alias. pyjbig2 is now installed by default.
 jbig2 = []
 # Review web UI.
-web = ["fastapi", "uvicorn", "pydantic"]
+web = ["fastapi", "uvicorn", "pydantic", "python-multipart"]
 dev = ["pytest"]
 
 [project.scripts]
