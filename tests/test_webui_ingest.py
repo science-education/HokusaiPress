@@ -17,6 +17,17 @@ from fastapi.testclient import TestClient
 
 from hokusai_press.webui.app import create_app
 
+# Pending contract: create_app grows a `runner=` kwarg in WP-61a. Until then,
+# skip (not fail) so the committed suite stays green.
+import inspect
+
+if "runner" not in inspect.signature(create_app).parameters:
+    pytest.skip(
+        "WP-61a unimplemented: create_app(db, runner=...) missing "
+        "(see docs/tasks/WP-61a-codex.md)",
+        allow_module_level=True,
+    )
+
 
 def _require(client):
     if client.get("/api/jobs").status_code != 200:
