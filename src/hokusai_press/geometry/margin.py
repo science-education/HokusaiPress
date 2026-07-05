@@ -635,19 +635,31 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     known, so mixed-dpi sources still yield equal pages) plus the output margin.
     The max guarantees no page's body is ever clipped.
 
-    Positioning (user decision 2026-07-03, superseding the nombre-anchored
-    horizontal rule): the BODY hull -- body_text_box, i.e. the text block with
-    the nombre / 柱 stripped -- is centered LEFT-RIGHT on every page. The
-    earlier rule anchored the nombre at a fixed fore-edge offset and let each
-    page's body-width variation land entirely on the gutter side; real-corpus
-    measurement showed that leaves individual pages up to ~16 mm off-center
-    (median page fine, outlier pages very visible). Symmetric side margins on
-    every page beat horizontal nombre alignment; small per-page horizontal
-    nombre jitter is the accepted cost.
+    Positioning: the PRINTING-PLATE model (user decision 2026-07-05). The
+    type area (版面) and the nombre are fixed on the same plate, so the
+    nombre is the one reliable landmark of where the plate sits -- even on a
+    chapter-end page whose ink hull shrinks to a few lines/columns. Naive
+    hull centering (the previous rule) drags exactly those partial pages to
+    the middle; the rule before that anchored the nombre but derived its
+    offset from hull statistics contaminated by the nombre itself and dumped
+    per-page width variation on the gutter side.
+
+    So: robust statistics over FULL pages only (hull within 90% of the
+    document's reference hull size) define the STANDARD body frame and the
+    STANDARD nombre point -- the per-parity horizontal offset e_x between the
+    nombre center and the plate (body-frame) center. A page with a credible
+    nombre is placed so its nombre lands on the standard point:
+    crop center = nombre center - e_x. Full pages thus come out with the
+    body centered (their hull center ~= plate center), and partial pages get
+    the PLATE restored to position, leaving the short text where the
+    typesetter put it. A nombre far from the parity's typical page position
+    (fraction > 0.15 off) is treated as a false detection and the page falls
+    back to hull centering; a page with no nombre keeps its proportional
+    baseline() position (deliberately off-center dividers stay put).
 
     VERTICALLY the nombre baseline anchor is kept (digits share a baseline;
-    flipping pages should not make the folio bob up and down), with the
-    centered-proportional baseline() as the no-nombre fallback.
+    flipping pages should not make the folio bob up and down), shared across
+    parity, with baseline() as the no-nombre fallback.
 
     Every offset is clamped so no real content is clipped and (for
     non-confident pages) every side keeps >= the output margin.
@@ -717,29 +729,72 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     #         running-header space, is a real design choice, kept).
     default_margin_in = output_margin_mm / 25.4
     stat_pages = [p for p in reliable if confident(p) and p.margin.page_w and p.margin.page_h]
+
+    # FULL pages only: a chapter-end page's hull legitimately shrinks (the
+    # plate doesn't), so partial pages must not pollute the standard body
+    # frame. Reference size is a high percentile (full pages cluster there);
+    # "full" = within 90% of it on BOTH axes. Fewer than 3 full pages (a very
+    # fragmented booklet) -> fall back to all stat pages.
+    if stat_pages:
+        ref_w = float(np.percentile([extent(p, bbox(p).width) for p in stat_pages], 75))
+        ref_h = float(np.percentile([extent(p, bbox(p).height) for p in stat_pages], 75))
+        full_pages = [p for p in stat_pages
+                      if extent(p, bbox(p).width) >= 0.9 * ref_w
+                      and extent(p, bbox(p).height) >= 0.9 * ref_h]
+        if len(full_pages) < 3:
+            full_pages = stat_pages
+    else:
+        full_pages = []
+
     body_w_vals, body_h_vals, side_margin_vals = [], [], []
     top_vals, bottom_vals = [], []
+    e_x_vals: dict[int, list[float]] = {0: [], 1: []}
+    nombre_x_fracs: dict[int, list[float]] = {0: [], 1: []}
     nombre_y_fracs: list[float] = []
-    for p in stat_pages:
+    for p in full_pages:
         bb = bbox(p)
         pw, ph = p.margin.page_w, p.margin.page_h
         nb = p.margin.nombre_box
+        parity = p.source.page_index % 2
         body_w_vals.append(extent(p, bb.width))
         body_h_vals.append(extent(p, bb.height))
         side_margin_vals.append(extent(p, bb.x0))           # left body margin
         side_margin_vals.append(extent(p, pw - bb.x1))      # right body margin
         top_vals.append(extent(p, bb.y0))
         bottom_vals.append(extent(p, ph - bb.y1))
+        # standard nombre point: horizontal offset of the nombre center from
+        # the PLATE (body-frame) center; full pages' hull center ~= plate
+        # center, which is why partial pages are excluded above
+        e_x_vals[parity].append(
+            extent(p, (nb.x0 + nb.x1) / 2 - (bb.x0 + bb.x1) / 2))
         nombre_y_fracs.append(((nb.y0 + nb.y1) / 2 - bb.y0) / (bb.height or 1.0))
+    for p in stat_pages:
+        nb = p.margin.nombre_box
+        nombre_x_fracs[p.source.page_index % 2].append(
+            (nb.x0 + nb.x1) / 2 / p.margin.page_w)
 
     body_w = float(np.median(body_w_vals)) if body_w_vals else uni_w
     body_h = float(np.median(body_h_vals)) if body_h_vals else uni_h
     side_margin = float(np.median(side_margin_vals)) if side_margin_vals else default_margin_in
     top_margin = float(np.median(top_vals)) if top_vals else default_margin_in
     bottom_margin = float(np.median(bottom_vals)) if bottom_vals else default_margin_in
+    e_x: dict[int, float] = {
+        par: float(np.median(v)) for par, v in e_x_vals.items() if v}
+    typical_x_frac: dict[int, float] = {
+        par: float(np.median(v)) for par, v in nombre_x_fracs.items() if v}
 
     nombre_near_bottom = (
         float(np.median(nombre_y_fracs)) > 0.5 if nombre_y_fracs else True)
+
+    NOMBRE_FRAC_TOL = 0.15   # nombre further than this (page-width fraction)
+    #                          from the parity's typical spot = false detection
+
+    def nombre_credible(p, parity):
+        tf = typical_x_frac.get(parity)
+        if tf is None or not p.margin.page_w:
+            return True   # nothing to compare against -- trust the detector
+        nb = p.margin.nombre_box
+        return abs((nb.x0 + nb.x1) / 2 / p.margin.page_w - tf) <= NOMBRE_FRAC_TOL
 
     def target_size(p):  # the FIXED uniform output size, in this page's own pixels
         dpi = p.dpi if use_dpi else 1.0
@@ -785,14 +840,22 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
         crop_w, crop_h = crop_size(p)
         c = p.margin.content
         bb = bbox(p)
-        # HORIZONTAL: center the BODY hull (nombre/柱 stripped) in the crop --
-        # symmetric left/right margins on EVERY page (user priority
-        # 2026-07-03). Applied to pages that participate in the body scheme
-        # (nombre present); a divider / cover page keeps its proportional
-        # baseline position (a deliberately off-center part title must stay
-        # off-center, guarded by test_divider_page_without_nombre...).
+        # HORIZONTAL (printing-plate model): land the nombre on the parity's
+        # standard point, restoring the PLATE position -- a full page's body
+        # comes out centered, a chapter-end partial page keeps its short text
+        # where the typesetter put it instead of being dragged to the middle.
+        # An atypically-placed nombre (false detection) or a book without
+        # enough full pages falls back to hull centering; a no-nombre divider
+        # / cover keeps its proportional baseline position (guarded by
+        # test_divider_page_without_nombre...).
+        parity = p.source.page_index % 2
         if confident(p):
-            x0 = (bb.x0 + bb.x1) / 2 - crop_w / 2
+            ex = e_x.get(parity)
+            nb = p.margin.nombre_box
+            if ex is not None and nombre_credible(p, parity):
+                x0 = (nb.x0 + nb.x1) / 2 - ex * unit - crop_w / 2
+            else:
+                x0 = (bb.x0 + bb.x1) / 2 - crop_w / 2
         else:
             x0 = baseline(p)[0]
         # VERTICAL: anchor on the nombre's bottom edge (y1) -- digits share a

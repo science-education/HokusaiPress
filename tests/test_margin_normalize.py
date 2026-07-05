@@ -276,29 +276,23 @@ def test_divider_page_without_nombre_keeps_proportional_position():
     assert abs(orig_fy - new_cy) < 0.05
 
 
-def test_body_hull_centered_left_right_per_page():
-    # User decision 2026-07-03: the BODY hull is centered L-R on EVERY page.
-    # A page whose body is much narrower than the uniform crop must still get
-    # symmetric side margins (the old nombre anchor dumped all the slack on
-    # the gutter side -- up to ~16mm off-center on the real corpus).
+def _with_regions(p, boxes):
     from hokusai_press.model import Region, RegionKind
 
-    def with_regions(p, boxes):
-        p.regions = [Region(kind=RegionKind.TEXT, box=b) for b in boxes]
-        return p
+    p.regions = [Region(kind=RegionKind.TEXT, box=b) for b in boxes]
+    return p
 
+
+def test_full_pages_body_centered_left_right():
+    # Printing-plate model (user decision 2026-07-05): on FULL pages the body
+    # hull ~= the plate, so landing the nombre on the standard point centers
+    # the body left-right.
     pages = [
-        with_regions(
+        _with_regions(
             _numbered_page(i, Box(200, 300, 800, 1300), 1000, 1400,
                            Box(750, 1305, 780, 1325)),
             [Box(200, 300, 800, 1290)])
-        for i in (0, 2, 4)
-    ] + [
-        # narrow-body page (chapter end): body 300px narrower than the others
-        with_regions(
-            _numbered_page(6, Box(200, 300, 500, 1300), 1000, 1400,
-                           Box(450, 1305, 480, 1325)),
-            [Box(200, 300, 500, 1290)]),
+        for i in (0, 2, 4, 6)
     ]
     normalize_margins(pages, output_margin_mm=5.0)
 
@@ -309,6 +303,57 @@ def test_body_hull_centered_left_right_per_page():
         left = bb.x0 - crop.x0
         right = crop.x1 - bb.x1
         assert abs(left - right) < 2.0, (p.source.page_index, left, right)
+
+
+def test_chapter_end_partial_page_restores_plate_not_hull_center():
+    # A tategaki chapter-end page: only the fore-edge half of the plate has
+    # ink, the nombre stays at its plate spot. The crop must align with the
+    # full pages' crop (plate restored) -- NOT center the shrunken hull.
+    full = [
+        _with_regions(
+            _numbered_page(i, Box(200, 300, 800, 1300), 1000, 1400,
+                           Box(750, 1305, 780, 1325)),
+            [Box(200, 300, 800, 1290)])
+        for i in (0, 2, 4)
+    ]
+    partial = _with_regions(
+        _numbered_page(6, Box(500, 300, 800, 1300), 1000, 1400,
+                       Box(750, 1305, 780, 1325)),   # same plate spot
+        [Box(500, 300, 800, 1290)])
+    pages = full + [partial]
+    normalize_margins(pages, output_margin_mm=5.0)
+
+    # identical page coords + identical nombre spot -> identical crop x
+    assert abs(partial.margin.crop.x0 - full[0].margin.crop.x0) < 2.0
+    # and the hull is deliberately NOT centered (text stays at the fore edge)
+    bb = Box(500, 300, 800, 1290)
+    left = bb.x0 - partial.margin.crop.x0
+    right = partial.margin.crop.x1 - bb.x1
+    assert left - right > 100
+
+
+def test_atypical_nombre_falls_back_to_hull_centering():
+    # A "nombre" detected far from the parity's typical spot is a false
+    # positive; anchoring on it would fling the page. Fall back to centering.
+    pages = [
+        _with_regions(
+            _numbered_page(i, Box(200, 300, 800, 1300), 1000, 1400,
+                           Box(750, 1305, 780, 1325)),
+            [Box(200, 300, 800, 1290)])
+        for i in (0, 2, 4)
+    ] + [
+        _with_regions(
+            _numbered_page(6, Box(200, 300, 800, 1300), 1000, 1400,
+                           Box(210, 700, 240, 720)),   # mid-page "nombre"
+            [Box(200, 300, 800, 1290)]),
+    ]
+    normalize_margins(pages, output_margin_mm=5.0)
+
+    p = pages[-1]
+    bb = Box(200, 300, 800, 1290)
+    left = bb.x0 - p.margin.crop.x0
+    right = p.margin.crop.x1 - bb.x1
+    assert abs(left - right) < 2.0
 
 
 def test_body_text_box_excludes_nombre_overlap():
