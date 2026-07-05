@@ -535,6 +535,12 @@ MARGINAL_SPAN_GAP_FRAC = 0.02   # text spans this far apart (frac of content
 MARGINAL_SPAN_FRAC = 0.25       # a span narrower than this (frac of content
 #                                 width) sitting apart from a dominant body
 #                                 block is furniture (running head/柱, nombre)
+OUTER_FURNITURE_SPAN_FRAC = 0.04  # an outermost span this tiny (one 柱/footer
+#                                   line) is margin furniture; a chapter title
+#                                   block (several lines) stays body
+OUTER_FURNITURE_GAP_FRAC = 0.04   # ... but only when separated from the rest
+#                                   by at least this gap (section-heading
+#                                   whitespace inside the body is smaller)
 DOMINANT_SPAN_FRAC = 0.50       # ... but only strip furniture when ONE span is
 #                                 at least this wide (a real horizontal body
 #                                 block); tategaki column pages have no such
@@ -547,19 +553,24 @@ def body_text_box(params) -> "Box | None":
     the margin. Used for centering + format sizing so a fore-edge 柱 doesn't
     drag the whole block off-centre (real-corpus issue: img20260430_0002).
 
-    Furniture is removed in two independent ways:
+    Furniture is removed in sequential passes:
     1. any text region overlapping the detected nombre box (or printed folio
        box) is excluded up front -- the page number is never body text, and
        leaving it in silently widened the hull on 111/128 pages of the first
        real-corpus book, so the "centered" box wasn't the body's;
-    2. span analysis: merge regions into x-spans; if ONE span dominates the
-       content width (a horizontal body block, yokogaki), keep the wide spans
-       and drop the narrow separated ones (柱 / nombre). If there is no
-       dominant x-span (tategaki columns), run the SAME logic on the y-axis:
-       body columns share (nearly) the full body height, while a nombre /
-       running head in the top/bottom margin is a short separated y-span.
-       Only when neither axis has a dominant span (e.g. a figure page) fall
-       back to the full content box, so nothing is wrongly stripped."""
+    2. a VERTICAL pass drops short separated spans at the OUTER ends only
+       (a running head above the body, a footer line below). Outer-only is
+       deliberate: an interior short span is a heading between body blocks,
+       not furniture. This pass runs FIRST because a 柱 usually OVERLAPS the
+       body horizontally (top corner, reaching into the fore margin), so the
+       x-pass alone can never remove it -- and a 柱 left in mirrors the body
+       off-center by half its protrusion on every verso/recto pair
+       (real-corpus issue: img20260416, +-3mm parity-mirrored);
+    3. a HORIZONTAL pass then drops narrow separated side spans (a fore-edge
+       柱 in tategaki) exactly as before.
+    Each pass applies only when its axis has a dominant span; if neither
+    axis decides (e.g. a figure page) fall back to the full content box, so
+    nothing is wrongly stripped."""
     content = params.margin.content if params.margin else None
     if content is None:
         return None
@@ -574,10 +585,8 @@ def body_text_box(params) -> "Box | None":
     if not regions or content.width <= 0 or content.height <= 0:
         return content
 
-    def _axis_body(lo_hi_pairs, other_pairs, size):
-        """Merge spans along one axis; drop narrow separated furniture when a
-        dominant span exists. Returns (kept spans, None) or (None, None)."""
-        ivs = sorted(lo_hi_pairs)
+    def _merged_spans(regs, get_span, size):
+        ivs = sorted(get_span(r) for r in regs)
         gap = MARGINAL_SPAN_GAP_FRAC * size
         merged: list[list[float]] = []
         for a, b in ivs:
@@ -586,41 +595,76 @@ def body_text_box(params) -> "Box | None":
             else:
                 merged.append([a, b])
         if max(b - a for a, b in merged) < DOMINANT_SPAN_FRAC * size:
+            return None                     # no dominant block -> undecided
+        return merged
+
+    def _in_range(regs, get_span, lo, hi):
+        out = [r for r in regs
+               if lo - 1 <= sum(get_span(r)) / 2 <= hi + 1]
+        return out or None
+
+    def _strip_outer(regs, get_span, size):
+        """Drop margin furniture at the outer ends: a TINY outermost span
+        (single 柱 / footer line, < OUTER_FURNITURE_SPAN_FRAC of the axis)
+        separated from the rest by a wide gap (>= OUTER_FURNITURE_GAP_FRAC).
+        No dominance requirement -- body text fragmented into section blocks
+        (real corpus: img20260416, section-heading whitespace splits the body
+        into <50% spans) must not disable this pass. The tiny-span cap keeps
+        a chapter-opening title block (several lines tall) as body."""
+        ivs = sorted(get_span(r) for r in regs)
+        gap = MARGINAL_SPAN_GAP_FRAC * size
+        merged: list[list[float]] = []
+        for a, b in ivs:
+            if merged and a <= merged[-1][1] + gap:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        i, j = 0, len(merged) - 1
+        while (i < j and merged[i][1] - merged[i][0]
+               < OUTER_FURNITURE_SPAN_FRAC * size
+               and merged[i + 1][0] - merged[i][1]
+               >= OUTER_FURNITURE_GAP_FRAC * size):
+            i += 1
+        while (j > i and merged[j][1] - merged[j][0]
+               < OUTER_FURNITURE_SPAN_FRAC * size
+               and merged[j][0] - merged[j - 1][1]
+               >= OUTER_FURNITURE_GAP_FRAC * size):
+            j -= 1
+        if i == 0 and j == len(merged) - 1:
+            return None                     # nothing stripped -> undecided
+        return _in_range(regs, get_span, merged[i][0], merged[j][1])
+
+    def _strip_narrow(regs, get_span, size):
+        """Drop ALL short separated spans (original x-pass semantics)."""
+        merged = _merged_spans(regs, get_span, size)
+        if merged is None:
             return None
         keep = [(a, b) for a, b in merged
                 if (b - a) >= MARGINAL_SPAN_FRAC * size]
-        return keep or None
-
-    def _hull(kept, centers_of, spans_of):
-        lo = min(a for a, _ in kept)
-        hi = max(b for _, b in kept)
-        other = [spans_of(r) for r in regions
-                 if any(a - 1 <= centers_of(r) <= b + 1 for a, b in kept)]
-        if not other:
+        if not keep:
             return None
-        o0 = min(a for a, _ in other)
-        o1 = max(b for _, b in other)
-        return lo, hi, o0, o1
+        out = [r for r in regs
+               if any(a - 1 <= sum(get_span(r)) / 2 <= b + 1 for a, b in keep)]
+        return out or None
 
-    keep_x = _axis_body([(r.box.x0, r.box.x1) for r in regions], None,
-                        content.width)
-    if keep_x is not None:
-        h = _hull(keep_x, lambda r: (r.box.x0 + r.box.x1) / 2,
-                  lambda r: (r.box.y0, r.box.y1))
-        if h:
-            x0, x1, y0, y1 = h
-            return Box(x0, y0, x1, y1)
-    keep_y = _axis_body([(r.box.y0, r.box.y1) for r in regions], None,
-                        content.height)
-    if keep_y is not None:
-        h = _hull(keep_y, lambda r: (r.box.y0 + r.box.y1) / 2,
-                  lambda r: (r.box.x0, r.box.x1))
-        if h:
-            y0, y1, x0, x1 = h
-            return Box(x0, y0, x1, y1)
-    # neither axis decides (figure page etc.): keep the full content box --
-    # figures are body content too, and the text-region hull would ignore them
-    return content
+    y_span = lambda r: (r.box.y0, r.box.y1)   # noqa: E731
+    x_span = lambda r: (r.box.x0, r.box.x1)   # noqa: E731
+
+    kept = regions
+    decided = False
+    f = _strip_outer(kept, y_span, content.height)
+    if f is not None:
+        kept, decided = f, True
+    f = _strip_narrow(kept, x_span, content.width)
+    if f is not None:
+        kept, decided = f, True
+    if not decided:
+        # neither axis decides (figure page etc.): keep the full content box
+        # -- figures are body content too, and the text-region hull would
+        # ignore them
+        return content
+    return Box(min(r.box.x0 for r in kept), min(r.box.y0 for r in kept),
+               max(r.box.x1 for r in kept), max(r.box.y1 for r in kept))
 
 
 def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
@@ -748,6 +792,7 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
 
     body_w_vals, body_h_vals, side_margin_vals = [], [], []
     top_vals, bottom_vals = [], []
+    nb_bottom_vals, nb_top_vals = [], []
     e_x_vals: dict[int, list[float]] = {0: [], 1: []}
     nombre_x_fracs: dict[int, list[float]] = {0: [], 1: []}
     nombre_y_fracs: list[float] = []
@@ -762,6 +807,14 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
         side_margin_vals.append(extent(p, pw - bb.x1))      # right body margin
         top_vals.append(extent(p, bb.y0))
         bottom_vals.append(extent(p, ph - bb.y1))
+        # nombre-referenced vertical spaces: the vertical anchor must measure
+        # and apply from the SAME reference (the nombre baseline). Measuring
+        # the bottom margin from the hull but applying it from the nombre
+        # bottom (previous code) silently added their difference below the
+        # page and stole it from the top -- the 柱 ended up ~1mm from the
+        # paper edge instead of at its original distance.
+        nb_bottom_vals.append(extent(p, ph - nb.y1))
+        nb_top_vals.append(extent(p, nb.y1))
         # standard nombre point: horizontal offset of the nombre center from
         # the PLATE (body-frame) center; full pages' hull center ~= plate
         # center, which is why partial pages are excluded above
@@ -778,6 +831,8 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     side_margin = float(np.median(side_margin_vals)) if side_margin_vals else default_margin_in
     top_margin = float(np.median(top_vals)) if top_vals else default_margin_in
     bottom_margin = float(np.median(bottom_vals)) if bottom_vals else default_margin_in
+    nb_bottom_space = float(np.median(nb_bottom_vals)) if nb_bottom_vals else bottom_margin
+    nb_top_space = float(np.median(nb_top_vals)) if nb_top_vals else top_margin
     e_x: dict[int, float] = {
         par: float(np.median(v)) for par, v in e_x_vals.items() if v}
     typical_x_frac: dict[int, float] = {
@@ -863,9 +918,9 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
         if confident(p):
             nb = p.margin.nombre_box
             if nombre_near_bottom:
-                y0 = nb.y1 + bottom_margin * unit - crop_h
+                y0 = nb.y1 + nb_bottom_space * unit - crop_h
             else:
-                y0 = nb.y1 - top_margin * unit
+                y0 = nb.y1 - nb_top_space * unit
         else:
             y0 = baseline(p)[1]
         # Never clip real content: if the nombre anchor would push the FULL

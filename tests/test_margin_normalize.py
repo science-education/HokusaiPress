@@ -385,3 +385,36 @@ def test_body_text_box_tategaki_strips_bottom_furniture_via_y_spans():
                  for b in cols + [furniture]]
     bb = body_text_box(p)
     assert bb.y1 <= 1200
+
+
+def test_running_head_overlapping_body_is_stripped():
+    # Real-corpus bug (img20260416 p7/p8): a 柱 at the top fore corner
+    # OVERLAPS the body horizontally, so the x-pass alone can never strip it;
+    # the hull then extends toward the fore edge and centering it mirrors the
+    # body ~3mm off-center on every verso/recto pair. The y-pass (outer short
+    # spans) must remove it even though it x-overlaps the body.
+    from hokusai_press.geometry.margin import body_text_box
+
+    body_lines = [Box(200, 300 + i * 50, 800, 340 + i * 50) for i in range(20)]
+    kashira = Box(600, 100, 950, 140)      # top fore corner, x-overlaps body
+    p = _page(0, Box(200, 100, 950, 1340))
+    _with_regions(p, body_lines + [kashira])
+
+    bb = body_text_box(p)
+    assert bb.x1 <= 800          # 柱's fore-edge protrusion excluded
+    assert bb.y0 >= 300          # and its top band too
+
+
+def test_interior_heading_is_kept():
+    # Outer-only stripping: a short heading BETWEEN body blocks is body text,
+    # not furniture -- it must stay in the hull.
+    from hokusai_press.geometry.margin import body_text_box
+
+    upper = [Box(200, 300 + i * 50, 800, 340 + i * 50) for i in range(8)]
+    heading = Box(200, 760, 500, 800)      # short, separated, interior
+    lower = [Box(200, 860 + i * 50, 800, 900 + i * 50) for i in range(8)]
+    p = _page(0, Box(200, 300, 800, 1300))
+    _with_regions(p, upper + [heading] + lower)
+
+    bb = body_text_box(p)
+    assert bb.y0 <= 300 and bb.y1 >= 1250   # last lower line ends at 1250
