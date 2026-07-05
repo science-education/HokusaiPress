@@ -91,6 +91,17 @@
 - テスト: `tests/test_webui_reading.py`、全体pytestともにgreen。
 # HokusaiPress 引き継ぎ (Handoff)
 
+## 2026-07-03: マージン正規化を「本文枠の左右中央」に変更(ユーザー決定)
+- 水平配置をノンブル錨点から **body_text_box(ノンブル・柱除外後の本文hull)の
+  ページ左右中央化** に変更。旧設計は本文幅の個体差を全てノド側に寄せ、実書籍で
+  最大283px(≒16mm)の偏りが出ていた → 変更後は本文ページ max 20.5px(≒1.2mm)。
+- body_text_box を強化: (1) nombre_box/printed_folio と重なるTEXT領域を除外
+  (111/128頁で除去漏れがあった) (2) 支配的x-spanが無い縦書きにはy-span版の
+  同ロジックを適用。図版ページ(両軸とも判定不能)は従来どおりcontentへフォールバック。
+- 垂直はノンブル基線錨のまま。無ノンブル頁(扉・表紙)は比例位置維持のまま。
+- geometry/margin.py のみ変更。tests/test_margin_normalize.py に新仕様の3テスト追加
+  (計314 passed)。既存 doc は recompute_margins 済み。
+
 ## 2026-07-02: WP-01 FTS5 全文検索
 - 保存済みページの OCR テキスト検索、自動同期、全件再索引を実装。
 - `src/hokusai_press/store.py` に `SearchHit`、`Store.search()`、`Store.reindex_all()` を追加。

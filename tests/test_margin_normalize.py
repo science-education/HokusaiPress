@@ -274,3 +274,69 @@ def test_divider_page_without_nombre_keeps_proportional_position():
     new_cy = (c.y0 + c.height / 2 - crop.y0) / crop.height
     assert abs(orig_fx - new_cx) < 0.05
     assert abs(orig_fy - new_cy) < 0.05
+
+
+def test_body_hull_centered_left_right_per_page():
+    # User decision 2026-07-03: the BODY hull is centered L-R on EVERY page.
+    # A page whose body is much narrower than the uniform crop must still get
+    # symmetric side margins (the old nombre anchor dumped all the slack on
+    # the gutter side -- up to ~16mm off-center on the real corpus).
+    from hokusai_press.model import Region, RegionKind
+
+    def with_regions(p, boxes):
+        p.regions = [Region(kind=RegionKind.TEXT, box=b) for b in boxes]
+        return p
+
+    pages = [
+        with_regions(
+            _numbered_page(i, Box(200, 300, 800, 1300), 1000, 1400,
+                           Box(750, 1305, 780, 1325)),
+            [Box(200, 300, 800, 1290)])
+        for i in (0, 2, 4)
+    ] + [
+        # narrow-body page (chapter end): body 300px narrower than the others
+        with_regions(
+            _numbered_page(6, Box(200, 300, 500, 1300), 1000, 1400,
+                           Box(450, 1305, 480, 1325)),
+            [Box(200, 300, 500, 1290)]),
+    ]
+    normalize_margins(pages, output_margin_mm=5.0)
+
+    for p in pages:
+        from hokusai_press.geometry.margin import body_text_box
+        bb = body_text_box(p)
+        crop = p.margin.crop
+        left = bb.x0 - crop.x0
+        right = crop.x1 - bb.x1
+        assert abs(left - right) < 2.0, (p.source.page_index, left, right)
+
+
+def test_body_text_box_excludes_nombre_overlap():
+    # The nombre is never body text: a TEXT region overlapping the detected
+    # nombre box must not widen the body hull (it did on 111/128 real pages).
+    from hokusai_press.geometry.margin import body_text_box
+    from hokusai_press.model import Region, RegionKind
+
+    p = _page(0, Box(200, 300, 820, 1330), nombre=Box(770, 1300, 820, 1330))
+    p.regions = [
+        Region(kind=RegionKind.TEXT, box=Box(200, 300, 700, 1290)),  # body
+        Region(kind=RegionKind.TEXT, box=Box(768, 1298, 822, 1332)),  # nombre
+    ]
+    bb = body_text_box(p)
+    assert bb.x1 <= 700
+
+
+def test_body_text_box_tategaki_strips_bottom_furniture_via_y_spans():
+    # Tategaki columns: no dominant x-span, but the columns share the full
+    # body height -> the y-span pass must strip a short bottom furniture
+    # block (running head) that x-span analysis alone could not.
+    from hokusai_press.geometry.margin import body_text_box
+    from hokusai_press.model import Region, RegionKind
+
+    cols = [Box(200 + i * 90, 300, 260 + i * 90, 1200) for i in range(5)]
+    furniture = Box(240, 1290, 420, 1330)     # short, separated, bottom
+    p = _page(0, Box(200, 300, 710, 1330))
+    p.regions = [Region(kind=RegionKind.TEXT, box=b)
+                 for b in cols + [furniture]]
+    bb = body_text_box(p)
+    assert bb.y1 <= 1200

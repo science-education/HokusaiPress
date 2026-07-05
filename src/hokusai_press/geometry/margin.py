@@ -547,39 +547,80 @@ def body_text_box(params) -> "Box | None":
     the margin. Used for centering + format sizing so a fore-edge 柱 doesn't
     drag the whole block off-centre (real-corpus issue: img20260430_0002).
 
-    Found from the horizontal spans of the text regions: merge regions into
-    x-spans; if ONE span dominates the content width (a horizontal body block,
-    yokogaki), keep the wide spans and drop the narrow separated ones (柱 /
-    nombre); otherwise (no dominant span -- e.g. tategaki columns, or a
-    figure page) fall back to the full content box, so nothing is wrongly
-    stripped. The body's y-extent comes from the kept regions too."""
+    Furniture is removed in two independent ways:
+    1. any text region overlapping the detected nombre box (or printed folio
+       box) is excluded up front -- the page number is never body text, and
+       leaving it in silently widened the hull on 111/128 pages of the first
+       real-corpus book, so the "centered" box wasn't the body's;
+    2. span analysis: merge regions into x-spans; if ONE span dominates the
+       content width (a horizontal body block, yokogaki), keep the wide spans
+       and drop the narrow separated ones (柱 / nombre). If there is no
+       dominant x-span (tategaki columns), run the SAME logic on the y-axis:
+       body columns share (nearly) the full body height, while a nombre /
+       running head in the top/bottom margin is a short separated y-span.
+       Only when neither axis has a dominant span (e.g. a figure page) fall
+       back to the full content box, so nothing is wrongly stripped."""
     content = params.margin.content if params.margin else None
     if content is None:
         return None
     regions = [r for r in (params.regions or []) if r.kind == RegionKind.TEXT]
-    if not regions or content.width <= 0:
+    for fb in (params.margin.nombre_box if params.margin else None,
+               params.printed_folio.box if params.printed_folio else None):
+        if fb is None:
+            continue
+        regions = [r for r in regions
+                   if not (r.box.x0 < fb.x1 and r.box.x1 > fb.x0
+                           and r.box.y0 < fb.y1 and r.box.y1 > fb.y0)]
+    if not regions or content.width <= 0 or content.height <= 0:
         return content
-    ivs = sorted((r.box.x0, r.box.x1) for r in regions)
-    gap = MARGINAL_SPAN_GAP_FRAC * content.width
-    merged: list[list[float]] = []
-    for a, b in ivs:
-        if merged and a <= merged[-1][1] + gap:
-            merged[-1][1] = max(merged[-1][1], b)
-        else:
-            merged.append([a, b])
-    if max(b - a for a, b in merged) < DOMINANT_SPAN_FRAC * content.width:
-        return content                       # no dominant block -> keep all
-    keep = [(a, b) for a, b in merged
-            if (b - a) >= MARGINAL_SPAN_FRAC * content.width]
-    if not keep:
-        return content
-    x0 = min(a for a, _ in keep)
-    x1 = max(b for _, b in keep)
-    ys = [(r.box.y0, r.box.y1) for r in regions
-          if any(a - 1 <= (r.box.x0 + r.box.x1) / 2 <= b + 1 for a, b in keep)]
-    if not ys:
-        return content
-    return Box(x0, min(y for y, _ in ys), x1, max(y for _, y in ys))
+
+    def _axis_body(lo_hi_pairs, other_pairs, size):
+        """Merge spans along one axis; drop narrow separated furniture when a
+        dominant span exists. Returns (kept spans, None) or (None, None)."""
+        ivs = sorted(lo_hi_pairs)
+        gap = MARGINAL_SPAN_GAP_FRAC * size
+        merged: list[list[float]] = []
+        for a, b in ivs:
+            if merged and a <= merged[-1][1] + gap:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        if max(b - a for a, b in merged) < DOMINANT_SPAN_FRAC * size:
+            return None
+        keep = [(a, b) for a, b in merged
+                if (b - a) >= MARGINAL_SPAN_FRAC * size]
+        return keep or None
+
+    def _hull(kept, centers_of, spans_of):
+        lo = min(a for a, _ in kept)
+        hi = max(b for _, b in kept)
+        other = [spans_of(r) for r in regions
+                 if any(a - 1 <= centers_of(r) <= b + 1 for a, b in kept)]
+        if not other:
+            return None
+        o0 = min(a for a, _ in other)
+        o1 = max(b for _, b in other)
+        return lo, hi, o0, o1
+
+    keep_x = _axis_body([(r.box.x0, r.box.x1) for r in regions], None,
+                        content.width)
+    if keep_x is not None:
+        h = _hull(keep_x, lambda r: (r.box.x0 + r.box.x1) / 2,
+                  lambda r: (r.box.y0, r.box.y1))
+        if h:
+            x0, x1, y0, y1 = h
+            return Box(x0, y0, x1, y1)
+    keep_y = _axis_body([(r.box.y0, r.box.y1) for r in regions], None,
+                        content.height)
+    if keep_y is not None:
+        h = _hull(keep_y, lambda r: (r.box.y0 + r.box.y1) / 2,
+                  lambda r: (r.box.x0, r.box.x1))
+        if h:
+            y0, y1, x0, x1 = h
+            return Box(x0, y0, x1, y1)
+    # neither axis decides (figure page etc.): keep the full content box --
+    # figures are body content too, and the text-region hull would ignore them
+    return content
 
 
 def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
@@ -594,23 +635,22 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     known, so mixed-dpi sources still yield equal pages) plus the output margin.
     The max guarantees no page's body is ever clipped.
 
-    Positioning fuses two strategies under a hard ">= output margin on all four
-    sides" guarantee (the crop never touches the content):
-    - the BASELINE for every page is centered on both axes: this page's own
-      content centered within the document-uniform crop. Averaged over the
-      whole book this already centers the body on the page, since it's each
-      page's actual content extent against the one shared crop size.
-    - when a page's nombre is CONFIDENT (a page number was assigned by the OCR
-      sequence resolver), a small CORRECTION is added on top of that
-      baseline so the nombre lands at a common per-parity offset from the
-      baseline -- removing the residual per-page jitter from a varying
-      content box, without dragging the whole page off-center. (Anchoring
-      directly to "nombre offset from content's near edge" instead of to the
-      centered baseline was tried first and is wrong: the "slack" between
-      this page's content size and the document-wide uniform crop size then
-      lands entirely on the far side, biasing every page toward one corner
-      -- exactly what real-corpus review caught.)
-    Either way the offset is clamped so every side keeps >= the output margin.
+    Positioning (user decision 2026-07-03, superseding the nombre-anchored
+    horizontal rule): the BODY hull -- body_text_box, i.e. the text block with
+    the nombre / 柱 stripped -- is centered LEFT-RIGHT on every page. The
+    earlier rule anchored the nombre at a fixed fore-edge offset and let each
+    page's body-width variation land entirely on the gutter side; real-corpus
+    measurement showed that leaves individual pages up to ~16 mm off-center
+    (median page fine, outlier pages very visible). Symmetric side margins on
+    every page beat horizontal nombre alignment; small per-page horizontal
+    nombre jitter is the accepted cost.
+
+    VERTICALLY the nombre baseline anchor is kept (digits share a baseline;
+    flipping pages should not make the folio bob up and down), with the
+    centered-proportional baseline() as the no-nombre fallback.
+
+    Every offset is clamped so no real content is clipped and (for
+    non-confident pages) every side keeps >= the output margin.
     """
     have = [p for p in pages if p.margin and p.margin.content]
     if not have:
@@ -675,14 +715,10 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     #         deskew makes any L/R imbalance jump out.
     #   a_top / a_bottom -- independent head/foot margins (this asymmetry, e.g.
     #         running-header space, is a real design choice, kept).
-    #   d  -- how far the nombre's OUTER edge sticks out past the body's
-    #         fore-edge; lets us anchor on the crisp nombre while still landing
-    #         the body's fore margin at M.
     default_margin_in = output_margin_mm / 25.4
     stat_pages = [p for p in reliable if confident(p) and p.margin.page_w and p.margin.page_h]
     body_w_vals, body_h_vals, side_margin_vals = [], [], []
-    top_vals, bottom_vals, d_vals = [], [], []
-    by_parity_nombre_x: dict[int, list[float]] = {0: [], 1: []}
+    top_vals, bottom_vals = [], []
     nombre_y_fracs: list[float] = []
     for p in stat_pages:
         bb = bbox(p)
@@ -694,12 +730,6 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
         side_margin_vals.append(extent(p, pw - bb.x1))      # right body margin
         top_vals.append(extent(p, bb.y0))
         bottom_vals.append(extent(p, ph - bb.y1))
-        by_parity_nombre_x[p.source.page_index % 2].append((nb.x0 + nb.x1) / 2 / pw)
-        # nombre outer edge vs body fore edge (sign: outward past the body)
-        if (nb.x0 + nb.x1) / 2 > (bb.x0 + bb.x1) / 2:        # nombre on the right
-            d_vals.append(extent(p, nb.x1 - bb.x1))
-        else:                                               # nombre on the left
-            d_vals.append(extent(p, bb.x0 - nb.x0))
         nombre_y_fracs.append(((nb.y0 + nb.y1) / 2 - bb.y0) / (bb.height or 1.0))
 
     body_w = float(np.median(body_w_vals)) if body_w_vals else uni_w
@@ -707,19 +737,7 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     side_margin = float(np.median(side_margin_vals)) if side_margin_vals else default_margin_in
     top_margin = float(np.median(top_vals)) if top_vals else default_margin_in
     bottom_margin = float(np.median(bottom_vals)) if bottom_vals else default_margin_in
-    d_med = float(np.median(d_vals)) if d_vals else 0.0
-    # the nombre's own (visible) fore margin that keeps the body's fore margin
-    # at the symmetric side_margin: side_margin = nombre_fore_margin + d
-    nombre_fore_margin = side_margin - d_med
 
-    # Which side carries the nombre, per parity, IS the fore-edge (a page
-    # number is conventionally set at the fore-edge corner). A direct, reliable
-    # signal -- unlike comparing raw L/R gap magnitudes, which picks the wrong
-    # side on any page whose content detection is a little noisy on one edge.
-    nombre_side: dict[int, str] = {}
-    for parity, xs in by_parity_nombre_x.items():
-        if xs:
-            nombre_side[parity] = "right" if float(np.median(xs)) > 0.5 else "left"
     nombre_near_bottom = (
         float(np.median(nombre_y_fracs)) > 0.5 if nombre_y_fracs else True)
 
@@ -767,20 +785,14 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
         crop_w, crop_h = crop_size(p)
         c = p.margin.content
         bb = bbox(p)
-        parity = p.source.page_index % 2
-        side = nombre_side.get(parity)
-        # HORIZONTAL: anchor on the nombre's outer edge so it lands at the same
-        # visible fore margin (nombre_fore_margin) on every same-parity page --
-        # the user-chosen priority. Because that margin is derived to put the
-        # body's fore edge at the symmetric side_margin, the body is centred
-        # for the median page; per-page body-width variation lands on the
-        # GUTTER (binding) side, the least visible edge.
-        if confident(p) and side is not None:
-            nb = p.margin.nombre_box
-            if side == "left":
-                x0 = nb.x0 - nombre_fore_margin * unit
-            else:
-                x0 = nb.x1 + nombre_fore_margin * unit - crop_w
+        # HORIZONTAL: center the BODY hull (nombre/柱 stripped) in the crop --
+        # symmetric left/right margins on EVERY page (user priority
+        # 2026-07-03). Applied to pages that participate in the body scheme
+        # (nombre present); a divider / cover page keeps its proportional
+        # baseline position (a deliberately off-center part title must stay
+        # off-center, guarded by test_divider_page_without_nombre...).
+        if confident(p):
+            x0 = (bb.x0 + bb.x1) / 2 - crop_w / 2
         else:
             x0 = baseline(p)[0]
         # VERTICAL: anchor on the nombre's bottom edge (y1) -- digits share a
@@ -806,7 +818,13 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
         # anchor. A baseline (no-nombre) page keeps the real output-margin
         # floor, since there's no anchor to protect instead.
         if p.margin.confidence >= 0.2:
-            xf = 0.0 if (confident(p) and side is not None) else margin_px
+            # horizontal floor for a body-centered page is 0 (only prevent
+            # clipping): its nombre/柱 sat near the fore edge in the original
+            # too, and forcing the 5mm floor on that furniture measurably
+            # drags the body off-center (real corpus: 70px on a page whose
+            # nombre sits far outside the body). Baseline pages keep the
+            # real output-margin floor.
+            xf = 0.0 if confident(p) else margin_px
             yf = 0.0 if confident(p) else margin_px
             x0 = max(min(x0, c.x0 - xf), c.x1 + xf - crop_w)
             y0 = max(min(y0, c.y0 - yf), c.y1 + yf - crop_h)
