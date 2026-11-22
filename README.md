@@ -103,6 +103,32 @@ hokusai-press run scan.pdf --out book.pdf --device npu      # バッチ解析+�
 hokusai-press run scan.pdf --out book.pdf --layout-engine none --text-engine ppocr-v6 --runtime onnxruntime --device npu
 ```
 
+## 書籍スキャンの一括処理（段階別の出力）
+
+元データのフォルダをまとめて処理し、文字層つきのPDFと、同じ画像で文字層を外したPDFを一度に出します。
+モデルの読み込みはコマンド全体で1回だけなので、複数の本は1つのコマンドに渡してください。
+
+```bash
+hokusai-press run "元データ/*.pdf" --out "補正済み/OCR済/" --image-only-out "補正済み/00_倉庫/本文二値化/" \
+  --suffix _HP --db hokusai.db --workers 2 --skip-existing
+```
+
+- `--suffix _HP`: 出力名に印を付けます（例 `img20261121_0001_HP.pdf`）。どのツールで作ったかを後から見分けるためです。
+- `--image-only-out`: 文字層を取り除いた版の出力先です。画像は文字層つきの版とバイト単位で同じです。
+- `--skip-existing`: 出力済みの本を飛ばします。途中で止まったバッチを再開するときに使います。
+
+## 文字層だけを付け替える（`ocr`）
+
+補正済みのPDF（ScanTailor の出力や、以前のOCR済みPDF）の画像には手を付けず、文字層だけを新しいOCRで作り直します。
+古い文字層は取り除きます（`--keep-existing-text` で残す）。各頁を300dpiで描画してOCRします。
+
+```bash
+hokusai-press ocr "本文二値化/*.pdf" --out "OCR済/" --suffix "（OCR済）" --text
+```
+
+文字層のフォントは、同梱の Noto Sans JP に無い字だけをシステムのフォント（メイリオ・游ゴシックなど）で補います。
+互換漢字（U+F900台など）は通常の字に畳むので、ふつうの字で検索できます。
+
 ## レビューと再生成
 
 ```bash

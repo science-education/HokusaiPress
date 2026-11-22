@@ -19,14 +19,14 @@ def _is_folder_out(out: str) -> bool:
             or os.path.splitext(out)[1] == "")
 
 
-def _resolve_out(out: str, source: str) -> str:
-    """Allow --out to be a folder: save as the source's name with a .pdf
-    extension inside it (folder created on demand). Otherwise --out is used as
-    the output file path verbatim."""
+def _resolve_out(out: str, source: str, suffix: str = "") -> str:
+    """Allow --out to be a folder: save as the source's name (+ suffix) with a
+    .pdf extension inside it (folder created on demand). Otherwise --out is
+    used as the output file path verbatim."""
     if _is_folder_out(out):
         os.makedirs(out, exist_ok=True)
         stem = os.path.splitext(os.path.basename(source))[0]
-        return os.path.join(out, stem + ".pdf")
+        return os.path.join(out, stem + suffix + ".pdf")
     return out
 
 
@@ -88,6 +88,12 @@ def _run_one(payload: dict) -> dict:
         runtime=payload["runtime"], pages=payload["pages"],
     )
     summary["tpb"] = time.perf_counter() - t0
+    if payload.get("image_only"):
+        # the same pages without the OCR text layer (the "binarized" stage)
+        from .textlayer import image_only_copy
+
+        image_only_copy(payload["out"], payload["image_only"])
+        summary["image_only"] = payload["image_only"]
     return summary
 
 
@@ -100,7 +106,9 @@ def _print_summary(summary: dict, profile: bool) -> bool:
     if flagged:
         line += f"  (needs review: {len(summary['needs_review'])} pages)"
     line += f"  TPB={tpb:.1f}s TPP={tpb / pages:.2f}s/page"
-    print(line)
+    print(line, flush=True)
+    if summary.get("image_only"):
+        print(f"  [image-only] {summary['image_only']}", flush=True)
     for w in summary.get("warnings", []):
         print(f"  [warn] {w}")
     if profile:
@@ -202,9 +210,42 @@ def main(argv=None) -> int:
                        help="process this many files in parallel threads sharing "
                             "one OCR engine (overlaps CPU work with NPU inference; "
                             "works with --device npu; ~2 is the sweet spot)")
+    p_run.add_argument("--suffix", default="",
+                       help="append this to the output file name when --out "
+                            "(or --image-only-out) is a folder, e.g. '_HP' to "
+                            "mark files made by HokusaiPress")
+    p_run.add_argument("--image-only-out", default=None,
+                       help="also write each result without its text layer "
+                            "(images only) to this folder or file")
+    p_run.add_argument("--skip-existing", action="store_true",
+                       help="skip sources whose output PDF already exists "
+                            "(resume an interrupted batch)")
     p_run.add_argument("--pages", default=None,
                        help="process only these 0-based pages, e.g. '9,52,236-237'"
                             " (fast for debugging)")
+
+    p_ocr = sub.add_parser(
+        "ocr", help="replace the text layer of finished PDFs (images kept as is)")
+    p_ocr.add_argument("source", nargs="+",
+                       help="PDF file(s), folder(s) (all *.pdf), or glob")
+    p_ocr.add_argument("--out", required=True,
+                       help="output PDF path, or a folder (saves <source><suffix>.pdf)")
+    p_ocr.add_argument("--suffix", default="",
+                       help="append this to output names in a folder, e.g. '（OCR済）'")
+    p_ocr.add_argument("--ocr-engine", default=DEFAULT_OCR_ENGINE,
+                       help=f"OCR engine (default: {DEFAULT_OCR_ENGINE})")
+    p_ocr.add_argument("--device", default="auto")
+    p_ocr.add_argument("--model-dir", default="models")
+    p_ocr.add_argument("--openvino-cache-dir", default=None)
+    p_ocr.add_argument("--runtime", default=None)
+    p_ocr.add_argument("--dpi", type=int, default=300,
+                       help="render resolution for OCR (default 300)")
+    p_ocr.add_argument("--keep-existing-text", action="store_true",
+                       help="do not remove the text layer the PDF already has")
+    p_ocr.add_argument("--text", action="store_true",
+                       help="also write <output>.txt (pages separated by form feed)")
+    p_ocr.add_argument("--skip-existing", action="store_true",
+                       help="skip sources whose output PDF already exists")
 
     p_queue = sub.add_parser("queue", help="list pages awaiting review")
     p_queue.add_argument("--db", default="hokusai.db")
@@ -281,11 +322,27 @@ def main(argv=None) -> int:
             print("error: --out must be a folder when processing multiple inputs")
             return 1
 
+        if (args.image_only_out and len(sources) > 1
+                and not _is_folder_out(args.image_only_out)):
+            print("error: --image-only-out must be a folder when processing multiple inputs")
+            return 1
+        if args.skip_existing:
+            kept = [s for s in sources
+                    if not os.path.exists(_resolve_out(args.out, s, args.suffix))]
+            for s in sources:
+                if s not in kept:
+                    print(f"[skip] {os.path.basename(s)}: output exists")
+            sources = kept
+            if not sources:
+                return 0
+
         pages_sel = _parse_pages(args.pages)
 
         def _payload(src, db):
             return {
-                "src": src, "out": _resolve_out(args.out, src), "db": db,
+                "src": src, "out": _resolve_out(args.out, src, args.suffix), "db": db,
+                "image_only": (_resolve_out(args.image_only_out, src, args.suffix)
+                               if args.image_only_out else None),
                 "model_dir": args.model_dir, "device": args.device,
                 "ocr_engine": args.ocr_engine,
                 "layout_engine": args.layout_engine,
@@ -336,6 +393,38 @@ def main(argv=None) -> int:
         if flagged_docs:
             print("  run: hokusai-press review")
         return 0
+
+    if args.command == "ocr":
+        from .ocr import get_ocr_engine
+        from .reocr import ocr_pdf
+
+        sources = _expand_sources(args.source)
+        if not sources:
+            print("no input files matched")
+            return 1
+        if len(sources) > 1 and not _is_folder_out(args.out):
+            print("error: --out must be a folder when processing multiple inputs")
+            return 1
+        engine = get_ocr_engine(args.ocr_engine, args.model_dir, args.device,
+                                args.openvino_cache_dir, args.runtime)
+        failed = 0
+        for src in sources:
+            dst = _resolve_out(args.out, src, args.suffix)
+            if args.skip_existing and os.path.exists(dst):
+                print(f"[skip] {os.path.basename(src)}: output exists")
+                continue
+            try:
+                r = ocr_pdf(src, dst, engine, dpi=args.dpi,
+                            keep_existing_text=args.keep_existing_text,
+                            text_out=(os.path.splitext(dst)[0] + ".txt") if args.text else None)
+            except Exception as e:  # keep going with the other books
+                failed += 1
+                print(f"[FAIL] {os.path.basename(src)}: {e}")
+                continue
+            print(f"[OK] {os.path.basename(src)}: {r['pages']} pages, {r['lines']} lines, "
+                  f"{r['chars']} chars -> {dst}  ({r['seconds'] / max(r['pages'], 1):.2f}s/page)",
+                  flush=True)
+        return 1 if failed else 0
 
     if args.command == "queue":
         from .store import Store
