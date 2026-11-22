@@ -322,89 +322,12 @@ def discover_font(font_path: str | None = None) -> str:
     )
 
 
-def _calc_font_size(stringWidth, content, bbox_height, bbox_width, font_name):
-    """Best font size so the string fills the box."""
-    best, min_diff = None, np.inf
-    for rate in np.arange(0.5, 1.0, 0.01):
-        font_size = bbox_height * rate
-        diff = abs(stringWidth(content, font_name, font_size) - bbox_width)
-        if diff < min_diff:
-            min_diff, best = diff, font_size
-    return best
-
-
 def build_text_overlay(pages: list, font_path: str | None = None) -> bytes:
-    """Invisible-text-only PDF: one page per (width, height, lines) tuple."""
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.pdfmetrics import stringWidth
-    from reportlab.pdfbase.ttfonts import TTFont
-    from reportlab.pdfgen import canvas
+    """Invisible-text-only PDF: one page per (width, height, lines) tuple.
 
-    # Check if there is any non-empty text across all pages
-    has_any_text = False
-    for w, h, lines in pages:
-        for ln in lines:
-            if ln.get("text", "").strip():
-                has_any_text = True
-                break
-        if has_any_text:
-            break
+    Delegates to hokusai_press.textlayer, which picks a font per character
+    (bundled Noto Sans JP, then system fonts) so no character silently drops
+    out, and folds CJK compatibility ideographs."""
+    from ..textlayer import draw_text_pages
 
-    packet = BytesIO()
-    c = canvas.Canvas(packet)
-
-    if not has_any_text:
-        for w, h, lines in pages:
-            c.setPageSize((w, h))
-            c.showPage()
-        c.save()
-        return packet.getvalue()
-
-    font_file = discover_font(font_path)
-    font_name = "NotoSansJP"
-
-    if font_name not in pdfmetrics.getRegisteredFontNames():
-        pdfmetrics.registerFont(TTFont(font_name, font_file))
-
-    for w, h, lines in pages:
-        c.setPageSize((w, h))
-        for ln in lines:
-            text = ln.get("text", "")
-            if not text:
-                continue
-            box = ln.get("box")
-            if not box or len(box) < 4:
-                continue
-            x1, y1, x2, y2 = box[:4]
-            bw, bh = x2 - x1, y2 - y1
-            vertical = ln.get("direction") == "v"
-            font_size = (
-                _calc_font_size(stringWidth, text, bw, bh, font_name)
-                if vertical
-                else _calc_font_size(stringWidth, text, bh, bw, font_name)
-            )
-            if not font_size:
-                continue
-            if vertical:
-                char_h = bh / len(text)
-                for j, ch in enumerate(text):
-                    char_x = x1 + (bw - font_size) / 2
-                    char_y = (h - y1) - (j * char_h) - char_h / 2
-                    c.saveState()
-                    c.translate(char_x, char_y + font_size / 2)
-                    c.rotate(-90)
-                    t = c.beginText(0, 0)
-                    t.setTextRenderMode(3)  # invisible
-                    t.setFont(font_name, font_size)
-                    t.textOut(ch)
-                    c.drawText(t)
-                    c.restoreState()
-            else:
-                t = c.beginText(x1, h - y2 + (bh - font_size) * 0.5)
-                t.setTextRenderMode(3)
-                t.setFont(font_name, font_size)
-                t.textOut(text)
-                c.drawText(t)
-        c.showPage()
-    c.save()
-    return packet.getvalue()
+    return draw_text_pages(pages, font_path)
