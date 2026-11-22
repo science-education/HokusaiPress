@@ -9,6 +9,8 @@ import sys
 import tempfile
 import time
 
+from .ocr.factory import DEFAULT_OCR_ENGINE
+
 
 def _is_folder_out(out: str) -> bool:
     """--out denotes a folder when it is an existing directory, ends with a path
@@ -148,7 +150,7 @@ def main(argv=None) -> int:
                        help="output PDF path, or a folder (saves <source>.pdf)")
     p_run.add_argument("--db", default="hokusai.db", help="job/decision SQLite db")
     p_run.add_argument("--model-dir", default="models", help="hybrid-ocr model dir")
-    p_run.add_argument("--ocr-engine", default="hybrid",
+    p_run.add_argument("--ocr-engine", default=DEFAULT_OCR_ENGINE,
                        choices=["auto", "hybrid", "yomitoku", "ndlocr",
                                 "ppocr-v6", "paddleocr-v6",
                                 "pp-structurev3", "pp-structure",

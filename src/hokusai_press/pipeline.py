@@ -29,6 +29,7 @@ from .model import (
     PageParams,
     ReviewStatus,
 )
+from .ocr.factory import DEFAULT_OCR_ENGINE
 from .store import Store
 
 MIN_CONTENT_AREA_FRAC = 0.12   # content smaller than this share of the page =
@@ -194,7 +195,7 @@ def analyze_document(
     path: str,
     model_dir: str = "models",
     device: str = "auto",
-    ocr_engine: str = "hybrid",
+    ocr_engine: str = DEFAULT_OCR_ENGINE,
     layout_engine: str | None = None,
     text_engine: str | None = None,
     use_ocr: bool = True,
@@ -396,7 +397,7 @@ def run(
     db_path: str = "hokusai.db",
     model_dir: str = "models",
     device: str = "auto",
-    ocr_engine: str = "hybrid",
+    ocr_engine: str = DEFAULT_OCR_ENGINE,
     layout_engine: str | None = None,
     text_engine: str | None = None,
     use_ocr: bool = True,
