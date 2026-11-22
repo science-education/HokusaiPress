@@ -257,28 +257,6 @@ def test_region_shadow_keeps_glyph_crossing_tight_text_boundary():
     assert (out[40:360, 285:288] == 255).all()
 
 
-def test_ink_text_clusters_finds_text_but_not_specks_or_edge_lines():
-    from hokusai_press.geometry.margin import ink_text_clusters
-
-    img = np.full((2000, 1400, 3), 255, np.uint8)
-    # a faint "publisher line" (gray ~110, as measured on a real cover) near the foot
-    for k in range(6):
-        x = 500 + k * 40
-        cv2.rectangle(img, (x, 1850), (x + 25, 1880), (110, 110, 110), -1)
-    # main text block so Otsu sees real ink
-    for row in range(10):
-        for k in range(20):
-            x = 200 + k * 45
-            cv2.rectangle(img, (x, 300 + row * 60), (x + 30, 330 + row * 60), (40, 40, 40), -1)
-    # a lone speck and a thin vertical ADF-like line (not touching the border)
-    cv2.rectangle(img, (1200, 1500), (1203, 1503), (0, 0, 0), -1)
-    cv2.line(img, (20, 200), (20, 1700), (0, 0, 0), 2)
-    boxes = ink_text_clusters(img)
-    assert any(b.y0 >= 1840 and b.y1 <= 1890 and b.x0 <= 505 for b in boxes)
-    assert not any(b.x1 < 40 for b in boxes)            # the edge line
-    assert not any(b.x0 >= 1190 and b.y0 >= 1490 for b in boxes)  # the speck
-
-
 def test_compute_margin_keeps_text_no_region_covers():
     from hokusai_press.pipeline import compute_margin
 
@@ -291,3 +269,38 @@ def test_compute_margin_keeps_text_no_region_covers():
     _, mg = compute_margin(img, Deskew(0.0, 1.0), regions)
     assert mg.content.y1 >= 950
     assert mg.content.x1 >= 300 + 7 * 60 + 45 - 2
+
+
+def test_content_ink_box_keeps_print_and_drops_scan_garbage():
+    import cv2
+    import numpy as np
+
+    from hokusai_press.geometry.margin import content_ink_box
+    from hokusai_press.model import Box, Deskew, Region, RegionKind
+
+    img = np.full((2200, 1400, 3), 255, np.uint8)
+    cv2.rectangle(img, (300, 300), (1100, 1800), (0, 0, 0), 3)      # body
+    regions = [Region(kind=RegionKind.TEXT, box=Box(300, 300, 1100, 1800))]
+    cv2.rectangle(img, (1150, 2000), (1210, 2060), (0, 0, 0), -1)   # page number on a black tab
+    cv2.rectangle(img, (0, 500), (25, 700), (40, 40, 40), -1)       # scan surround at the edge
+    cv2.circle(img, (700, 2160), 3, (0, 0, 0), -1)                  # dust in the outer band
+    cv2.circle(img, (200, 1000), 4, (0, 0, 0), -1)                  # an isolated dot
+    box = content_ink_box(img, Deskew(), regions)
+    assert box.x1 >= 1210 and box.y1 >= 2060        # tab kept
+    assert box.x0 >= 290                            # surround and dot dropped
+    assert box.y1 < 2150                            # dust dropped
+
+
+def test_edge_shadow_rule_spares_print_away_from_the_edge():
+    import cv2
+    import numpy as np
+
+    from hokusai_press.geometry.margin import remove_edge_shadows
+
+    img = np.full((2200, 1400), 255, np.uint8)
+    cv2.rectangle(img, (5, 100), (25, 2100), 60, -1)       # shadow hugging the left edge
+    cv2.rectangle(img, (150, 220), (1250, 228), 0, -1)     # rule under the running head (10% in)
+    cv2.rectangle(img, (150, 250), (1250, 330), 0, -1)     # a black heading band
+    out = remove_edge_shadows(img)
+    assert out[1000, 15] == 255                             # shadow removed
+    assert out[224, 700] == 0 and out[300, 700] == 0        # print kept
