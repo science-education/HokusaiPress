@@ -304,3 +304,23 @@ def test_edge_shadow_rule_spares_print_away_from_the_edge():
     out = remove_edge_shadows(img)
     assert out[1000, 15] == 255                             # shadow removed
     assert out[224, 700] == 0 and out[300, 700] == 0        # print kept
+
+
+def test_content_ink_box_ignores_ocr_region_off_the_paper_or_over_no_ink():
+    import cv2
+    import numpy as np
+
+    from hokusai_press.geometry.margin import content_ink_box
+    from hokusai_press.model import Box, Deskew, Region, RegionKind
+
+    # img20261121_0011 p30: a blank page where OCR reported a "0" line far
+    # wider than the page; the crop then ran off the paper
+    blank = np.full((2209, 1415, 3), 255, np.uint8)
+    ghost = [Region(kind=RegionKind.TEXT, box=Box(262, 2136, 2021, 2160))]
+    assert content_ink_box(blank, Deskew(), ghost) is None
+
+    img = blank.copy()
+    cv2.rectangle(img, (300, 300), (1100, 1800), (0, 0, 0), 3)
+    regions = [Region(kind=RegionKind.TEXT, box=Box(300, 300, 1500, 1800))] + ghost
+    box = content_ink_box(img, Deskew(), regions)
+    assert box.x1 <= 1415 and box.y1 <= 1805       # clipped, ghost dropped

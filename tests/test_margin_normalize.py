@@ -322,3 +322,23 @@ def test_part_title_page_is_not_registered_on_the_type_area():
     # keeps its proportional place on the paper (centre ~0.48, ~0.48)
     assert abs(((c.x0 + c.x1) / 2 - crop.x0) / crop.width - 675 / 1400) < 0.01
     assert abs(((c.y0 + c.y1) / 2 - crop.y0) / crop.height - 1050 / 2200) < 0.01
+
+
+def _yokogaki_page(idx, lines):
+    p = _numbered_page(idx, Box(min(b.x0 for b in lines), min(b.y0 for b in lines),
+                                max(b.x1 for b in lines), max(b.y1 for b in lines)),
+                       1400, 2200, None, dpi=300)
+    p.regions = [_text(b) for b in lines]
+    return p
+
+
+def test_minority_direction_pages_without_consensus_are_not_registered():
+    # img20261121_0015: a tategaki book whose cover and colophon are the only
+    # yokogaki pages. Two pages are no type area: the cover keeps its place.
+    body = [_tategaki_page(i, 0, 0) for i in range(1, 12) if i != 2]
+    cover = _yokogaki_page(0, [Box(400, 700 + 90 * k, 1000, 760 + 90 * k) for k in range(5)])
+    colophon = _yokogaki_page(2, [Box(150, 1500 + 60 * k, 900, 1540 + 60 * k) for k in range(8)])
+    normalize_margins([cover, colophon] + body, output_margin_mm=5.0)
+    crop, c = cover.margin.crop, cover.margin.content
+    assert abs(((c.x0 + c.x1) / 2 - crop.x0) / crop.width - 700 / 1400) < 0.01
+    assert abs(((c.y0 + c.y1) / 2 - crop.y0) / crop.height - c.y0 / 2200 - (c.height / 2) / 2200) < 0.01
