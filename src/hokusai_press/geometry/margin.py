@@ -483,6 +483,68 @@ def _deskewed_binary(img_bgr: np.ndarray, deskew: Deskew) -> np.ndarray:
     return binary
 
 
+# Undetected-text rescue (ink_text_clusters). Real print that no OCR/layout
+# region covers -- a faint publisher name at the foot of a cover, a gray cover
+# title on a --no-ocr run -- must not fall outside the content box, or the
+# margin fill whitens it. Only clusters that look like text are trusted, so
+# stray specks and edge-line fragments still cannot widen the box.
+CLUSTER_GAP_FRAC = 0.012      # glyphs closer than this (x page side) merge
+CLUSTER_MIN_GLYPHS = 3        # a word, not a speck
+LINE_ASPECT_MAX = 15.0        # longer/shorter side above this = a rule/edge line
+LINE_THIN_FRAC = 0.004        # ... when also thinner than this (x page side)
+GLYPH_MAX_FRAC = 0.25         # one component larger than this is not a glyph
+
+
+def ink_text_clusters(img_bgr: np.ndarray) -> list:
+    """Boxes (in img_bgr's own pixel frame, no deskew) of text-like ink clusters.
+
+    A cluster is a group of >= CLUSTER_MIN_GLYPHS glyph-sized components that
+    sit close together. Components touching the image border, specks, thin
+    rule-like lines and page-sized blobs are ignored."""
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) if img_bgr.ndim == 3 else img_bgr
+    gray = remove_edge_shadows(gray)
+    th = ink_threshold(gray)
+    binary = np.where(gray <= th, 255, 0).astype(np.uint8)
+    h, w = binary.shape
+    side = float(min(h, w))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    min_area = SPECKLE_AREA_FRAC * h * w
+    glyphs = np.zeros_like(binary)
+    for i in range(1, n):
+        x, y, cw, ch, area = stats[i]
+        if area < min_area:
+            continue
+        if x == 0 or y == 0 or x + cw == w or y + ch == h:
+            continue
+        long_, short = max(cw, ch), max(1, min(cw, ch))
+        if long_ / short > LINE_ASPECT_MAX and short < LINE_THIN_FRAC * side:
+            continue
+        if cw > GLYPH_MAX_FRAC * w or ch > GLYPH_MAX_FRAC * h:
+            continue
+        glyphs[y:y + ch, x:x + cw][labels[y:y + ch, x:x + cw] == i] = 255
+    gap = max(3, int(round(CLUSTER_GAP_FRAC * side)))
+    merged = cv2.dilate(glyphs, np.ones((gap, gap), np.uint8))
+    m, mlabels, mstats, _ = cv2.connectedComponentsWithStats(merged, connectivity=8)
+    if m <= 1:
+        return []
+    # count glyph components per merged cluster
+    gn, glabels, gstats, gcent = cv2.connectedComponentsWithStats(glyphs, connectivity=8)
+    counts = np.zeros(m, dtype=np.int32)
+    for j in range(1, gn):
+        cx, cy = int(gcent[j][0]), int(gcent[j][1])
+        counts[mlabels[min(h - 1, cy), min(w - 1, cx)]] += 1
+    boxes = []
+    half = gap // 2
+    for k in range(1, m):
+        if counts[k] < CLUSTER_MIN_GLYPHS:
+            continue
+        x, y, cw, ch, _ = mstats[k]
+        # undo the dilation so the box hugs the glyphs
+        boxes.append(Box(float(min(w, x + half)), float(min(h, y + half)),
+                         float(max(0, x + cw - half)), float(max(0, y + ch - half))))
+    return boxes
+
+
 def find_content_box(img_bgr: np.ndarray, deskew: Deskew) -> Margin:
     binary = _deskewed_binary(img_bgr, deskew)
     h, w = binary.shape
