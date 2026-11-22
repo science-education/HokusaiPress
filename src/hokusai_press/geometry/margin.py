@@ -571,6 +571,14 @@ def content_ink_box(img_bgr: np.ndarray, deskew: Deskew, regions=()) -> "Box | N
             continue                                  # scan edge line
         (dots if area < tiny else kept).append((x, y, x1, y1))
     boxes = [Box(float(a), float(b), float(c), float(d)) for a, b, c, d in kept]
+    # OCR regions count only clipped to the image and over printed ink: NDL
+    # can report a text line on a blank page that runs off the paper
+    # (img20261121_0011 p30, a "0" 1759 px wide on a 1415 px page), which
+    # pushed the crop past the paper edge
+    ink = np.zeros((h, w), np.uint8)
+    for a, b, c, d in kept + dots:
+        ink[b:d, a:c] = 1
+    regions = [r for r in (regions or ()) if _region_on_ink(r.box, ink)]
     if dots and kept:
         # a dot counts only next to other print (punctuation, a diacritic,
         # the dot of a dotted rule); a lone one is dust
@@ -585,11 +593,23 @@ def content_ink_box(img_bgr: np.ndarray, deskew: Deskew, regions=()) -> "Box | N
         for a, b, c, d in dots:
             if near[b:d, a:c].any():
                 boxes.append(Box(float(a), float(b), float(c), float(d)))
-    boxes += [r.box for r in (regions or ())]
+    boxes += [_clip_box(r.box, w, h) for r in regions]
     if not boxes:
         return None
     return Box(min(b.x0 for b in boxes), min(b.y0 for b in boxes),
                max(b.x1 for b in boxes), max(b.y1 for b in boxes))
+
+
+def _clip_box(b: Box, w: int, h: int) -> Box:
+    return Box(min(max(b.x0, 0.0), w), min(max(b.y0, 0.0), h),
+               min(max(b.x1, 0.0), w), min(max(b.y1, 0.0), h))
+
+
+def _region_on_ink(b: Box, ink: np.ndarray) -> bool:
+    h, w = ink.shape
+    c = _clip_box(b, w, h)
+    x0, y0, x1, y1 = int(c.x0), int(c.y0), int(np.ceil(c.x1)), int(np.ceil(c.y1))
+    return x1 > x0 and y1 > y0 and bool(ink[y0:y1, x0:x1].any())
 
 
 def _detect_nombre(binary: np.ndarray, content: Box) -> Box | None:
