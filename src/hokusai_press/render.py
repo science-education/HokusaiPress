@@ -46,7 +46,9 @@ def compose_transform(
     # nombre-anchored) when margin normalization has run; otherwise fall back
     # to the raw content box padded by the output margin.
     target_w = target_h = None
-    if params.margin and params.margin.crop:
+    if getattr(settings, "margin_mode", "normalize") == "none":
+        cx0, cy0, crop_w, crop_h = 0, 0, w, h
+    elif params.margin and params.margin.crop:
         crop = params.margin.crop
         cx0, cy0, crop_w, crop_h = crop.x0, crop.y0, crop.width, crop.height
         target_w, target_h = params.margin.target_w, params.margin.target_h
@@ -186,8 +188,12 @@ def render_page_image(
     # protected), then the per-page component rule for wider shadows. On the
     # production run path the original is already region-cleaned (no-op here); on
     # the rebuild path the original is freshly loaded, so this is where it applies.
-    clean = remove_region_shadows(original_bgr, params.regions)
-    clean = remove_edge_shadows(clean)
+    keep_page = getattr(settings, "margin_mode", "normalize") == "none"
+    if keep_page:
+        clean = original_bgr          # no shadow removal: the page as scanned
+    else:
+        clean = remove_region_shadows(original_bgr, params.regions)
+        clean = remove_edge_shadows(clean)
     out = cv2.warpAffine(clean, M, out_size, flags=cv2.INTER_AREA,
                          borderValue=(255, 255, 255))
 
@@ -197,7 +203,7 @@ def render_page_image(
     # paper, a thin dark edge line outside the content). Text/figures/photos are
     # inside the content box, so nothing real is touched. ScanTailor's "fill
     # margins", and the right tool for uniform-illumination ADF scans.
-    if params.margin and params.margin.content:
+    if params.margin and params.margin.content and not keep_page:
         ow, oh = out_size
         # The fill region is the content box UNIONED with the nombre box grown
         # by a fraction of its own height. The page-number's OCR box bounds the

@@ -126,3 +126,24 @@ def test_reocr_uses_engine_boxes_at_render_resolution(tmp_path):
     assert "再OCRの本文" in _text(out)
     assert _image_hashes(src) == _image_hashes(out)
     assert (tmp_path / "o.txt").read_text(encoding="utf-8") == "再OCRの本文"
+
+
+def test_margin_mode_none_keeps_the_whole_page():
+    import numpy as np
+    from hokusai_press.model import Box, Deskew, Margin, PageParams, RenderSettings, SourceRef
+    from hokusai_press.render import compose_transform, render_page_image
+
+    orig = np.full((1000, 700, 3), 255, np.uint8)
+    orig[20:40, 20:200] = 0          # print near the corner, outside the content box
+    orig[400:600, 200:500] = 0       # the "content"
+    p = PageParams(source=SourceRef(path="x", page_index=0), dpi=300,
+                   deskew=Deskew(0.0, 1.0),
+                   margin=Margin(content=Box(200, 400, 500, 600), confidence=1.0))
+    s = RenderSettings(target_dpi=300, margin_mode="none")
+    _, size, _ = compose_transform(orig.shape, p, s)
+    assert size == (700, 1000)
+    out, _, _, _ = render_page_image(orig, p, s)
+    assert out[30, 100].max() < 50   # corner print survives: no crop, no margin fill
+    s2 = RenderSettings(target_dpi=300)
+    out2, _, _, _ = render_page_image(orig, p, s2)
+    assert out2.shape[:2] != (1000, 700) or out2[30, 100].min() > 200

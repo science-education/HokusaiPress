@@ -268,6 +268,13 @@ def main(argv=None) -> int:
                            "many threads (no OCR engine involved here, so "
                            "there's no NPU concurrency limit -- core count "
                            "is the natural ceiling)")
+    p_re.add_argument("--margin-mode", choices=["normalize", "none"], default="normalize",
+                      help="none = keep the whole scanned page (deskew and "
+                           "binarize only; no crop, margin fill or shadow removal)")
+    p_re.add_argument("--image-only-out", default=None,
+                      help="also write the result without its text layer to this folder or file")
+    p_re.add_argument("--suffix", default="",
+                      help="append this to the output name when --out is a folder")
     p_re.add_argument("--process-pool", action="store_true",
                       help="use processes instead of threads for --workers "
                            "(faster: PIL's TIFF/group4 encode doesn't fully "
@@ -450,12 +457,19 @@ def main(argv=None) -> int:
     if args.command == "rebuild":
         from .pipeline import rebuild
 
-        out = _resolve_out(args.out, args.source)
+        out = _resolve_out(args.out, args.source, args.suffix)
         summary = rebuild(args.doc, args.source, out, db_path=args.db,
                           max_workers=args.workers,
-                          use_processes=args.process_pool)
+                          use_processes=args.process_pool,
+                          margin_mode=args.margin_mode)
         print(f"[OK] rebuilt {summary['doc_id']}: {summary['pages']} pages "
-              f"-> {summary['out_pdf']}")
+              f"-> {summary['out_pdf']}", flush=True)
+        if args.image_only_out:
+            from .textlayer import image_only_copy
+
+            bare = _resolve_out(args.image_only_out, args.source, args.suffix)
+            image_only_copy(out, bare)
+            print(f"  [image-only] {bare}", flush=True)
         return 0
 
     if args.command == "remargin":
