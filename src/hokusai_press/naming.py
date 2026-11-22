@@ -47,6 +47,7 @@ class Record:
     publisher: str = ""
     issued: str = ""
     volume: str = ""
+    edition: str = ""
     raw_author: str = ""
 
 
@@ -82,7 +83,7 @@ def find_isbns(text: str) -> list[str]:
     """Valid ISBNs in OCR text, in order of appearance (no duplicates)."""
     text = unicodedata.normalize("NFKC", text)
     out: list[str] = []
-    for m in re.finditer(r"[I1l][S5][B8][N]\s*[:：]?\s*([0-9OolIDSB|\-\s‐－−–—ー]{9,24}[0-9Xx])", text):
+    for m in re.finditer(r"[I1l]\s{0,3}[S5]\s{0,3}[B8]\s{0,3}N\s*[:：]?\s*([0-9OolIDSB|\-\s‐－−–—ー]{9,80}[0-9Xx])", text):
         raw = m.group(1).translate(_NOISE)
         digits = re.sub(r"[^0-9Xx]", "", raw)
         for cand in (digits[:13], digits[:10]):
@@ -95,22 +96,35 @@ def find_isbns(text: str) -> list[str]:
 # --- NDL lookup -----------------------------------------------------------------
 
 def _display_authors(author_field: str, creators: list[str]) -> str:
-    """'Wiggins, Alexis,吉田, 新一郎,アレクシス・ウィギンズ [著],吉田新一郎 訳'
-    -> 'アレクシス・ウィギンズ 著、吉田新一郎 訳'"""
-    parts = [p.strip() for p in (author_field or "").split(",") if p.strip()]
-    shown = []
-    for p in parts:
-        if ROLE_RE.search(p):
-            p = re.sub(r"\s*\[(.+?)\]\s*$", r" \1", p)   # "[著]" -> " 著"
-            shown.append(re.sub(r"\s+", " ", p).strip())
-    if shown:
-        return "、".join(shown)
+    """NDL's author field is the creators' headings, then the display form:
+    'Wiggins, Alexis,吉田, 新一郎,アレクシス・ウィギンズ [著],吉田新一郎 訳'
+    -> 'アレクシス・ウィギンズ 著、吉田新一郎 訳';
+    '...,飯窪真也, 齊藤萌木, 白水始 著' -> '飯窪真也・齊藤萌木・白水始 著'."""
+    field_ = (author_field or "").strip()
+    heads = ",".join(creators)
+    display = field_[len(heads):].lstrip(", ") if heads and field_.startswith(heads) else field_
+    groups, names = [], []
+    for p in (x.strip() for x in display.split(",")):
+        if not p:
+            continue
+        m = ROLE_RE.search(p)
+        if m:
+            name = re.sub(r"\s*\[?" + re.escape(m.group(1)) + r"\]?\s*$", "", p).strip()
+            if name:
+                names.append(name)
+            if names:
+                groups.append("・".join(names) + " " + m.group(1))
+            names = []
+        else:
+            names.append(p)
+    if groups:
+        return "、".join(re.sub(r"\s+", " ", g) for g in groups)
     # no display form: "鈴木, 秀幸, 1948-" -> "鈴木秀幸"
-    names = []
+    out = []
     for c in creators:
         bits = [b.strip() for b in c.split(",") if b.strip() and not re.match(r"^\d{4}-", b.strip())]
-        names.append("".join(bits[:2]))
-    return "、".join(n for n in names if n)
+        out.append("".join(bits[:2]))
+    return "、".join(n for n in out if n)
 
 
 def parse_record(item, isbn: str) -> Record:
@@ -124,6 +138,7 @@ def parse_record(item, isbn: str) -> Record:
         publisher=", ".join((e.text or "").strip() for e in item.findall("dc:publisher", NS)),
         issued=(item.findtext("dcterms:issued", namespaces=NS) or "").strip(),
         volume=(item.findtext("dcndl:volume", namespaces=NS) or "").strip(),
+        edition=(item.findtext("dcndl:edition", namespaces=NS) or "").strip(),
         raw_author=author,
     )
 
@@ -163,12 +178,16 @@ def title_score(title: str, text: str) -> float:
 
 
 def format_name(rec: Record, suffix: str = "") -> str:
-    parts = [p.strip() for p in rec.title.split(" : ") if p.strip()]
+    # " = Parallel title" (an English title printed alongside) is dropped
+    parts = [p.split(" = ")[0].strip() for p in rec.title.split(" : ")]
+    parts = [p for p in parts if p]
     title = parts[0]
     if len(parts) > 1:
         title += "ー" + "ー".join(parts[1:]) + "ー"
     if rec.volume and rec.volume not in title:
         title += " " + rec.volume
+    if rec.edition and rec.edition not in title:
+        title += " " + rec.edition
     name = f"『{title}』"
     if rec.authors:
         name += f"（{rec.authors}）"
