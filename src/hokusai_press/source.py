@@ -232,6 +232,79 @@ def _bed_span(gray: np.ndarray, axis: int, bed_gray: "float | None" = None):
     return a, b, (bed_l + bed_r) / 2
 
 
+BED_SEED_MIN = 0.10    # bed gray must cover this much of the ring inside the pad ...
+BED_MAX_FRAC = 0.50    # ... and the bed less than this much of the image
+BED_MIN_AREA = 0.002   # a bed piece is at least this much of the image
+BED_NOISE_MAX = 2.0    # ... and flat: median 7x7 std (bed 0.3-0.8; print >= 4)
+PAD_MAX_FRAC = 0.03    # the scanner's white pad: a thin band on all four sides
+BED_EDGE_GROW = 0.01   # the sheet's edge shadow: up to this much of the short side
+BED_EDGE_PAPER = 200   # ... over pixels darker than paper
+
+
+def scanner_bed_mask(gray: np.ndarray) -> "np.ndarray | None":
+    """Pixels outside the sheet -- the white border pad and the uniform gray
+    scanner bed -- as a bool mask, or None when the image shows no bed.
+
+    A sheet laid askew leaves bed triangles at its corners (img20261121_0010
+    p243-244); unlike find_paper, which wants whole bed columns, this follows
+    the bed itself: gray within BED_TOL of the bed's own level, connected to
+    the border of the unpadded image, in pieces too large to be ink and as
+    flat as only the bed is. Measured on img20261121: the bed's median 7x7
+    std is 0.3-0.8; printed gray touching the paper edge (a tinted chapter
+    band 0006 p166, a header bar 0014 p36, a cover 0003 p1) and paper
+    texture 4-29 -- level and connectivity alone took those for bed."""
+    h, w = gray.shape
+    px0, px1 = _white_pad(gray, 0)
+    py0, py1 = _white_pad(gray, 1)
+    # Only inside the scanner's own pad: a page's flat white margin around
+    # flat (born-digital) gray print is no pad, and that print no bed.
+    for lo, hi, n in ((px0, px1, w), (py0, py1, h)):
+        if not (0 < lo <= PAD_MAX_FRAC * n and 0 < n - hi <= PAD_MAX_FRAC * n):
+            return None
+    ih, iw = py1 - py0, px1 - px0
+    k = max(3, int(0.01 * min(ih, iw)))
+    if ih <= 2 * k or iw <= 2 * k:
+        return None                              # all pad: a blank white page
+    inner = cv2.medianBlur(np.ascontiguousarray(gray[py0:py1, px0:px1]), 5)
+    ring = np.r_[inner[:k].ravel(), inner[-k:].ravel(),
+                 inner[k:-k, :k].ravel(), inner[k:-k, -k:].ravel()]
+    mid = ring[(ring > 20) & (ring < 235)]
+    if mid.size < BED_SEED_MIN * ring.size:
+        return None
+    bed_gray = int(np.argmax(np.bincount(mid, minlength=256)))
+    if np.count_nonzero(np.abs(ring.astype(np.int16) - bed_gray) <= BED_TOL) < BED_SEED_MIN * ring.size:
+        return None
+    cand = (np.abs(inner.astype(np.int16) - bed_gray) <= BED_TOL).astype(np.uint8)
+    n, lbl, stats, _ = cv2.connectedComponentsWithStats(cand, connectivity=4)
+    raw = gray[py0:py1, px0:px1].astype(np.float32)
+    mu = cv2.blur(raw, (7, 7))
+    sd = np.sqrt(np.maximum(cv2.blur(raw * raw, (7, 7)) - mu * mu, 0.0))
+    core = cv2.erode(cand, np.ones((9, 9), np.uint8)).astype(bool)
+    keep = np.zeros(n, bool)
+    for i in range(1, n):
+        x, y, cw, ch, area = stats[i]
+        touches = x <= k or y <= k or x + cw >= iw - k or y + ch >= ih - k
+        if not (touches and area >= BED_MIN_AREA * ih * iw):
+            continue
+        r = core[y:y + ch, x:x + cw] & (lbl[y:y + ch, x:x + cw] == i)
+        keep[i] = r.any() and float(np.median(sd[y:y + ch, x:x + cw][r])) <= BED_NOISE_MAX
+    bed = keep[lbl]
+    if not bed.any() or bed.mean() >= BED_MAX_FRAC:
+        return None
+    mask = np.ones((h, w), bool)
+    mask[py0:py1, px0:px1] = bed
+    # the sheet's edge casts a darker line on the bed (105-117 against 123):
+    # grow over dark pixels only, a few px, never onto the paper
+    dark = (gray < BED_EDGE_PAPER).astype(np.uint8)
+    grown = mask.astype(np.uint8)
+    for _ in range(max(3, int(BED_EDGE_GROW * min(h, w)))):
+        nxt = cv2.dilate(grown, np.ones((3, 3), np.uint8)) & (dark | grown)
+        if np.array_equal(nxt, grown):
+            break
+        grown = nxt
+    return grown.astype(bool)
+
+
 def find_paper(img: np.ndarray) -> "list | None":
     """The sheet's box [x0, y0, x1, y1] when the image shows a uniform scanner
     bed around it (left+right or top+bottom), else None."""

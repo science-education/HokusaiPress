@@ -324,3 +324,43 @@ def test_content_ink_box_ignores_ocr_region_off_the_paper_or_over_no_ink():
     regions = [Region(kind=RegionKind.TEXT, box=Box(300, 300, 1500, 1800))] + ghost
     box = content_ink_box(img, Deskew(), regions)
     assert box.x1 <= 1415 and box.y1 <= 1805       # clipped, ghost dropped
+
+
+def _askew_sheet_on_bed(angle, fold=0.4, ncols=2, h=1200, w=840):
+    """A sheet laid askew on the gray scanner bed with a folded-back corner,
+    saved with the scanner's pure-white pad: img20261121_0010 p243 (a short
+    closing paragraph, the bottom-right corner folded)."""
+    img = np.full((h, w, 3), 250, np.uint8)
+    for k in range(ncols):                       # tategaki columns of glyphs
+        x = int(w * 0.8) - 26 * k
+        for y in range(int(h * 0.25), int(h * 0.85), 18):
+            cv2.rectangle(img, (x, y), (x + 11, y + 11), (0, 0, 0), 1)
+    m = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+    img = cv2.warpAffine(img, m, (w, h), borderValue=(123, 123, 123))
+    fold_pts = np.array([[w, int(h * (1 - fold))], [w, h], [int(w * (1 - fold)), h]], np.int32)
+    cv2.fillPoly(img, [fold_pts], (123, 123, 123))
+    return cv2.copyMakeBorder(img, 16, 16, 16, 16, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+
+
+def test_deskew_sheet_askew_on_scanner_bed_inside_white_pad():
+    # The pad's edge against the bed is exactly axis-aligned and, with little
+    # text on the page, used to outvote it: deskew returned 0 deg.
+    sk = find_skew(_askew_sheet_on_bed(6.0))
+    assert abs(sk.angle_deg + 6.0) < 0.3
+
+
+def test_scanner_bed_mask_covers_bed_and_pad_only():
+    from hokusai_press.source import scanner_bed_mask
+    img = cv2.cvtColor(_askew_sheet_on_bed(6.0, fold=0.25), cv2.COLOR_BGR2GRAY)
+    m = scanner_bed_mask(img)
+    assert m is not None
+    assert m[:16].all() and m[:, :16].all()                    # the pad
+    assert m[img == 123].mean() > 0.95                          # the bed
+    assert m[img == 250].mean() < 0.01 and m[img < 60].mean() < 0.01   # sheet, print
+    #                                    (only blurred pixels along the sheet's edge)
+    plain = np.full((600, 400), 250, np.uint8)                  # no bed: untouched
+    cv2.rectangle(plain, (100, 100), (300, 120), 0, -1)
+    assert scanner_bed_mask(cv2.copyMakeBorder(plain, 16, 16, 16, 16, cv2.BORDER_CONSTANT, value=255)) is None
+    digital = np.full((2000, 1400), 255, np.uint8)              # flat white margin around
+    digital[200:600, 300:700] = 123                             # flat gray print: no pad, no bed
+    assert scanner_bed_mask(digital) is None

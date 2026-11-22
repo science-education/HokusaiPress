@@ -114,6 +114,23 @@ def ink_threshold(gray: np.ndarray, book_valley: "int | None" = None) -> int:
     return otsu
 
 
+def whiten_scanner_bed(img: np.ndarray) -> np.ndarray:
+    """The scanner bed (and white pad) around a sheet laid askew, white
+    (source.scanner_bed_mask). As ink it pinned deskew at 0 deg through its
+    axis-aligned edge against the pad, and once the page is turned straight
+    it lands inside the crop as a black triangle (img20261121_0010 p243-244).
+    Continuing the bed into the pad instead left the sheet's own edge to
+    outvote text printed askew on it (0002 p269: 0.65 -> -0.10 deg)."""
+    from ..source import scanner_bed_mask
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    bed = scanner_bed_mask(gray)
+    if bed is None:
+        return img
+    out = img.copy()
+    out[bed] = 255
+    return out
+
+
 def remove_edge_shadows(img: np.ndarray) -> np.ndarray:
     """Whiten dark binding/ADF shadow bands along the page edges (gray or BGR).
 
@@ -126,11 +143,13 @@ def remove_edge_shadows(img: np.ndarray) -> np.ndarray:
 
     Used once on the original before everything (content detection, deskew,
     render) so a shadow can neither be mistaken for content nor survive into the
-    output.
+    output. The scanner bed around a sheet laid askew goes white first
+    (whiten_scanner_bed), for the same reasons.
     """
     # Remove fragmented binding lines FIRST, from the pristine ink: the shadow
     # rule below would otherwise eat a line's solid core and leave short dashes
     # whose vertical extent no longer reads as a line (near-blank pages only).
+    img = whiten_scanner_bed(img)
     img = _remove_fragmented_edge_lines(img)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
     h, w = gray.shape
