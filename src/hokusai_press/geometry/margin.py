@@ -736,7 +736,15 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
         d, b, _ = bodies[id(p)]
         groups.setdefault((d, p.source.page_index % 2), []).append(p)
     anchored: dict = {}
+    per_dir = {d: sum(len(ps) for k, ps in groups.items() if k[0] == d) for d in ("v", "h")}
+    main_dir = max(per_dir, key=per_dir.get)
     for key, ps in groups.items():
+        if len(ps) < ANCHOR_MIN_GROUP and key[0] != main_dir:
+            # two yokogaki pages in a tategaki book (the cover, the colophon)
+            # are no type area: registering them pushed the cover's title
+            # into a corner (img20261121_0015 p1). Only a short book's own
+            # direction is trusted without a consensus.
+            continue
         pos = [(_start_corner(key[0], bodies[id(p)][1]), p) for p in ps]
         if len(ps) >= ANCHOR_MIN_GROUP:
             mx = float(np.median([c[0] / unit(p) for c, p in pos]))
