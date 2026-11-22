@@ -45,3 +45,29 @@ def test_identify_without_isbn(monkeypatch):
     monkeypatch.setattr(naming, "page_texts", lambda path, **k: ({1: "no number"}, "title"))
     p = naming.identify("x.pdf", lookup=lambda i: None)
     assert p.name is None and "ISBN" in p.note
+
+
+def test_several_authors_edition_and_parallel_title():
+    a = naming._display_authors(
+        "飯窪, 真也,齊藤, 萌木,白水, 始, 1970-,飯窪真也, 齊藤萌木, 白水始 著",
+        ["飯窪, 真也", "齊藤, 萌木", "白水, 始, 1970-"])
+    assert a == "飯窪真也・齊藤萌木・白水始 著"
+    a = naming._display_authors(
+        "鹿毛, 雅治,楠見, 孝,南風原, 朝和,鹿毛雅治, 楠見孝, 南風原朝和編",
+        ["鹿毛, 雅治", "楠見, 孝", "南風原, 朝和"])
+    assert a == "鹿毛雅治・楠見孝・南風原朝和 編"
+    assert naming._display_authors("渡部, 信一,渡部信一 編著", ["渡部, 信一"]) == "渡部信一 編著"
+    rec = Record("x", "学力の心理学 : 何をどう育み、どう評価するのか = Psychology of academic competence", "")
+    assert format_name(rec) == "『学力の心理学ー何をどう育み、どう評価するのかー』.pdf"
+    rec = Record("x", "よくわかる教育評価", "田中耕治 編", edition="第3版")
+    assert format_name(rec) == "『よくわかる教育評価 第3版』（田中耕治 編）.pdf"
+
+
+def test_find_isbns_with_spaced_letters():
+    text = "印刷・製本 I S B N 9 7 8 - 4 - 3 1 4 - 0 1 2 1 6 - 4 C 0 0 3 6 P r i n t e d"
+    assert find_isbns(text) == ["9784314012164"]
+
+
+def test_find_isbns_one_character_per_line():
+    text = "I S\r\nB\r\nN\r\n9\r\n7\r\n8\r\n-\r\n4\r\n-\r\n3\r\n1\r\n4\r\n-\r\n0\r\n1\r\n2\r\n1\r\n6\r\n-\r\n4\r\nC\r\n0\r\n0"
+    assert find_isbns(text) == ["9784314012164"]
