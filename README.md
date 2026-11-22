@@ -52,18 +52,23 @@ pip install -e ".[mlx-vl,web]"
 
 | 指定 | 検出器 | 認識器 | 主な用途 |
 |---|---|---|---|
-| `--ocr-engine hybrid` | Yomitoku系DBNet | NDL系認識器 | 既定。従来互換と図版レイアウト |
+| `--ocr-engine ndlocr` | NDL-OCR Lite DEIMv2 | NDL PARSeqカスケード | **既定**。CPUで最速、レイアウト17分類、CC BY 4.0 |
+| `--ocr-engine hybrid` | Yomitoku系DBNet | NDL系認識器 | Intel NPUで検出を高速化（`--device npu`）。出力は非商用（CC BY-NC-SA） |
 | `--ocr-engine yomitoku` | Yomitoku DBNet | Yomitoku PARSeq | Apple SiliconのMPS処理 |
-| `--ocr-engine ndlocr` | NDL-OCR Lite DEIMv2 | NDL PARSeqカスケード | 高速なCPU処理 |
 | `--ocr-engine paddle-vl-1.6` | PP-DocLayoutV3 | PaddleOCR-VL-1.6 | 文書構造を含むVLM解析 |
+
+既定は 2026-11-22 に hybrid から ndlocr に変えました。評価セット（`bench/ocr_bench.py`）では認識精度が同等で、CPUでは約4倍速いためです。
 
 YomitokuとNDL-OCRは、それぞれ自身の検出器と認識器を使用します。`hybrid` は
 Yomitoku系の文字検出とNDL系の文字認識を組み合わせ、Yomitokuの図版レイアウト検出も
 実行します。
 
 ```bash
-# 既定: Hybrid
-hokusai-press run scan.pdf --out hybrid.pdf
+# 既定: NDL-OCR Lite
+hokusai-press run scan.pdf --out book.pdf
+
+# Hybrid（Intel NPU）
+hokusai-press run scan.pdf --out hybrid.pdf --ocr-engine hybrid --device npu
 
 # 各ネイティブOCR
 hokusai-press run scan.pdf --out yomitoku.pdf --ocr-engine yomitoku --device mps

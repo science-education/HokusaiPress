@@ -30,6 +30,7 @@ import numpy as np
 
 from .model import Box, Flag, Region, RegionKind, SourceRef
 from .ocr.base import FIGURE_LIKE_LABELS
+from .ocr.factory import DEFAULT_OCR_ENGINE
 
 PHOTO_AREA_FRAC = 0.01      # dense residual blob larger than this = photo
 PHOTO_FILL = 0.2           # connected-component fill ratio separating photo from line art
@@ -63,7 +64,7 @@ def analyze(
     source: SourceRef,
     model_dir: str = "models",
     device: str = "auto",
-    ocr_engine: str = "hybrid",
+    ocr_engine: str = DEFAULT_OCR_ENGINE,
     layout_engine: str | None = None,
     text_engine: str | None = None,
     use_ocr: bool = True,

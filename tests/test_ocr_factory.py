@@ -137,3 +137,13 @@ def test_hybrid_detector_does_not_guess_among_multiple_outputs():
     _fix_detector_output_name(engine)
 
     assert engine.detector.session is session
+
+
+def test_default_engine_is_native_ndlocr():
+    from hokusai_press.ocr import DEFAULT_OCR_ENGINE
+
+    assert DEFAULT_OCR_ENGINE == "ndlocr"
+    assert resolve_engine_selection(None, None, None) == ("ndlocr", "ndlocr")
+    assert resolve_engine_selection("auto", None, None) == ("ndlocr", "ndlocr")
+    # hybrid stays available as an explicit choice
+    assert resolve_engine_selection("hybrid", None, None) == ("hybrid", "hybrid")

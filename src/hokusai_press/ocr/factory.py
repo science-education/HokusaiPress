@@ -28,6 +28,12 @@ class OCRConfig:
     mlx_server_url: str | None
 
 
+# Default OCR engine (2026-11-22): the native NDL-OCR Lite pipeline. Its
+# recognition accuracy matches hybrid/Yomitoku on the bench set, it is the
+# fastest on CPU, its DEIM detector also returns layout classes, and it is
+# CC BY 4.0 (hybrid's Yomitoku detector makes output non-commercial).
+DEFAULT_OCR_ENGINE = "ndlocr"
+
 _engine: OCREngine | None = None
 _config: OCRConfig | None = None
 _engine_lock = threading.Lock()
@@ -113,9 +119,9 @@ def resolve_engine_selection(
 ) -> tuple[str, str]:
     """Map legacy single-engine choices into layout/text components."""
 
-    legacy = _norm(legacy_engine or "hybrid")
+    legacy = _norm(legacy_engine or DEFAULT_OCR_ENGINE)
     legacy_map = {
-        "auto": ("hybrid", "hybrid"),
+        "auto": (DEFAULT_OCR_ENGINE, DEFAULT_OCR_ENGINE),
         "hybrid": ("hybrid", "hybrid"),
         "yomitoku": ("yomitoku", "yomitoku"),
         "ndlocr": ("ndlocr", "ndlocr"),
