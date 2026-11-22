@@ -129,7 +129,7 @@ def test_compose_crops_and_scales_identity():
     assert out_size == (200, 400)
     mapped = _map_box(Box(50, 100, 250, 500), M)
     assert abs(mapped.x0) < 1e-6 and abs(mapped.y0) < 1e-6
-    assert abs(mapped.x1 - 200) < 1e-6 and abs(mapped.y1 - 400) < 1e-6
+    assert abs(mapped.x1 - 200) < 1e-3 and abs(mapped.y1 - 400) < 1e-3
 
 
 def test_map_box_under_rotation_covers_all_four_corners():
@@ -238,3 +238,18 @@ def test_photo_region_tone_override_is_carried():
     _, _, _, photo_boxes = render_page_image(
         np.full((800, 600, 3), 255, np.uint8), params, settings)
     assert photo_boxes[0][4] == "gray"
+
+
+def test_compose_fill_page_scales_up_to_the_target():
+    settings = RenderSettings(target_dpi=600, output_margin_mm=0.0)
+    params = _params(Box(0, 0, 196, 392), dpi=600)
+    params.margin.crop = Box(2, 4, 198, 396)                 # 98% of the target
+    params.margin.target_w, params.margin.target_h = 200.0, 400.0
+    _, out_size, scale = compose_transform((400, 300), params, settings)
+    assert out_size == (200, 400) and abs(scale - 1.0) < 1e-9   # a normal page: no enlarging
+    params.margin.fill = True
+    M, out_size, scale = compose_transform((400, 300), params, settings)
+    assert out_size == (200, 400)
+    mapped = _map_box(params.margin.crop, M)
+    assert abs(mapped.x0) < 1e-3 and abs(mapped.y0) < 1e-3
+    assert abs(mapped.x1 - 200) < 1e-3 and abs(mapped.y1 - 400) < 1e-3

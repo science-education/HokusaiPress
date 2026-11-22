@@ -710,6 +710,10 @@ def _start_corner(d: str, b: Box) -> tuple:
     return (b.x1, b.y0) if d == "v" else (b.x0, b.y0)
 
 
+FULL_BLEED_FILL = 0.96     # content over this much of the sheet = the sheet is the page
+FULL_BLEED_MAX_CUT = 0.10  # ... trimmed to the page only within this much per axis
+
+
 def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     """Uniform page size with the type area (版面) at one position (sets margin.crop).
 
@@ -731,7 +735,10 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     Size: the type area plus the book's median paper margins (equal sides),
     so the result looks like the printed page. A page whose content does not
     fit is never clipped: its crop grows and the renderer scales it down
-    (flagged CONTENT_SCALED_DOWN)."""
+    (flagged CONTENT_SCALED_DOWN). The exception is a page that IS the whole
+    sheet (a black chapter-title page scanned past the trim): a window of the
+    sheet with the page's shape fills the page (Margin.fill), cutting at most
+    FULL_BLEED_MAX_CUT of it, instead of shrinking it between white bands."""
     have = [p for p in pages if p.margin and p.margin.content]
     if not have:
         return
@@ -842,6 +849,26 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
             x0 = c.x0 + c.width / 2 - fx * crop_w
             y0 = c.y0 + c.height / 2 - fy * crop_h
             floor = margin_px
+        p.margin.fill = False
+        if p.margin.confidence >= 0.2 and p.margin.page_w and p.margin.page_h and (
+                crop_w > tw_px * 1.001 or crop_h > th_px * 1.001) and (
+                c.width >= FULL_BLEED_FILL * p.margin.page_w
+                and c.height >= FULL_BLEED_FILL * p.margin.page_h):
+            # the content is the whole sheet (a black chapter-title page, a
+            # cover) and larger than the book's page: a sheet scanned past
+            # the trim (img20261121_0010 p15: the black paper 4% wider than
+            # the book, its top and bottom cut by the scan). Shrinking it
+            # left white bands; the trim-size window of the sheet is the page.
+            s = min(c.width / tw_px, c.height / th_px)
+            fw, fh = tw_px * s, th_px * s
+            if abs(s - 1.0) <= FULL_BLEED_MAX_CUT and max(c.width / fw, c.height / fh) <= 1.0 + FULL_BLEED_MAX_CUT:
+                x0 = c.x0 + (c.width - fw) / 2.0
+                y0 = c.y0 + (c.height - fh) / 2.0
+                p.margin.crop = Box(x0, y0, x0 + fw, y0 + fh)
+                p.margin.target_w, p.margin.target_h = tw_px, th_px
+                p.margin.fill = True
+                p.flags = [f for f in p.flags if f != Flag.CONTENT_SCALED_DOWN]
+                continue
         if p.margin.confidence >= 0.2:
             # never clip: shift the crop minimally to contain the content,
             # keeping up to `floor` of white around it where there is room

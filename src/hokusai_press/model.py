@@ -141,6 +141,11 @@ class Margin:
     # the output canvas.
     target_w: Optional[float] = None
     target_h: Optional[float] = None
+    # the sheet itself is the page (a black chapter-title page, a cover):
+    # `crop` is a window of it with the target's aspect, rendered to fill the
+    # target exactly (scaled up or down a little) instead of shrunk with white
+    # bands around it.
+    fill: bool = False
 
 
 @dataclass
@@ -278,6 +283,7 @@ def _decode_page(d) -> PageParams:
             page_h=margin.get("page_h"),
             target_w=margin.get("target_w"),
             target_h=margin.get("target_h"),
+            fill=margin.get("fill", False),
         ),
         regions=[_decode_region(r) for r in d.get("regions", [])],
         page_kind=PageKind(d.get("page_kind", "auto")),

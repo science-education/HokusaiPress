@@ -342,3 +342,34 @@ def test_minority_direction_pages_without_consensus_are_not_registered():
     crop, c = cover.margin.crop, cover.margin.content
     assert abs(((c.x0 + c.x1) / 2 - crop.x0) / crop.width - 700 / 1400) < 0.01
     assert abs(((c.y0 + c.y1) / 2 - crop.y0) / crop.height - c.y0 / 2200 - (c.height / 2) / 2200) < 0.01
+
+
+def test_full_bleed_sheet_larger_than_the_page_is_trimmed_not_shrunk():
+    # img20261121_0010 p15: a black chapter-title page scanned past the trim
+    # (4% wider than the book's page, its top and bottom cut by the scan).
+    # Shrunk to fit it left white bands; the page is a trim-size window of it.
+    body = [_tategaki_page(i, 0, 0) for i in range(1, 9)]
+    normalize_margins(body, output_margin_mm=5.0)
+    tw, th = body[0].margin.target_w, body[0].margin.target_h
+    black = _numbered_page(9, Box(0, 0, tw * 1.04, th * 0.98), tw * 1.04, th * 0.98, None, dpi=300)
+    black.regions = [_text(Box(tw * 0.4, th * 0.1, tw * 0.45, th * 0.4))]
+    pages = body + [black]
+    normalize_margins(pages, output_margin_mm=5.0)
+    m = black.margin
+    assert m.fill
+    assert abs(m.crop.width / m.crop.height - tw / th) < 1e-6        # the page's shape
+    assert m.crop.height <= m.content.height + 1e-6                  # all sheet, no white
+    assert m.crop.width <= m.content.width + 1e-6
+    assert abs((m.crop.x0 + m.crop.x1) - (m.content.x0 + m.content.x1)) < 1e-6   # centred
+    from hokusai_press.model import Flag
+    assert Flag.CONTENT_SCALED_DOWN not in black.flags
+    assert not any(p.margin.fill for p in body)
+
+
+def test_full_bleed_sheet_far_too_large_is_still_shrunk():
+    body = [_tategaki_page(i, 0, 0) for i in range(1, 9)]
+    normalize_margins(body, output_margin_mm=5.0)
+    tw, th = body[0].margin.target_w, body[0].margin.target_h
+    big = _numbered_page(9, Box(0, 0, tw * 1.6, th * 1.6), tw * 1.6, th * 1.6, None, dpi=300)
+    normalize_margins(body + [big], output_margin_mm=5.0)
+    assert not big.margin.fill
