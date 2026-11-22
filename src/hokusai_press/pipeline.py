@@ -539,6 +539,13 @@ def rebuild(doc_id: str, source_path: str, out_pdf: str,
                 lambda a: load_single(*a), load_args)]
     else:
         originals = [load_single(*a)[0] for a in load_args]
+    # analyze turned pages against the book's orientation by 90 deg CW before
+    # computing every stored box (deskew, margin, OCR regions); do the same
+    # here, or those pages render sideways with a misplaced text layer.
+    originals = [
+        cv2.rotate(o, cv2.ROTATE_90_CLOCKWISE) if Flag.PAGE_REORIENTED in p.flags else o
+        for o, p in zip(originals, doc.pages)
+    ]
     # rebuild makes a fresh Document, so the shadow-band model isn't carried in
     # the stored per-page params -- recompute it from the originals (same
     # document-level detector as analyze) so render applies the identical bands.

@@ -193,3 +193,33 @@ def test_merge_dbs_folds_workers_and_cleans_up(tmp_path):
     finally:
         tgt.close()
     assert not os.path.exists(w0) and not os.path.exists(w1)   # temp dbs removed
+
+
+def test_rebuild_turns_pages_that_analyze_reoriented(tmp_path):
+    """A landscape page that analyze turned 90 deg CW to match a portrait book
+    has all its stored boxes in the turned frame, so rebuild must turn it
+    too (it rendered sideways with a misplaced text layer before)."""
+    import pytest
+
+    pytest.importorskip("pikepdf")
+    import numpy as np
+    import pypdfium2 as pdfium
+    from PIL import Image
+
+    from hokusai_press import pipeline
+    from hokusai_press.model import Deskew, Flag, PageParams, SourceRef
+    from hokusai_press.store import Store
+
+    src = str(tmp_path / "land.pdf")
+    Image.fromarray(np.full((300, 400, 3), 255, np.uint8)).save(src, resolution=100)
+    db = str(tmp_path / "j.db")
+    store = Store(db)
+    store.upsert_page("land.pdf", 0, PageParams(
+        source=SourceRef(path=src, page_index=0), dpi=100, deskew=Deskew(),
+        flags=[Flag.PAGE_REORIENTED]))
+    store.close()
+
+    out = str(tmp_path / "out.pdf")
+    pipeline.rebuild("land.pdf", src, out, db_path=db, margin_mode="none")
+    w, h = pdfium.PdfDocument(out)[0].get_size()
+    assert h > w
