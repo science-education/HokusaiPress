@@ -196,6 +196,7 @@ def analyze_document(
     runtime: str | None = "paddle",
     pages: "set[int] | None" = None,
     max_workers: int = 4,
+    keep_orientation: bool = False,
 ) -> AnalyzeResult:
     from .source import load_page
 
@@ -213,23 +214,47 @@ def analyze_document(
     loaded = list(load_page(path, pages))
     prof["raster"] += perf_counter() - t
 
-    # Safety net: an ADF-scanned book has ONE page orientation (a uniform crop
-    # is meaningless across mixed portrait/landscape pages). A genuinely
-    # landscape source page (a wide table/chart, not a rotation-metadata bug --
-    # see source.py's rotation handling) still needs to fit a portrait book, so
-    # force it to the book's dominant orientation and flag it for a human to
-    # confirm the forced rotation direction looks right (rotating a wide table
-    # 90 deg CW vs CCW both "fit", but only one reads correctly).
+    # One page orientation per book (a uniform page size is meaningless across
+    # mixed portrait/landscape pages). A page whose image disagrees with the
+    # book is first cropped to the sheet if the scan kept the gray scanner bed
+    # around it (an upright black chapter page saved wide); only a sheet that
+    # still disagrees was stored sideways, and it is turned the way its text
+    # reads (orientation.choose_rotation). keep_orientation leaves pages as
+    # stored. Both are recorded in SourceRef (paper, rotate) so every later
+    # load (rebuild, remargin, review UI) sees the same page.
+    from . import orientation as orient_mod
+    from .source import find_paper, orient
+
     reoriented: set[int] = set()
     if len(loaded) >= 3:
         is_landscape = [o.shape[1] > o.shape[0] for (_s, o, _w, _d) in loaded]
         dominant_landscape = sum(is_landscape) * 2 > len(loaded)
         fixed = []
+        engine = None
         for (s, o, w, d), landscape in zip(loaded, is_landscape):
             if landscape != dominant_landscape:
-                o = cv2.rotate(o, cv2.ROTATE_90_CLOCKWISE)
-                w = cv2.rotate(w, cv2.ROTATE_90_CLOCKWISE)
-                reoriented.add(s.page_index)
+                box = find_paper(o)
+                if box is not None:
+                    s.paper = box
+                    pw, ph = box[2] - box[0], box[3] - box[1]
+                    landscape = pw > ph
+                if landscape != dominant_landscape and not keep_orientation:
+                    if use_ocr:
+                        if engine is None:
+                            from .ocr import get_ocr_engine
+
+                            engine = get_ocr_engine(
+                                ocr_engine, model_dir=model_dir, device=device,
+                                openvino_cache_dir=openvino_cache_dir,
+                                runtime=runtime, layout_engine=layout_engine,
+                                text_engine=text_engine)
+                        s.rotate, _ = orient_mod.choose_rotation(
+                            orient(w, s, s.ocr_scale), engine)
+                    else:
+                        s.rotate = 90       # no OCR to tell: flagged for review
+                    reoriented.add(s.page_index)
+                o = orient(o, s)
+                w = orient(w, s, s.ocr_scale)
             fixed.append((s, o, w, d))
         loaded = fixed
 
@@ -396,6 +421,7 @@ def run(
     openvino_cache_dir: Optional[str] = None,
     runtime: str | None = "paddle",
     pages: "set[int] | None" = None,
+    keep_orientation: bool = False,
 ) -> dict:
     """Full batch run: analyze, persist params, render the PDF."""
     from . import learn
@@ -409,7 +435,8 @@ def run(
                               use_ocr=use_ocr,
                               learned_model=learned,
                               openvino_cache_dir=openvino_cache_dir,
-                              runtime=runtime, pages=pages)
+                              runtime=runtime, pages=pages,
+                              keep_orientation=keep_orientation)
     doc_id = os.path.basename(path)
     t = perf_counter()
     store = Store(db_path)
@@ -522,13 +549,12 @@ def rebuild(doc_id: str, source_path: str, out_pdf: str,
                 lambda a: load_single(*a), load_args)]
     else:
         originals = [load_single(*a)[0] for a in load_args]
-    # analyze turned pages against the book's orientation by 90 deg CW before
-    # computing every stored box (deskew, margin, OCR regions); do the same
-    # here, or those pages render sideways with a misplaced text layer.
-    originals = [
-        cv2.rotate(o, cv2.ROTATE_90_CLOCKWISE) if Flag.PAGE_REORIENTED in p.flags else o
-        for o, p in zip(originals, doc.pages)
-    ]
+    # every stored box (deskew, margin, OCR regions) is in the frame analyze
+    # saw: the sheet cropped from the scanner bed and turned upright (see
+    # SourceRef.paper/rotate); without this such pages render wrong.
+    from .source import orient
+
+    originals = [orient(o, p.source) for o, p in zip(originals, doc.pages)]
     # rebuild makes a fresh Document, so the shadow-band model isn't carried in
     # the stored per-page params -- recompute it from the originals (same
     # document-level detector as analyze) so render applies the identical bands.
@@ -566,14 +592,10 @@ def _load_and_compute_margin(args):
     source_path, p = args
     from .source import load_single
 
-    import cv2
-
-    from .model import Flag
+    from .source import orient
 
     original, _ = load_single(source_path, p.source.page_index)
-    if Flag.PAGE_REORIENTED in p.flags:   # as analyze did (see rebuild)
-        original = cv2.rotate(original, cv2.ROTATE_90_CLOCKWISE)
-    return compute_margin(original, p.deskew, p.regions)
+    return compute_margin(orient(original, p.source), p.deskew, p.regions)
 
 
 def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,

@@ -65,13 +65,14 @@ def create_app(db_path: str):
     _ORIG_CACHE_MAX = 4
 
     def _load_original(params):
-        from ..source import load_single
+        from ..source import load_single, orient
 
-        key = (params.source.path, params.source.page_index)
+        src = params.source
+        key = (src.path, src.page_index, tuple(src.paper or ()), src.rotate)
         if key in _orig_cache:
             _orig_cache.move_to_end(key)
             return _orig_cache[key]
-        original, _ = load_single(*key)
+        original = orient(load_single(src.path, src.page_index)[0], src)
         _orig_cache[key] = original
         while len(_orig_cache) > _ORIG_CACHE_MAX:
             _orig_cache.popitem(last=False)

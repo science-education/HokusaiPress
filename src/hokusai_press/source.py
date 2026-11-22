@@ -164,3 +164,113 @@ def _extract_original(page, doc, index: int) -> tuple[np.ndarray, float | None, 
     bitmap = page.render(scale=OCR_DPI / 72)
     bgr = cv2.cvtColor(bitmap.to_numpy()[..., :3], cv2.COLOR_RGB2BGR)
     return bgr, float(OCR_DPI), None
+
+
+# --- paper and orientation ----------------------------------------------------
+# A flatbed/ADF scan whose page-size detection failed (a black chapter page is
+# the usual case) is saved larger than the sheet, with the uniform gray
+# scanner bed around it. Measured on img20261121_0010/0013: bed ~123 gray with
+# a column std of ~1, page 67-80 (black) or ~250 (white), plus a pure-white
+# 31px pad at the image border.
+BED_TOL = 10           # a bed column/row is within this of the bed gray ...
+BED_STD = 4.0          # ... and this uniform
+BED_MIN_FRAC = 0.04    # a bed must be at least this wide to count
+PAPER_MAX_FRAC = 0.92  # ... and leave the sheet smaller than this
+PAPER_MIN_FRAC = 0.30  # a "sheet" narrower than this is a gray band on the page
+
+
+def _white_pad(gray: np.ndarray, axis: int) -> tuple[int, int]:
+    """[lo, hi) along an axis inside the pure-white border padding: the run of
+    flat 255 lines contiguous with each edge (white paper is never this flat),
+    plus the few pixels over which the pad's inner edge fades."""
+    g = gray.astype(np.float32)
+    flat = (np.median(g, axis=axis) >= 254) & (g.std(axis=axis) < 2.0)
+    n = flat.size
+    lo = 0
+    while lo < n and flat[lo]:
+        lo += 1
+    hi = n
+    while hi > lo and flat[hi - 1]:
+        hi -= 1
+    if lo == 0 and hi == n:
+        return 0, n
+    fade = 4
+    return min(n, lo + fade if lo else 0), max(0, hi - fade if hi < n else n)
+
+
+def _bed_span(gray: np.ndarray, axis: int, bed_gray: "float | None" = None):
+    """[a, b) of the sheet along one axis of an unpadded image (axis 0 =
+    columns), or None if there is no uniform bed on both sides."""
+    g = gray.astype(np.float32)
+    mean = g.mean(axis=axis)
+    std = g.std(axis=axis)
+    n = mean.size
+    k = max(3, int(0.01 * n))
+    bed_l = float(np.median(mean[k:2 * k]))
+    bed_r = float(np.median(mean[-2 * k:-k]))
+    if abs(bed_l - bed_r) > BED_TOL or not (20 < bed_l < 235):
+        return None                               # no gray bed on both sides
+    if bed_gray is not None and abs((bed_l + bed_r) / 2 - bed_gray) > BED_TOL:
+        return None                               # not the same scanner bed
+    # uniform relative to the bed's own noise (1-4 gray levels measured)
+    std_lim = max(BED_STD, 2.0 * float(np.median(np.r_[std[k:2 * k], std[-2 * k:-k]])))
+    bed = (np.abs(mean - (bed_l + bed_r) / 2) <= BED_TOL) & (std <= std_lim)
+    dark = np.flatnonzero(mean < 240)           # skip what is left of the pad
+    if dark.size == 0:
+        return None
+    lo, hi = int(dark[0]), int(dark[-1]) + 1
+    a = lo
+    while a < hi and bed[a]:
+        a += 1
+    b = hi
+    while b > a and bed[b - 1]:
+        b -= 1
+    if (a - lo) < BED_MIN_FRAC * n or (hi - b) < BED_MIN_FRAC * n:
+        return None
+    if not (PAPER_MIN_FRAC * n <= (b - a) <= PAPER_MAX_FRAC * n):
+        return None
+    return a, b, (bed_l + bed_r) / 2
+
+
+def find_paper(img: np.ndarray) -> "list | None":
+    """The sheet's box [x0, y0, x1, y1] when the image shows a uniform scanner
+    bed around it (left+right or top+bottom), else None."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    h, w = gray.shape
+    px0, px1 = _white_pad(gray, 0)
+    py0, py1 = _white_pad(gray, 1)
+    inner = gray[py0:py1, px0:px1]
+    if inner.size == 0:
+        return None
+    # one axis first, then the other inside it, and only if it shows the
+    # same bed gray (a dark page's own blank rows are not the scanner bed)
+    xs = _bed_span(inner, 0)
+    if xs is not None:
+        ys = _bed_span(inner[:, xs[0]:xs[1]], 1, bed_gray=xs[2])
+    else:
+        ys = _bed_span(inner, 1)
+        if ys is not None:
+            xs = _bed_span(inner[ys[0]:ys[1], :], 0, bed_gray=ys[2])
+    if xs is None and ys is None:
+        return None
+    x0, x1 = (px0 + xs[0], px0 + xs[1]) if xs else (0, w)
+    y0, y1 = (py0 + ys[0], py0 + ys[1]) if ys else (0, h)
+    return [float(x0), float(y0), float(x1), float(y1)]
+
+
+def orient(img: np.ndarray, ref: SourceRef, scale: float = 1.0) -> np.ndarray:
+    """Apply ref.paper (crop) and ref.rotate (clockwise) to a raw page image;
+    scale maps raw pixels to img's pixels (ref.ocr_scale for the OCR raster)."""
+    if ref.paper:
+        x0, y0, x1, y1 = (int(round(v * scale)) for v in ref.paper)
+        img = img[max(0, y0):y1, max(0, x0):x1]
+    r = int(ref.rotate or 0) % 360
+    if r:
+        img = cv2.rotate(img, _ROTATE_CV2[r])
+    return np.ascontiguousarray(img)
+
+
+def load_oriented(ref: SourceRef) -> np.ndarray:
+    """The page image as analyzed: raw extraction + orient()."""
+    original, _ = load_single(ref.path, ref.page_index)
+    return orient(original, ref)
