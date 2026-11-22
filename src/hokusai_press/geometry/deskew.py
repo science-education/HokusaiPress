@@ -39,7 +39,10 @@ def _binary(img_bgr: np.ndarray) -> np.ndarray:
     if max(h, w) > WORK_MAX_SIDE:
         s = WORK_MAX_SIDE / max(h, w)
         gray = cv2.resize(gray, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
-    from .margin import remove_edge_shadows  # binding/ADF shadows skew the profile
+    # binding/ADF shadows and the scanner bed skew the profile (the bed's
+    # axis-aligned edge against the white pad pinned img20261121_0010
+    # p243-244 at 0 deg)
+    from .margin import remove_edge_shadows
     gray = remove_edge_shadows(gray)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     return (binary > 0).astype(np.float32)

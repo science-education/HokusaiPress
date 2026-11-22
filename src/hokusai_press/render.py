@@ -72,7 +72,9 @@ def compose_transform(
     # both sides, not all on one edge).
     extra_x = extra_y = 0.0
     if target_w and target_h:
-        shrink = min(1.0, target_w / crop_w, target_h / crop_h)
+        shrink = min(target_w / crop_w, target_h / crop_h)
+        if not (params.margin and params.margin.fill):
+            shrink = min(1.0, shrink)
         scale = base_scale * shrink
         out_w, out_h = max(1, round(target_w * base_scale)), max(1, round(target_h * base_scale))
         extra_x = (out_w - crop_w * scale) / 2.0
