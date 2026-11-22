@@ -86,6 +86,7 @@ def _run_one(payload: dict) -> dict:
         learned_model_path=payload["learned_model"],
         openvino_cache_dir=payload["cache"],
         runtime=payload["runtime"], pages=payload["pages"],
+        keep_orientation=payload.get("keep_orientation", False),
     )
     summary["tpb"] = time.perf_counter() - t0
     if payload.get("image_only"):
@@ -200,6 +201,10 @@ def main(argv=None) -> int:
                        help="deprecated alias for --runtime")
     p_run.add_argument("--no-ocr", action="store_true",
                        help="skip OCR (geometry + heuristic separation only)")
+    p_run.add_argument("--keep-orientation", action="store_true",
+                       help="leave pages that differ from the book's orientation as "
+                            "stored (default: crop the scanner bed, then turn a page "
+                            "saved sideways the way its text reads)")
     p_run.add_argument("--learned-model", default=None,
                        help="JSON page-kind model from `learn` to guide auto decisions")
     p_run.add_argument("--openvino-cache-dir", default=None,
@@ -375,6 +380,7 @@ def main(argv=None) -> int:
                 "cache": args.openvino_cache_dir,
                 "runtime": args.runtime or args.paddle_engine or "paddle",
                 "pages": pages_sel,
+                "keep_orientation": args.keep_orientation,
             }
 
         flagged_docs = 0

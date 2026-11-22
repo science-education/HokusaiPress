@@ -215,7 +215,7 @@ def test_rebuild_turns_pages_that_analyze_reoriented(tmp_path):
     db = str(tmp_path / "j.db")
     store = Store(db)
     store.upsert_page("land.pdf", 0, PageParams(
-        source=SourceRef(path=src, page_index=0), dpi=100, deskew=Deskew(),
+        source=SourceRef(path=src, page_index=0, rotate=90), dpi=100, deskew=Deskew(),
         flags=[Flag.PAGE_REORIENTED]))
     store.close()
 

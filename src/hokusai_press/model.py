@@ -76,6 +76,13 @@ class SourceRef:
     page_index: int = 0             # 0-based page within a PDF
     embedded_image_id: Optional[str] = None  # pikepdf XObject key, if extracted
     ocr_scale: float = 1.0          # original_px = ocr_px / ocr_scale
+    # How the raw page image becomes the page the rest of the pipeline sees
+    # (source.orient): first crop to `paper` [x0, y0, x1, y1] in raw pixels --
+    # the sheet without the scanner bed around it, for a scan whose page size
+    # detection failed (e.g. a black chapter page) -- then turn it clockwise
+    # by `rotate` degrees (0/90/180/270), for a page stored sideways.
+    paper: Optional[list] = None
+    rotate: int = 0
 
 
 @dataclass
@@ -253,8 +260,11 @@ def _decode_region(d) -> Region:
 
 def _decode_page(d) -> PageParams:
     margin = d.get("margin")
+    src = dict(d["source"])
+    if "rotate" not in src and "page_reoriented_to_match_book" in d.get("flags", []):
+        src["rotate"] = 90          # params stored before SourceRef.rotate existed
     return PageParams(
-        source=SourceRef(**d["source"]),
+        source=SourceRef(**src),
         dpi=d.get("dpi"),
         deskew=Deskew(**d.get("deskew", {})),
         margin=None
