@@ -72,6 +72,14 @@ def compute_margin(original: np.ndarray, sk, regions) -> tuple[np.ndarray, Margi
         # an outer edge, far from page center), crops the real text OUT of
         # frame entirely while still claiming "found, just not confident".
         mg.confidence = max(mg.confidence, 1.0)
+        # ...but regions can miss real print (a faint publisher line at the
+        # foot of a cover, a gray title next to the one detected picture on a
+        # --no-ocr run). Grow the box to text-like ink clusters so the margin
+        # fill cannot whiten them; specks and edge lines are not clusters.
+        c = mg.content
+        for b in margin_mod.ink_text_clusters(original):
+            c = Box(min(c.x0, b.x0), min(c.y0, b.y0), max(c.x1, b.x1), max(c.y1, b.y1))
+        mg.content = c
     # detection-failed safety: if there's no region AND the page covers too
     # little of the page (near-blank page, or detection missed an undetected
     # figure that no region model classified), a sliver crop would drop real

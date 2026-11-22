@@ -255,3 +255,39 @@ def test_region_shadow_keeps_glyph_crossing_tight_text_boundary():
 
     assert (out[80:320, 235:260] == 0).all()
     assert (out[40:360, 285:288] == 255).all()
+
+
+def test_ink_text_clusters_finds_text_but_not_specks_or_edge_lines():
+    from hokusai_press.geometry.margin import ink_text_clusters
+
+    img = np.full((2000, 1400, 3), 255, np.uint8)
+    # a faint "publisher line" (gray ~110, as measured on a real cover) near the foot
+    for k in range(6):
+        x = 500 + k * 40
+        cv2.rectangle(img, (x, 1850), (x + 25, 1880), (110, 110, 110), -1)
+    # main text block so Otsu sees real ink
+    for row in range(10):
+        for k in range(20):
+            x = 200 + k * 45
+            cv2.rectangle(img, (x, 300 + row * 60), (x + 30, 330 + row * 60), (40, 40, 40), -1)
+    # a lone speck and a thin vertical ADF-like line (not touching the border)
+    cv2.rectangle(img, (1200, 1500), (1203, 1503), (0, 0, 0), -1)
+    cv2.line(img, (20, 200), (20, 1700), (0, 0, 0), 2)
+    boxes = ink_text_clusters(img)
+    assert any(b.y0 >= 1840 and b.y1 <= 1890 and b.x0 <= 505 for b in boxes)
+    assert not any(b.x1 < 40 for b in boxes)            # the edge line
+    assert not any(b.x0 >= 1190 and b.y0 >= 1490 for b in boxes)  # the speck
+
+
+def test_compute_margin_keeps_text_no_region_covers():
+    from hokusai_press.pipeline import compute_margin
+
+    img = np.full((2000, 1400, 3), 255, np.uint8)
+    cv2.rectangle(img, (300, 200), (700, 600), (60, 60, 60), -1)   # the detected picture
+    for k in range(8):                                             # undetected title
+        x = 300 + k * 60
+        cv2.rectangle(img, (x, 900), (x + 45, 950), (140, 140, 140), -1)
+    regions = [Region(kind=RegionKind.PHOTO, box=Box(300, 200, 700, 600))]
+    _, mg = compute_margin(img, Deskew(0.0, 1.0), regions)
+    assert mg.content.y1 >= 950
+    assert mg.content.x1 >= 300 + 7 * 60 + 45 - 2
