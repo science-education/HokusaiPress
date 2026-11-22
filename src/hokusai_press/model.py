@@ -201,6 +201,13 @@ class RenderSettings:
     # output binarization uses it so a show-through page falls back to the
     # book's stable valley instead of a fixed floor (2-pass binarization).
     ink_valley: "int | None" = None
+    # "normalize" (default): crop to the content, normalize margins to a
+    # uniform book size, whiten the margin and edge shadows.
+    # "none": keep the whole scanned page -- deskew and binarization only; no
+    # crop, no margin fill, no shadow removal. For books where the margin
+    # processing is not trusted yet; switchable later by `rebuild` because
+    # every page's parameters are stored.
+    margin_mode: str = "normalize"
 
 
 @dataclass

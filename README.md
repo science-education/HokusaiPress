@@ -117,6 +117,15 @@ hokusai-press run "元データ/*.pdf" --out "補正済み/OCR済/" --image-only
 - `--image-only-out`: 文字層を取り除いた版の出力先です。画像は文字層つきの版とバイト単位で同じです。
 - `--skip-existing`: 出力済みの本を飛ばします。途中で止まったバッチを再開するときに使います。
 
+### 余白処理をせずに作り直す（`rebuild --margin-mode none`）
+
+余白の切り抜き・白塗り・縁の影の除去をせず、スキャンした紙面全体を残して作り直します（傾きの補正と二値化だけ行います）。
+各頁のパラメータとOCR結果はDBに残っているので、OCRはやり直しません。
+
+```bash
+hokusai-press rebuild "元データ/img20261121_0001.pdf" --doc img20261121_0001.pdf --db hokusai.db   --margin-mode none --out "OCR済/" --image-only-out "本文二値化/" --suffix _HP --workers 4
+```
+
 ## 文字層だけを付け替える（`ocr`）
 
 補正済みのPDF（ScanTailor の出力や、以前のOCR済みPDF）の画像には手を付けず、文字層だけを新しいOCRで作り直します。

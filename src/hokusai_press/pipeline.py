@@ -491,8 +491,12 @@ def _save_profile(store, doc_id: str, result) -> None:
 def rebuild(doc_id: str, source_path: str, out_pdf: str,
             db_path: str = "hokusai.db", max_workers: int = 1,
             use_processes: bool = False,
-            pages: "set[int] | None" = None) -> dict:
+            pages: "set[int] | None" = None,
+            margin_mode: str = "normalize") -> dict:
     """Regenerate the PDF purely from stored (possibly corrected) parameters.
+
+    margin_mode "none" renders the whole scanned page (deskew + binarize only,
+    no crop / margin fill / shadow removal); see RenderSettings.margin_mode.
 
     The output is a pure function of the parameters + the original image, so a
     review correction is realized simply by re-rendering — no image was ever
@@ -521,7 +525,10 @@ def rebuild(doc_id: str, source_path: str, out_pdf: str,
 
     import cv2
 
+    if margin_mode not in ("normalize", "none"):
+        raise ValueError(f"margin_mode must be 'normalize' or 'none', not {margin_mode!r}")
     doc = Document(source_path=source_path)
+    doc.render.margin_mode = margin_mode
     doc.pages = [row.params for row in rows]
     load_args = [(source_path, row.params.source.page_index) for row in rows]
     if max_workers > 1 and len(load_args) > 1:
