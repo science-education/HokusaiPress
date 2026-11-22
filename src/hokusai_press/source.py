@@ -237,7 +237,8 @@ BED_MAX_FRAC = 0.50    # ... and the bed less than this much of the image
 BED_MIN_AREA = 0.002   # a bed piece is at least this much of the image
 BED_NOISE_MAX = 2.0    # ... and flat: median 7x7 std (bed 0.3-0.8; print >= 4)
 PAD_MAX_FRAC = 0.03    # the scanner's white pad: a thin band on all four sides
-BED_EDGE_GROW = 0.01   # the sheet's edge shadow: up to this much of the short side
+BED_EDGE_GROW = 0.01   # the sheet's edge shadow: this far (of the short side) from the bed
+BED_EDGE_BAND = 0.04   # ... and any distance within this outer band of the image
 BED_EDGE_PAPER = 200   # ... over pixels darker than paper
 
 
@@ -293,16 +294,28 @@ def scanner_bed_mask(gray: np.ndarray) -> "np.ndarray | None":
         return None
     mask = np.ones((h, w), bool)
     mask[py0:py1, px0:px1] = bed
-    # the sheet's edge casts a darker line on the bed (105-117 against 123):
-    # grow over dark pixels only, a few px, never onto the paper
-    dark = (gray < BED_EDGE_PAPER).astype(np.uint8)
+    # the sheet's edge casts a darker line on the bed (105-117 against 123)
+    # and, where it lifts, a dark sliver (75-90) out to the bed's tip: add
+    # what is darker than paper next to the bed, and what runs on from it
+    # within the outer band of the image -- never the paper, never print
+    # inside the page
+    dark = gray < BED_EDGE_PAPER
     grown = mask.astype(np.uint8)
-    for _ in range(max(3, int(BED_EDGE_GROW * min(h, w)))):
-        nxt = cv2.dilate(grown, np.ones((3, 3), np.uint8)) & (dark | grown)
+    for _ in range(max(3, int(BED_EDGE_GROW * min(h, w)))):   # along the edge
+        nxt = cv2.dilate(grown, np.ones((3, 3), np.uint8)) & (dark | mask).astype(np.uint8)
         if np.array_equal(nxt, grown):
             break
         grown = nxt
-    return grown.astype(bool)
+    mask = grown.astype(bool)
+    bx, by = int(BED_EDGE_BAND * w), int(BED_EDGE_BAND * h)
+    band = np.ones((h, w), bool)
+    band[by:h - by, bx:w - bx] = False
+    reach = (dark & band) | mask                                # out to the tips
+    n, lbl = cv2.connectedComponents(reach.astype(np.uint8), connectivity=8)
+    hit = np.zeros(n, bool)
+    hit[np.unique(lbl[mask])] = True
+    hit[0] = False
+    return hit[lbl] | mask
 
 
 def find_paper(img: np.ndarray) -> "list | None":
