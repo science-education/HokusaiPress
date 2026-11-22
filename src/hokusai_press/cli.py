@@ -516,7 +516,19 @@ def main(argv=None) -> int:
                 continue
             print(f"{'[dry-run] ' if args.dry_run else ''}{os.path.basename(src)} -> {name}")
             if not args.dry_run:
-                os.rename(src, dst)
+                # a sync client (OneDrive) may hold the file for a moment
+                for attempt in range(5):
+                    try:
+                        os.rename(src, dst)
+                        break
+                    except PermissionError as e:
+                        if attempt == 4:
+                            print(f"[skip] in use: {src} ({e})")
+                            bad += 1
+                        else:
+                            import time
+
+                            time.sleep(3)
         return 1 if bad else 0
 
     if args.command == "queue":
