@@ -235,7 +235,9 @@ def test_robust_margin_keeps_top_bottom_asymmetric():
     ]
     normalize_margins(pages, output_margin_mm=5.0)
 
-    expected_h = 1050.0 + 250.0 + 100.0   # uni_h(content) + top + bottom
+    # body + top + bottom; a paper margin below the 5mm output margin is
+    # raised to it (100px -> 118px at 600dpi)
+    expected_h = 1050.0 + 250.0 + max(100.0, 5.0 / 25.4 * 600)
     for p in pages:
         assert abs(p.margin.crop.height - expected_h) < 1.0
 
@@ -274,3 +276,49 @@ def test_divider_page_without_nombre_keeps_proportional_position():
     new_cy = (c.y0 + c.height / 2 - crop.y0) / crop.height
     assert abs(orig_fx - new_cx) < 0.05
     assert abs(orig_fy - new_cy) < 0.05
+
+
+def _text(box):
+    from hokusai_press.model import Region, RegionKind
+    return Region(kind=RegionKind.TEXT, box=box)
+
+
+def _tategaki_page(idx, dx, dy, ncols=10, page_w=1400, page_h=2200, extra=()):
+    """Columns 40px wide, 76px pitch, 1600px tall; the type area's top-right
+    corner at (1200+dx, 300+dy). Page number far from the body (bottom)."""
+    cols = [Box(1160 + dx - 76 * k, 300 + dy, 1200 + dx - 76 * k, 1900 + dy) for k in range(ncols)]
+    regions = [_text(b) for b in cols] + [_text(b) for b in extra]
+    xs = [b.x0 for b in cols] + [b.x0 for b in extra]
+    content = Box(min(xs), 300 + dy, 1200 + dx, 1900 + dy)
+    p = _numbered_page(idx, content, page_w, page_h, None, dpi=300)
+    p.regions = regions
+    return p
+
+
+def test_tategaki_pages_register_on_the_type_area_start_corner():
+    # scan shift differs page to page (a few mm); short last page of a
+    # chapter (3 columns) and a page with a stray mark as "nombre" too
+    shifts = [(0, 0), (30, -20), (-25, 15), (10, 25), (-15, -10), (20, 5)]
+    pages = [_tategaki_page(i, dx, dy) for i, (dx, dy) in enumerate(shifts)]
+    pages.append(_tategaki_page(6, 12, -8, ncols=3))
+    pages[2].margin.nombre_box = Box(1007, 162, 1011, 166)   # a speck read as "9"
+    normalize_margins(pages, output_margin_mm=5.0)
+    pos = {(round(p.margin.crop.x1 - (1200 + d[0]), 3), round((300 + d[1]) - p.margin.crop.y0, 3))
+           for p, d in zip(pages, shifts + [(12, -8)])}
+    assert len(pos) == 1          # start corner at one output position on every page
+    w = {round(p.margin.crop.width, 3) for p in pages}
+    assert len(w) == 1
+    # equal left/right margins around the full type area
+    p = pages[0]
+    assert abs((p.margin.content.x0 - p.margin.crop.x0) - (p.margin.crop.x1 - p.margin.content.x1)) < 1.0
+
+
+def test_part_title_page_is_not_registered_on_the_type_area():
+    body = [_tategaki_page(i, 0, 0) for i in range(6)]
+    title = _numbered_page(6, Box(650, 800, 700, 1300), 1400, 2200, None, dpi=300)
+    title.regions = [_text(Box(650, 800, 700, 1300))]    # one short line, mid-page
+    normalize_margins(body + [title], output_margin_mm=5.0)
+    crop, c = title.margin.crop, title.margin.content
+    # keeps its proportional place on the paper (centre ~0.48, ~0.48)
+    assert abs(((c.x0 + c.x1) / 2 - crop.x0) / crop.width - 675 / 1400) < 0.01
+    assert abs(((c.y0 + c.y1) / 2 - crop.y0) / crop.height - 1050 / 2200) < 0.01

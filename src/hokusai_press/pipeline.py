@@ -45,41 +45,24 @@ def compute_margin(original: np.ndarray, sk, regions) -> tuple[np.ndarray, Margi
     (OCR-free fast path) so a margin/shadow-detection fix never needs OCR
     re-run to take effect -- regions are already known in both cases.
 
-    find_content_box's ink bounding box is used only for its confidence
-    signal and nombre-band detection; the box geometry itself is region-
-    derived (text/figure/photo only). The ink scan picks up whatever the
-    shadow-removal pass above missed (a stray disconnected speck, a tapering
-    line tip, ...), and any such leftover would otherwise widen the content
-    box to include it -- defeating the margin-fill step at render time,
-    which can only whiten what's OUTSIDE the content box. Regions are
-    always OCR/layout-detected real content, so they carry no such risk.
+    find_content_box supplies the confidence signal; the box itself is
+    margin.content_ink_box (all print minus recognisable scan garbage, plus
+    the regions).
     """
     original = margin_mod.remove_region_shadows(original, regions)
     mg = margin_mod.find_content_box(original, sk)
+    # Content = every printed mark that is not recognisably scan garbage
+    # (ScanTailor-style, inclusive), plus the OCR/layout regions. Whatever lies
+    # outside is whitened at render time, so this box must not miss real print
+    # that OCR does not report as text (a page number on a black tab, a rule,
+    # an ornament, part of a running head).
+    box = margin_mod.content_ink_box(original, sk, regions)
+    if box is not None:
+        mg.content = box
     if regions:
-        xs0 = [r.box.x0 for r in regions]
-        ys0 = [r.box.y0 for r in regions]
-        xs1 = [r.box.x1 for r in regions]
-        ys1 = [r.box.y1 for r in regions]
-        mg.content = Box(min(xs0), min(ys0), max(xs1), max(ys1))
-        # A region is always real OCR/layout-detected content -- trust it
-        # outright, however small (e.g. a single short part-title line on an
-        # otherwise blank divider page is GENUINE, deliberate content, not a
-        # missed detection). The full-page/confidence=0 fallback below is for
-        # when regions is empty and we truly have no signal; applying it here
-        # too would discard this real box in favor of a page-centered crop --
-        # which, for an asymmetrically-placed title (e.g. tategaki runs along
-        # an outer edge, far from page center), crops the real text OUT of
-        # frame entirely while still claiming "found, just not confident".
+        # A region is real OCR/layout-detected content -- trust it however
+        # small (a lone part-title line on a divider page is deliberate).
         mg.confidence = max(mg.confidence, 1.0)
-        # ...but regions can miss real print (a faint publisher line at the
-        # foot of a cover, a gray title next to the one detected picture on a
-        # --no-ocr run). Grow the box to text-like ink clusters so the margin
-        # fill cannot whiten them; specks and edge lines are not clusters.
-        c = mg.content
-        for b in margin_mod.ink_text_clusters(original):
-            c = Box(min(c.x0, b.x0), min(c.y0, b.y0), max(c.x1, b.x1), max(c.y1, b.y1))
-        mg.content = c
     # detection-failed safety: if there's no region AND the page covers too
     # little of the page (near-blank page, or detection missed an undetected
     # figure that no region model classified), a sliver crop would drop real
@@ -583,7 +566,13 @@ def _load_and_compute_margin(args):
     source_path, p = args
     from .source import load_single
 
+    import cv2
+
+    from .model import Flag
+
     original, _ = load_single(source_path, p.source.page_index)
+    if Flag.PAGE_REORIENTED in p.flags:   # as analyze did (see rebuild)
+        original = cv2.rotate(original, cv2.ROTATE_90_CLOCKWISE)
     return compute_margin(original, p.deskew, p.regions)
 
 
