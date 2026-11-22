@@ -247,6 +247,23 @@ def main(argv=None) -> int:
     p_ocr.add_argument("--skip-existing", action="store_true",
                        help="skip sources whose output PDF already exists")
 
+    p_id = sub.add_parser(
+        "identify", help="find each book's ISBN in its text layer, look it up "
+                         "in NDL Search and propose a file name (nothing is renamed)")
+    p_id.add_argument("source", nargs="+", help="OCR'd PDF file(s), folder(s), or glob")
+    p_id.add_argument("--csv", required=True,
+                      help="write proposals here (UTF-8 with BOM, opens in Excel); "
+                           "edit new_name, then apply with `rename`")
+    p_id.add_argument("--suffix", default="",
+                      help="append this to every proposed name, e.g. '_HP（OCR済）'")
+    p_id.add_argument("--keep-suffix-after", default=None,
+                      help="keep the part of the current name after this marker, "
+                           "e.g. '_HP' keeps '_HP（OCR済）'")
+
+    p_rn = sub.add_parser("rename", help="rename files as listed in an identify CSV")
+    p_rn.add_argument("--csv", required=True)
+    p_rn.add_argument("--dry-run", action="store_true")
+
     p_queue = sub.add_parser("queue", help="list pages awaiting review")
     p_queue.add_argument("--db", default="hokusai.db")
     p_queue.add_argument("--doc", default=None, help="filter by doc id")
@@ -432,6 +449,75 @@ def main(argv=None) -> int:
                   f"{r['chars']} chars -> {dst}  ({r['seconds'] / max(r['pages'], 1):.2f}s/page)",
                   flush=True)
         return 1 if failed else 0
+
+    if args.command == "identify":
+        import csv
+
+        from .naming import identify
+
+        sources = _expand_sources(args.source)
+        if not sources:
+            print("no input files matched")
+            return 1
+        rows = []
+        for src in sources:
+            suffix = args.suffix
+            if args.keep_suffix_after:
+                stem = os.path.splitext(os.path.basename(src))[0]
+                k = stem.find(args.keep_suffix_after)
+                if k >= 0:
+                    suffix = stem[k:] + suffix
+            try:
+                p = identify(src, suffix=suffix)
+            except Exception as e:
+                print(f"[FAIL] {os.path.basename(src)}: {e}")
+                rows.append({"path": src, "new_name": "", "note": f"error: {e}"})
+                continue
+            r = p.record
+            rows.append({
+                "path": src, "new_name": p.name or "",
+                "isbn": r.isbn if r else "", "title": r.title if r else "",
+                "authors": r.authors if r else "", "publisher": r.publisher if r else "",
+                "issued": r.issued if r else "", "score": p.score, "note": p.note,
+                "isbns_found": " ".join(p.isbn_pages),
+            })
+            mark = "OK" if p.name and not p.note else "CHECK"
+            print(f"[{mark}] {os.path.basename(src)} -> {p.name or '-'}  {p.note}", flush=True)
+        fields = ["path", "new_name", "isbn", "title", "authors", "publisher",
+                  "issued", "score", "note", "isbns_found"]
+        with open(args.csv, "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            w.writeheader()
+            for row in rows:
+                w.writerow({k: row.get(k, "") for k in fields})
+        print(f"proposals -> {args.csv}  (check new_name, then: hokusai-press rename --csv ...)")
+        return 0
+
+    if args.command == "rename":
+        import csv
+
+        with open(args.csv, encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.DictReader(f))
+        bad = 0
+        for row in rows:
+            src, name = row.get("path", ""), (row.get("new_name") or "").strip()
+            if not name:
+                continue
+            dst = os.path.join(os.path.dirname(src), name)
+            if os.path.abspath(dst) == os.path.abspath(src):
+                continue
+            if not os.path.exists(src):
+                print(f"[skip] missing: {src}")
+                bad += 1
+                continue
+            if os.path.exists(dst):
+                print(f"[skip] already exists: {dst}")
+                bad += 1
+                continue
+            print(f"{'[dry-run] ' if args.dry_run else ''}{os.path.basename(src)} -> {name}")
+            if not args.dry_run:
+                os.rename(src, dst)
+        return 1 if bad else 0
 
     if args.command == "queue":
         from .store import Store

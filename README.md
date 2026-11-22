@@ -138,6 +138,20 @@ hokusai-press ocr "本文二値化/*.pdf" --out "OCR済/" --suffix "（OCR済）
 文字層のフォントは、同梱の Noto Sans JP に無い字だけをシステムのフォント（メイリオ・游ゴシックなど）で補います。
 互換漢字（U+F900台など）は通常の字に畳むので、ふつうの字で検索できます。
 
+## 書名への改名（`identify` → `rename`）
+
+OCR済みPDFの文字層から奥付のISBNを探し、NDLサーチで書誌を引いて、`『本題ー副題ー』（著者 著、訳者 訳）.pdf` の形の名前を提案します。
+裏表紙の広告に他の本のISBNが並んでいても、表紙・扉の文字と書名が最もよく合うものを選びます。NDLに送るのはISBNだけです。
+
+```bash
+hokusai-press identify "OCR済/*_HP（OCR済）.pdf" --csv 改名候補.csv --keep-suffix-after _HP
+# 改名候補.csv の new_name を確かめ、必要なら直してから
+hokusai-press rename --csv 改名候補.csv --dry-run
+hokusai-press rename --csv 改名候補.csv
+```
+
+`identify` は何も改名しません。`note` に「要確認」とある行は、書名が表紙の文字と合わなかったものです。
+
 ## レビューと再生成
 
 ```bash
