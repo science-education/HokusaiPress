@@ -7,9 +7,10 @@ them as separate steps would interpolate the image two or three times and
 soften it; composing them means the original is sampled exactly once.
 
 Coordinate convention: margin boxes and content regions are stored in the
-deskewed-original frame (analysis already deskews the work raster). The same
-composed transform maps those boxes analytically into output space, so no
-second image pass is needed to know where text/figures land.
+deskewed-original frame (analysis already deskews the work raster). The
+crop+scale half of the transform maps those boxes analytically into output
+space, while the full composed transform (deskew + crop + scale) warps the
+original image in one pass.
 
 Image-layer encoding and the invisible searchable-text layer are delegated to
 the validated hybrid-ocr pdf_export builder (CCITT G4 / JBIG2 / JPEG +
@@ -26,21 +27,13 @@ import cv2
 from .model import Box, Document, PageKind, PageParams, RegionKind, RenderSettings
 
 
-def compose_transform(
+def _crop_scale_transform(
     original_shape: tuple[int, int],
     params: PageParams,
     settings: RenderSettings,
 ) -> tuple[np.ndarray, tuple[int, int], float]:
-    """Return (M 2x3, output_size (w,h), scale).
-
-    M maps original-image pixels directly to final output pixels.
-    """
+    """Return (A 3x3 float64, output_size (w,h), scale) for deskewed -> output."""
     h, w = original_shape[:2]
-    angle = params.deskew.angle_deg
-    # rotation about the original center (maps original -> deskewed frame)
-    R = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle, 1.0)
-    R_h = np.vstack([R, [0, 0, 1]])
-
     dpi = params.dpi or settings.target_dpi
     # crop box in deskewed frame. Prefer the normalized crop (uniform size,
     # nombre-anchored) when margin normalization has run; otherwise fall back
@@ -87,8 +80,40 @@ def compose_transform(
     A = np.array([[scale, 0, -scale * cx0 + extra_x],
                   [0, scale, -scale * cy0 + extra_y],
                   [0, 0, 1]], dtype=np.float64)
-    M = (A @ R_h)[:2, :]
     out_size = (out_w, out_h)
+    return A, out_size, scale
+
+
+def compose_box_transform(
+    original_shape: tuple[int, int],
+    params: PageParams,
+    settings: RenderSettings,
+) -> tuple[np.ndarray, tuple[int, int], float]:
+    """Return (A 2x3, output_size (w,h), scale).
+
+    A maps deskewed-original pixels (the frame of stored margin boxes and
+    content regions) directly to final output pixels (crop + scale only).
+    """
+    A, out_size, scale = _crop_scale_transform(original_shape, params, settings)
+    return A[:2, :].astype(np.float32), out_size, scale
+
+
+def compose_transform(
+    original_shape: tuple[int, int],
+    params: PageParams,
+    settings: RenderSettings,
+) -> tuple[np.ndarray, tuple[int, int], float]:
+    """Return (M 2x3, output_size (w,h), scale).
+
+    M maps original-image pixels directly to final output pixels.
+    """
+    h, w = original_shape[:2]
+    angle = params.deskew.angle_deg
+    # rotation about the original center (maps original -> deskewed frame)
+    R = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle, 1.0)
+    R_h = np.vstack([R, [0, 0, 1]])
+    A, out_size, scale = _crop_scale_transform(original_shape, params, settings)
+    M = (A @ R_h)[:2, :]
     return M.astype(np.float32), out_size, scale
 
 
@@ -179,6 +204,7 @@ def render_page_image(
     # validated location) -- then warp the clean image, so no shadow survives
     # into the output and a wrong crop can't reintroduce one.
     M, out_size, _ = compose_transform(original_bgr.shape, params, settings)
+    box_M, _, _ = compose_box_transform(original_bgr.shape, params, settings)
     # OCR-confident blank page: emit pure white (no warp needed), so neither
     # show-through nor any residual speck reaches the output.
     if getattr(params, "blank", False):
@@ -219,7 +245,7 @@ def render_page_image(
             pad = 0.6 * nb.height        # enough for an underline/overline/rule
             fb = Box(min(fb.x0, nb.x0 - pad), min(fb.y0, nb.y0 - pad),
                      max(fb.x1, nb.x1 + pad), max(fb.y1, nb.y1 + pad))
-        b = _map_box(fb, M)
+        b = _map_box(fb, box_M)
         x0 = max(0, min(ow, int(round(b.x0))))
         y0 = max(0, min(oh, int(round(b.y0))))
         x1 = max(0, min(ow, int(round(b.x1))))
@@ -237,14 +263,14 @@ def render_page_image(
     ow, oh = out_size
     for r in params.regions:
         if r.kind == RegionKind.PHOTO:
-            b = _map_box(r.box, M)
+            b = _map_box(r.box, box_M)
             x0, y0 = max(0.0, b.x0), max(0.0, b.y0)
             x1, y1 = min(float(ow), b.x1), min(float(oh), b.y1)
             if x1 - x0 < 1 or y1 - y0 < 1:
                 continue   # clipped to nothing (box mapped outside the page)
             photo_boxes.append((x0, y0, x1, y1, r.tone))
         if r.ocr_text:
-            b = _map_box(r.box, M)
+            b = _map_box(r.box, box_M)
             lines.append({
                 "box": [b.x0, b.y0, b.x1, b.y1],
                 "polygon": [[b.x0, b.y0], [b.x1, b.y0], [b.x1, b.y1], [b.x0, b.y1]],
@@ -269,13 +295,13 @@ def _figure_vecfills(
     """Return vector fills for solid FIGURE regions in rendered pixel space."""
     from .region_class import classify_patch
 
-    M, _, _ = compose_transform(original_shape, params, settings)
+    box_M, _, _ = compose_box_transform(original_shape, params, settings)
     h, w = out_bgr.shape[:2]
     fills = []
     for r in params.regions:
         if r.kind != RegionKind.FIGURE:
             continue
-        b = _map_box(r.box, M)
+        b = _map_box(r.box, box_M)
         x0i = max(0, min(w, int(round(min(b.x0, b.x1)))))
         y0i = max(0, min(h, int(round(min(b.y0, b.y1)))))
         x1i = max(0, min(w, int(round(max(b.x0, b.x1)))))
