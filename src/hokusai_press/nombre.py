@@ -710,7 +710,7 @@ def _gap_warnings(assigns, idx2page) -> list[str]:
             if v2 - v1 > span + GAP_TOLERANCE:
                 missing = (v2 - v1) - span
                 warnings.append(
-                    f"p{i2}: page number {v1} -> {v2} "
+                    f"p{i2 + 1}: page number {v1} -> {v2} "   # PDF page number
                     f"(~{missing} page(s) may be missing)")
                 p = idx2page.get(i2)
                 if p is not None and Flag.PAGE_NUMBER_GAP not in p.flags:

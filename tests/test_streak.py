@@ -61,7 +61,7 @@ def test_warning_lists_pages_compactly():
     assert _ranges([207, 209, 211, 213, 273]) == "p207-p213 every 2nd, p273"
     assert _ranges([1, 2, 3, 7, 9]) == "p1-p3, p7, p9"
     w = streak_warning({207: [(0.94, 8)], 209: [(0.94, 8)], 211: [(0.941, 7)], 5: []})
-    assert w.startswith("scanner streak on 3 page(s): p207-p211 every 2nd")
+    assert w.startswith("scanner streak on 3 page(s): p208-p212 every 2nd")  # PDF pages
     assert "94%" in w
     assert streak_warning({1: [], 2: []}) is None
 
@@ -73,3 +73,4 @@ def test_full_bleed_printed_rule_is_no_streak():
     rng = np.random.default_rng(0)
     g[:, 900:906] = rng.integers(60, 140, size=(g.shape[0], 1))
     assert find_streaks(_padded(g, pad)) == []
+

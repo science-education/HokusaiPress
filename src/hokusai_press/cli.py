@@ -549,7 +549,7 @@ def main(argv=None) -> int:
             print("review queue is empty")
             return 0
         for r in rows:
-            print(f"{r.doc_id} p{r.page_index}: {', '.join(r.flags)}")
+            print(f"{r.doc_id} p{r.page_index + 1}: {', '.join(r.flags)}")  # PDF page
         return 0
 
     if args.command == "review":

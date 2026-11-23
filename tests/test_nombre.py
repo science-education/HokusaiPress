@@ -238,3 +238,9 @@ def test_resolve_position_model_preserves_genuine_gap_warning():
 
     assert any("missing" in w for w in warnings)
     assert any(Flag.PAGE_NUMBER_GAP in p.flags for p in pages)
+
+
+def test_page_number_gap_warning_names_the_pdf_page():
+    from hokusai_press.nombre import _gap_warnings
+    w = _gap_warnings([(10, "arabic", 11), (20, "arabic", 40)], {})
+    assert w == ["p21: page number 11 -> 40 (~19 page(s) may be missing)"]
