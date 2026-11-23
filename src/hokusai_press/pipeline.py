@@ -435,7 +435,10 @@ def run(
 ) -> dict:
     """Full batch run: analyze, persist params, render the PDF."""
     from . import learn
+    from .model import refuse_overwrite
     from .render import build_pdf
+
+    refuse_overwrite(path, out_pdf)
 
     learned = learn.load(learned_model_path) if learned_model_path else None
     result = analyze_document(path, model_dir=model_dir, device=device,
@@ -530,8 +533,11 @@ def rebuild(doc_id: str, source_path: str, out_pdf: str,
     indices (e.g. a fast preview of a few pages) -- it does not affect
     what's stored; the full book's params are untouched.
     """
+    from .model import refuse_overwrite
     from .render import build_pdf
     from .source import load_single
+
+    refuse_overwrite(source_path, out_pdf)
 
     store = Store(db_path)
     try:

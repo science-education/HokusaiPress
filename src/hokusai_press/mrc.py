@@ -424,10 +424,12 @@ class MrcPageBuilder:
         thread pool and must preserve page order on append."""
         self._pages.append(encoded)
 
-    def save(self, output_path: str) -> None:
+    def save(self, output_path: str, source_path: str | None = None) -> None:
         import pikepdf
+        from .model import refuse_overwrite
         from .pdf_export import build_text_overlay
 
+        refuse_overwrite(source_path, output_path)
         if not self._pages:
             raise ValueError("no pages added")
 

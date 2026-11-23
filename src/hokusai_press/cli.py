@@ -19,15 +19,56 @@ def _is_folder_out(out: str) -> bool:
             or os.path.splitext(out)[1] == "")
 
 
-def _resolve_out(out: str, source: str, suffix: str = "") -> str:
+def _resolve_out(out: str, source: str, suffix: str = "", mkdir: bool = True) -> str:
     """Allow --out to be a folder: save as the source's name (+ suffix) with a
-    .pdf extension inside it (folder created on demand). Otherwise --out is
-    used as the output file path verbatim."""
+    .pdf extension inside it (folder created on demand when mkdir=True).
+    Otherwise --out is used as the output file path verbatim."""
     if _is_folder_out(out):
-        os.makedirs(out, exist_ok=True)
+        if mkdir:
+            os.makedirs(out, exist_ok=True)
         stem = os.path.splitext(os.path.basename(source))[0]
         return os.path.join(out, stem + suffix + ".pdf")
     return out
+
+
+def _norm_path(path: str) -> str:
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _check_output_collisions(
+    sources: list[str],
+    planned_outputs: list[tuple[str, str]],
+) -> str | None:
+    """Return an English error message if any output collides with an input or
+    another output, else None."""
+    input_map: dict[str, str] = {}
+    for src in sources:
+        input_map.setdefault(_norm_path(src), src)
+
+    seen_outputs: dict[str, tuple[str, str]] = {}
+    for src, out_path in planned_outputs:
+        key = _norm_path(out_path)
+        if key in input_map:
+            matched_src = input_map[key]
+            return (
+                f"error: output path '{out_path}' would overwrite input "
+                f"'{matched_src}'; use --suffix or a different output folder"
+            )
+        if key in seen_outputs:
+            prev_src, prev_out = seen_outputs[key]
+            if prev_src != src:
+                return (
+                    f"error: output path collision: '{out_path}' is produced by "
+                    f"both '{prev_src}' and '{src}'; use --suffix or a "
+                    f"different output folder"
+                )
+            return (
+                f"error: output path collision: '{out_path}' and '{prev_out}' "
+                f"resolve to the same file for input '{src}'; use --suffix or "
+                f"a different output folder"
+            )
+        seen_outputs[key] = (src, out_path)
+    return None
 
 
 def _expand_sources(paths: list[str]) -> list[str]:
@@ -364,6 +405,17 @@ def main(argv=None) -> int:
                 and not _is_folder_out(args.image_only_out)):
             print("error: --image-only-out must be a folder when processing multiple inputs")
             return 1
+        planned = []
+        for src in sources:
+            planned.append((src, _resolve_out(args.out, src, args.suffix, mkdir=False)))
+            if args.image_only_out:
+                planned.append((
+                    src,
+                    _resolve_out(args.image_only_out, src, args.suffix, mkdir=False),
+                ))
+        if err := _check_output_collisions(sources, planned):
+            print(err)
+            return 1
         if args.skip_existing:
             kept = [s for s in sources
                     if not os.path.exists(_resolve_out(args.out, s, args.suffix))]
@@ -447,6 +499,15 @@ def main(argv=None) -> int:
             return 1
         if len(sources) > 1 and not _is_folder_out(args.out):
             print("error: --out must be a folder when processing multiple inputs")
+            return 1
+        planned = []
+        for src in sources:
+            dst = _resolve_out(args.out, src, args.suffix, mkdir=False)
+            planned.append((src, dst))
+            if args.text:
+                planned.append((src, os.path.splitext(dst)[0] + ".txt"))
+        if err := _check_output_collisions(sources, planned):
+            print(err)
             return 1
         engine = get_ocr_engine(args.ocr_engine, args.model_dir, args.device,
                                 args.openvino_cache_dir, args.runtime)
@@ -574,6 +635,15 @@ def main(argv=None) -> int:
     if args.command == "rebuild":
         from .pipeline import rebuild
 
+        planned = [(args.source, _resolve_out(args.out, args.source, args.suffix, mkdir=False))]
+        if args.image_only_out:
+            planned.append((
+                args.source,
+                _resolve_out(args.image_only_out, args.source, args.suffix, mkdir=False),
+            ))
+        if err := _check_output_collisions([args.source], planned):
+            print(err)
+            return 1
         out = _resolve_out(args.out, args.source, args.suffix)
         summary = rebuild(args.doc, args.source, out, db_path=args.db,
                           max_workers=args.workers,
@@ -599,6 +669,10 @@ def main(argv=None) -> int:
             return 1
         if len(sources) > 1 and not _is_folder_out(args.out):
             print("error: --out must be a folder when processing multiple inputs")
+            return 1
+        planned = [(src, _resolve_out(args.out, src, mkdir=False)) for src in sources]
+        if err := _check_output_collisions(sources, planned):
+            print(err)
             return 1
 
         try:

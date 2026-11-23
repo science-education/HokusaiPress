@@ -288,7 +288,9 @@ def strip_text(pdf, page) -> int:
 def image_only_copy(src: str, dst: str) -> None:
     """Write src without its text layer to dst (images untouched)."""
     import pikepdf
+    from .model import refuse_overwrite
 
+    refuse_overwrite(src, dst)
     with pikepdf.open(src) as pdf:
         for page in pdf.pages:
             strip_text(pdf, page)
@@ -306,9 +308,9 @@ def overlay_text(src: str, pages: list, dst: str, strip_existing: bool = True,
     and line boxes in those pixels; None leaves the page as it is."""
     import pikepdf
     from reportlab.pdfgen import canvas
+    from .model import refuse_overwrite
 
-    if os.path.abspath(src) == os.path.abspath(dst):
-        raise ValueError(f"refusing to overwrite the input: {src}")
+    refuse_overwrite(src, dst)
     with pikepdf.open(src) as pdf:
         if len(pdf.pages) != len(pages):
             raise ValueError(f"{src}: {len(pdf.pages)} pages but {len(pages)} OCR results")

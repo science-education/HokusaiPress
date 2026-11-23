@@ -42,7 +42,13 @@ def ocr_pdf(src: str, dst: str, engine, dpi: int = RENDER_DPI,
     """OCR src page by page and write dst with a fresh text layer.
 
     Returns {"pages", "lines", "chars", "seconds"}."""
+    from .model import refuse_overwrite
     from .textlayer import overlay_text
+
+    refuse_overwrite(src, dst)
+    if text_out:
+        refuse_overwrite(src, text_out)
+        refuse_overwrite(dst, text_out)
 
     t0 = time.perf_counter()
     pages, texts = [], []
