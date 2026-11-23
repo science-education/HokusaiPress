@@ -181,6 +181,7 @@ class NdlocrLiteEngine:
                 outputpath=os.devnull,
                 save_viz=False,
             )
+            detections = [dict(item) for item in self._detector.detections]
 
         lines: list[OCRLine] = []
         for item in result.get("json_lines", []):
@@ -195,7 +196,7 @@ class NdlocrLiteEngine:
             })
 
         layout_boxes: list[LayoutBox] = []
-        for item in self._detector.detections:
+        for item in detections:
             class_id = int(item["class_index"])
             label = _NDL_LAYOUT_LABELS.get(class_id)
             if label is None:

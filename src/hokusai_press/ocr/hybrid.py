@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 
 
 class _OnnxOutputNameCompatSession:
@@ -55,9 +56,11 @@ class HybridOCREngine:
             openvino_cache_dir=openvino_cache_dir,
         )
         _fix_detector_output_name(self._engine)
+        self._lock = threading.Lock()
 
     def __call__(self, image_bgr):
-        result = self._engine(image_bgr)
+        with self._lock:
+            result = self._engine(image_bgr)
         for line in result.get("lines", []):
             line.setdefault("source", "ndlocr")
         return result
@@ -76,11 +79,13 @@ class YomitokuLayoutEngine:
         from hokusai_press.layout import YomitokuLayoutProvider
 
         self._provider = YomitokuLayoutProvider(device=device)
+        self._lock = threading.Lock()
 
     def analyze_layout(self, image_bgr):
         boxes = []
         try:
-            figures = self._provider.figures(image_bgr)
+            with self._lock:
+                figures = self._provider.figures(image_bgr)
         except ImportError:
             return boxes
         for box in figures:
