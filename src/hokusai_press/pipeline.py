@@ -132,10 +132,15 @@ def _finish_page(args, sk, ocr_up) -> tuple[PageParams, np.ndarray, Margin]:
     page_flags = [f for f in cflags if not (blank and f == Flag.NO_TEXT)]
     if source.page_index in reoriented:
         page_flags.append(Flag.PAGE_REORIENTED)
+    from .streak import page_streaks
+    streaks = page_streaks(ocr_img, source.rotate)   # dust on the scanner
+    if streaks:
+        page_flags.append(Flag.SCANNER_STREAK)
     params = PageParams(
         source=source, dpi=dpi, deskew=sk, margin=mg, regions=regions,
         page_kind=PageKind.AUTO, flags=page_flags, blank=blank,
     )
+    params._streaks = streaks          # for the book's warning (not stored)
     return params, original, mg
 
 
@@ -364,6 +369,11 @@ def analyze_document(
                 for c in rcands
             ]
     warnings = nombre_mod.resolve(doc.pages, heights, widths)
+    from .streak import streak_warning
+    w = streak_warning({p.source.page_index: getattr(p, "_streaks", [])
+                        for p in doc.pages})
+    if w:
+        warnings.append(w)
 
     # 6. cross-page margin consistency + nombre-anchored normalization.
     # A confirmed-blank page (rendered as pure white regardless of margin/

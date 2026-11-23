@@ -66,6 +66,7 @@ class Flag(str, Enum):
     PAGE_NUMBER_GAP = "page_number_gap"          # sequence break (possible miss)
     PAGE_REORIENTED = "page_reoriented_to_match_book"  # forced portrait<->landscape
     CONTENT_SCALED_DOWN = "content_scaled_down_to_match_book"  # outlier-large page
+    SCANNER_STREAK = "scanner_streak"            # dust line the length of the scan
 
 
 @dataclass
