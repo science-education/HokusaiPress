@@ -20,8 +20,8 @@ $py = "C:\Users\user\dev\NDL-OCR-Lite-NPU\.venv-openvino\Scripts\python.exe"  # 
 & $py -m pytest "C:\Users\user\dev\HokusaiPress" -q
 # 実行（NPU並列・キャッシュ）
 & $py -m hokusai_press.cli run "<pdf|folder>" --out <dir> --db <db.db> --device npu --openvino-cache-dir "C:\tmp\ov-cache" --workers 2
-# 特定頁だけ高速デバッグ（0-based, 真ページ番号保持）
-& $py -m hokusai_press.cli run <pdf> --out <dir> --db <db> --pages "9,52,236-237" --device npu
+# 特定頁だけ高速デバッグ（PDFの頁番号＝1始まりで指定、真ページ番号保持）
+& $py -m hokusai_press.cli run <pdf> --out <dir> --db <db> --pages "10,53,237-238" --device npu
 # 段階別タイミング
 & $py ... run ... --profile
 # レビューUI（落ちにくいよう Start-Process 常駐推奨）
@@ -635,10 +635,10 @@ margin.py側のロジック調整は今後これで高速に検証できる。
 ## 12. 2026-06-24 追記（マージン配置の再設計＋並列化）
 
 ### remargin 高速イテレーションパスの CLI 化＋並列化
-- `hokusai-press remargin <source...> --out <dir> --db <db> [--workers N] [--pages "0-29"]`：
+- `hokusai-press remargin <source...> --out <dir> --db <db> [--workers N] [--pages "1-30"]`：
   保存済み OCR regions を再利用し、影/margin/content枠/ノンブルを再計算→PDF再生成。**OCRは走らない**。
   margin.py のロジック調整を 5冊フルで OCR なしに検証できる（`recompute_shadows_and_margins`＋`rebuild`）。
-- `--pages` は**出力する頁のみ**を絞る（margin統計は全頁を使う＝部分出力でも判型は本全体で代表的）。
+- `--pages` は**出力する頁のみ**を絞る（PDFの頁番号＝1始まりで指定）（margin統計は全頁を使う＝部分出力でも判型は本全体で代表的）。
   各冊30頁程度のサブセットで素早く目視検証する運用（メモリ [[feedback-hokusaipress-verification]]）。
 - **頁内並列化**：`MrcPageBuilder.add_page` を状態を持たない純粋関数 `encode_page`（G4/JPEG符号化、
   build_pdf 時間の ~65%）に分割。`build_pdf(max_workers=N)` で render+encode をスレッドプール化。

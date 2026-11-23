@@ -53,8 +53,9 @@ def _expand_sources(paths: list[str]) -> list[str]:
 
 
 def _parse_pages(spec: "str | None") -> "set[int] | None":
-    """Parse a 0-based page selection like '9', '52,236-237', '0-4' to a set.
-    Returns None for the whole document."""
+    """Parse a page selection in PDF page numbers (1 = the first page), like
+    '10', '53,237-238', '1-5', to the set of 0-based page indices the pipeline
+    uses. Returns None for the whole document; ValueError for a bad spec."""
     if not spec:
         return None
     out: set[int] = set()
@@ -62,11 +63,17 @@ def _parse_pages(spec: "str | None") -> "set[int] | None":
         part = part.strip()
         if not part:
             continue
-        if "-" in part:
-            a, b = part.split("-", 1)
-            out.update(range(int(a), int(b) + 1))
-        else:
-            out.add(int(part))
+        try:
+            if "-" in part:
+                a, b = (int(x) for x in part.split("-", 1))
+            else:
+                a = b = int(part)
+        except ValueError:
+            raise ValueError(f"--pages: not a page or range: {part!r}") from None
+        if a < 1 or b < a:
+            raise ValueError(f"--pages: pages start at 1 (the PDF's first "
+                             f"page) and ranges run low-high: {part!r}")
+        out.update(range(a - 1, b))
     return out or None
 
 
@@ -226,8 +233,9 @@ def main(argv=None) -> int:
                        help="skip sources whose output PDF already exists "
                             "(resume an interrupted batch)")
     p_run.add_argument("--pages", default=None,
-                       help="process only these 0-based pages, e.g. '9,52,236-237'"
-                            " (fast for debugging)")
+                       help="process only these pages, numbered as in the PDF "
+                            "(1 = the first page), e.g. '10,53,237-238' "
+                            "(fast for debugging)")
 
     p_ocr = sub.add_parser(
         "ocr", help="replace the text layer of finished PDFs (images kept as is)")
@@ -329,8 +337,9 @@ def main(argv=None) -> int:
                                  "render+encode half of --workers (see "
                                  "rebuild --process-pool)")
     p_remargin.add_argument("--pages", default=None,
-                            help="only RENDER these 0-based pages to the "
-                                 "output PDF, e.g. '0-29' (fast preview). "
+                            help="only RENDER these pages (PDF page "
+                                 "numbers, 1 = the first) to the output "
+                                 "PDF, e.g. '1-30' (fast preview). "
                                  "Margin recompute still uses the WHOLE "
                                  "book's stored pages -- the robust per-side "
                                  "statistics need the full book to be "
@@ -365,7 +374,11 @@ def main(argv=None) -> int:
             if not sources:
                 return 0
 
-        pages_sel = _parse_pages(args.pages)
+        try:
+            pages_sel = _parse_pages(args.pages)
+        except ValueError as e:
+            print(f"error: {e}")
+            return 1
 
         def _payload(src, db):
             return {
@@ -588,7 +601,11 @@ def main(argv=None) -> int:
             print("error: --out must be a folder when processing multiple inputs")
             return 1
 
-        pages_sel = _parse_pages(args.pages)
+        try:
+            pages_sel = _parse_pages(args.pages)
+        except ValueError as e:
+            print(f"error: {e}")
+            return 1
         store = Store(args.db)
         try:
             for src in sources:

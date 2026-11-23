@@ -110,7 +110,7 @@ C:\tmp\hokusai-paddle-venv\Scripts\python.exe -m hokusai_press.cli run `
   C:\tmp\tmp0613\sample.pdf `
   --out C:\tmp\hokusai-ocr-engines\sample-ppocrv6.pdf `
   --db C:\tmp\hokusai-ocr-engines\sample-ppocrv6.db `
-  --pages 0 `
+  --pages 1 `
   --layout-engine none `
   --text-engine ppocr-v6 `
   --runtime onnxruntime `
