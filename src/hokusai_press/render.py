@@ -23,7 +23,15 @@ from __future__ import annotations
 import numpy as np
 import cv2
 
-from .model import Box, Document, PageKind, PageParams, RegionKind, RenderSettings
+from .model import (
+    Box,
+    Document,
+    PageKind,
+    PageParams,
+    RegionKind,
+    RenderSettings,
+    refuse_overwrite,
+)
 
 
 def compose_transform(
@@ -443,6 +451,7 @@ def build_pdf(
     """
     from .mrc import MrcPageBuilder
 
+    refuse_overwrite(document.source_path, out_path)
     builder = MrcPageBuilder(
         compress=document.render.bilevel_codec,
         target_dpi=document.render.target_dpi,
@@ -461,7 +470,7 @@ def build_pdf(
     else:
         for args in worker_args:
             builder.add_encoded_page(_render_and_encode_page(args))
-    builder.save(out_path)
+    builder.save(out_path, source_path=document.source_path or None)
     _set_physical_page_size(out_path, document.render.target_dpi)
     return out_path
 

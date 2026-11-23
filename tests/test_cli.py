@@ -229,3 +229,184 @@ def test_rebuild_turns_pages_that_analyze_reoriented(tmp_path):
     pipeline.rebuild("land.pdf", src, out, db_path=db, margin_mode="none")
     w, h = pdfium.PdfDocument(out)[0].get_size()
     assert h > w
+
+
+def _make_sample_pdf(path) -> tuple[str, bytes]:
+    import numpy as np
+    from PIL import Image
+
+    p = str(path)
+    Image.fromarray(np.full((200, 150, 3), 255, np.uint8)).save(p, resolution=100)
+    with open(p, "rb") as f:
+        return p, f.read()
+
+
+def _read_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def test_refuse_overwrite_direct_file(tmp_path, capsys, monkeypatch):
+    from hokusai_press.cli import main
+
+    src, orig_bytes = _make_sample_pdf(tmp_path / "scan.pdf")
+
+    called = []
+    import hokusai_press.pipeline as pipeline_mod
+    monkeypatch.setattr(pipeline_mod, "run", lambda *a, **k: called.append("run"))
+    monkeypatch.setattr(pipeline_mod, "rebuild", lambda *a, **k: called.append("rebuild"))
+    monkeypatch.setattr(
+        pipeline_mod, "recompute_shadows_and_margins", lambda *a, **k: called.append("remargin")
+    )
+
+    for argv in (
+        ["run", src, "--out", src, "--no-ocr"],
+        ["rebuild", src, "--doc", "scan.pdf", "--out", src],
+        ["remargin", src, "--out", src],
+        ["ocr", src, "--out", src],
+    ):
+        rc = main(argv)
+        out_text = capsys.readouterr().out
+        assert rc == 1
+        assert _read_bytes(src) == orig_bytes
+        assert "scan.pdf" in out_text
+        assert "--suffix" in out_text
+    assert called == []
+
+
+def test_refuse_overwrite_source_folder(tmp_path, capsys):
+    from hokusai_press.cli import main
+
+    src_dir = tmp_path / "books"
+    src_dir.mkdir()
+    src, orig_bytes = _make_sample_pdf(src_dir / "scan.pdf")
+
+    for argv in (
+        ["run", src, "--out", str(src_dir), "--no-ocr"],
+        ["rebuild", src, "--doc", "scan.pdf", "--out", str(src_dir)],
+        ["remargin", src, "--out", str(src_dir)],
+        ["ocr", src, "--out", str(src_dir)],
+    ):
+        rc = main(argv)
+        out_text = capsys.readouterr().out
+        assert rc == 1
+        assert _read_bytes(src) == orig_bytes
+        assert "scan.pdf" in out_text
+        assert "--suffix" in out_text
+
+
+def test_refuse_overwrite_case_and_relative_path(tmp_path, capsys, monkeypatch):
+    from hokusai_press.cli import main
+
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    src, orig_bytes = _make_sample_pdf(sub / "Scan.pdf")
+
+    monkeypatch.chdir(tmp_path)
+    # Relative path with parent traversal and different casing / forward slashes
+    rel_out = "./sub/../SUB/scan.pdf"
+    rc = main(["run", src, "--out", rel_out, "--no-ocr"])
+    out_text = capsys.readouterr().out
+    assert rc == 1
+    assert _read_bytes(src) == orig_bytes
+    assert rel_out in out_text
+    assert src in out_text
+    assert "--suffix" in out_text
+
+
+def test_refuse_multiple_inputs_output_collision(tmp_path, capsys):
+    from hokusai_press.cli import main
+
+    d1 = tmp_path / "d1"
+    d2 = tmp_path / "d2"
+    out_dir = tmp_path / "out"
+    d1.mkdir()
+    d2.mkdir()
+    src1, bytes1 = _make_sample_pdf(d1 / "book.pdf")
+    src2, bytes2 = _make_sample_pdf(d2 / "book.pdf")
+
+    for argv in (
+        ["run", src1, src2, "--out", str(out_dir), "--no-ocr"],
+        ["remargin", src1, src2, "--out", str(out_dir)],
+        ["ocr", src1, src2, "--out", str(out_dir)],
+    ):
+        rc = main(argv)
+        out_text = capsys.readouterr().out
+        assert rc == 1
+        assert _read_bytes(src1) == bytes1
+        assert _read_bytes(src2) == bytes2
+        assert src1 in out_text
+        assert src2 in out_text
+        assert "--suffix" in out_text
+
+
+def test_refuse_image_only_out_collision(tmp_path, capsys):
+    from hokusai_press.cli import main
+
+    src, orig_bytes = _make_sample_pdf(tmp_path / "scan.pdf")
+    out_pdf = str(tmp_path / "out.pdf")
+
+    # --image-only-out hits source
+    rc1 = main(["run", src, "--out", out_pdf, "--image-only-out", src, "--no-ocr"])
+    capsys.readouterr()
+    assert rc1 == 1
+    assert _read_bytes(src) == orig_bytes
+    assert not os.path.exists(out_pdf)
+
+    # --image-only-out hits primary --out
+    rc2 = main(["rebuild", src, "--doc", "scan.pdf", "--out", out_pdf, "--image-only-out", out_pdf])
+    capsys.readouterr()
+    assert rc2 == 1
+    assert _read_bytes(src) == orig_bytes
+
+
+def test_allow_suffix_and_different_folder(tmp_path):
+    pytest.importorskip("hybrid_ocr")
+    pytest.importorskip("pikepdf")
+
+    from hokusai_press.cli import main
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    src, orig_bytes = _make_sample_pdf(src_dir / "scan.pdf")
+    db = str(tmp_path / "j.db")
+
+    # Same folder with --suffix succeeds and preserves source
+    rc1 = main(["run", src, "--out", str(src_dir), "--suffix", "_HP", "--db", db, "--no-ocr"])
+    assert rc1 == 0
+    assert os.path.exists(src_dir / "scan_HP.pdf")
+    assert _read_bytes(src) == orig_bytes
+
+    # Different folder without --suffix succeeds and preserves source
+    out_dir = tmp_path / "out"
+    rc2 = main(["run", src, "--out", str(out_dir), "--db", db, "--no-ocr"])
+    assert rc2 == 0
+    assert os.path.exists(out_dir / "scan.pdf")
+    assert _read_bytes(src) == orig_bytes
+
+
+def test_save_safety_net_refuses_overwrite(tmp_path):
+    import numpy as np
+    from hokusai_press import pipeline
+    from hokusai_press.mrc import MrcPageBuilder
+    from hokusai_press.textlayer import image_only_copy
+
+    src, orig_bytes = _make_sample_pdf(tmp_path / "scan.pdf")
+
+    with pytest.raises(ValueError, match="refusing to overwrite"):
+        pipeline.run(src, src, db_path=str(tmp_path / "j.db"), use_ocr=False)
+    assert _read_bytes(src) == orig_bytes
+
+    with pytest.raises(ValueError, match="refusing to overwrite"):
+        pipeline.rebuild("scan.pdf", src, src, db_path=str(tmp_path / "j.db"))
+    assert _read_bytes(src) == orig_bytes
+
+    with pytest.raises(ValueError, match="refusing to overwrite"):
+        image_only_copy(src, src)
+    assert _read_bytes(src) == orig_bytes
+
+    builder = MrcPageBuilder()
+    builder.add_page(np.full((100, 100, 3), 255, np.uint8), [], [], "bw")
+    with pytest.raises(ValueError, match="refusing to overwrite"):
+        builder.save(src, source_path=src)
+    assert _read_bytes(src) == orig_bytes

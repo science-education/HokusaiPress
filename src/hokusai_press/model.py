@@ -16,6 +16,7 @@ boxes are mapped back here via SourceRef.ocr_scale.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Optional
@@ -303,3 +304,17 @@ def _decode_document(d) -> Document:
         pages=[_decode_page(p) for p in d.get("pages", [])],
         render=RenderSettings(**d.get("render", {})),
     )
+
+
+def same_path(a: str, b: str) -> bool:
+    """Return True if *a* and *b* resolve to the same filesystem path."""
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
+def refuse_overwrite(source_path: str | None, output_path: str) -> None:
+    """Raise ValueError if *output_path* resolves to the same file as *source_path*."""
+    if source_path and same_path(source_path, output_path):
+        raise ValueError(
+            f"refusing to overwrite source '{source_path}' with output '{output_path}'; "
+            "use --suffix or a different output folder"
+        )
