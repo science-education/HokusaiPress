@@ -462,6 +462,9 @@ class MrcPageBuilder:
                 if page["vector_fills"]:
                     _add_vector_fills(out, dest, page["vector_fills"], page["h"])
                 _add_overlay_named(dest, text_pdf.pages[i], None, f"/HPText{i}")
+            from .model import ensure_parent_dir
+
+            ensure_parent_dir(output_path)
             out.save(output_path, deterministic_id=True)
         finally:
             for s in sources:

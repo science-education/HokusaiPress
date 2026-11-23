@@ -889,3 +889,53 @@ def test_skip_existing_checks_out_pdf_image_only_and_db(tmp_path, capsys):
     assert "[OK] a.pdf:" in out_text
     assert img_pdf.exists()
 
+
+def test_output_parent_dirs_created_before_save(tmp_path):
+    """A10: _resolve_out, identify --csv, learn --out, and image_only_copy create
+    missing parent directories before writing."""
+    from hokusai_press import learn as learn_mod
+    from hokusai_press.cli import _resolve_out, main
+    from hokusai_press.model import (
+        Box, Deskew, Margin, PageKind, PageParams, Region, RegionKind, SourceRef,
+    )
+    from hokusai_press.store import Store
+
+    # 1. _resolve_out with a file path (has .pdf extension) creates parent dir
+    nested_pdf = tmp_path / "missing_a" / "nested_b" / "book.pdf"
+    resolved = _resolve_out(str(nested_pdf), "in.pdf")
+    assert resolved == str(nested_pdf)
+    assert nested_pdf.parent.is_dir()
+
+    # 2. identify --csv creates missing parent dir
+    src_pdf = _make_npage_pdf(tmp_path / "src.pdf", 1)
+    csv_out = tmp_path / "csv_dir" / "sub" / "proposals.csv"
+    assert main(["identify", src_pdf, "--csv", str(csv_out)]) == 0
+    assert csv_out.is_file()
+
+    # 3. learn --out creates missing parent dir
+    db = str(tmp_path / "learn.db")
+    st = Store(db)
+    try:
+        for i in range(6):
+            kind = PageKind.BW if i < 3 else PageKind.GRAY
+            p = PageParams(
+                source=SourceRef(path=src_pdf, page_index=i),
+                dpi=300.0,
+                deskew=Deskew(0.0, 1.0),
+                margin=Margin(content=Box(10, 10, 90, 90), confidence=1.0),
+                regions=[Region(RegionKind.TEXT, Box(10, 10, 90, 90))],
+                page_kind=kind,
+            )
+            st.upsert_page("src.pdf", i, p)
+            st.log_decision(
+                "src.pdf", i, "human", "page_kind", "auto", kind.value,
+                learn_mod.page_features(p),
+            )
+    finally:
+        st.close()
+    model_out = tmp_path / "model_dir" / "sub" / "model.json"
+    assert main(["learn", "--db", db, "--out", str(model_out)]) == 0
+    assert model_out.is_file()
+    assert learn_mod.load(str(model_out)) is not None
+
+

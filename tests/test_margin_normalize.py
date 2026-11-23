@@ -373,3 +373,22 @@ def test_full_bleed_sheet_far_too_large_is_still_shrunk():
     big = _numbered_page(9, Box(0, 0, tw * 1.6, th * 1.6), tw * 1.6, th * 1.6, None, dpi=300)
     normalize_margins(body + [big], output_margin_mm=5.0)
     assert not big.margin.fill
+
+
+def test_image_without_dpi_keeps_requested_margin_mm_at_render():
+    """A11: When dpi is None (e.g. PNG/JPEG without DPI metadata), normalize_margins
+    and render.compose_transform must use the same DPI assumption so 5mm stays ~5mm."""
+    import pytest
+    from hokusai_press.model import RenderSettings
+    from hokusai_press.render import compose_transform
+
+    page = _numbered_page(0, Box(10, 10, 610, 1010), 620, 1020, None, dpi=None)
+    normalize_margins([page], output_margin_mm=5.0)
+    settings = RenderSettings(target_dpi=600, output_margin_mm=5.0)
+    _, (out_w, out_h), _ = compose_transform((1020, 620), page, settings)
+    # Content is 600x1000 at 600 dpi -> margin on each side should be ~5mm (not ~0.8mm)
+    margin_x_mm = ((out_w - 600) / 2) / settings.target_dpi * 25.4
+    margin_y_mm = ((out_h - 1000) / 2) / settings.target_dpi * 25.4
+    assert margin_x_mm == pytest.approx(5.0, abs=0.2)
+    assert margin_y_mm == pytest.approx(5.0, abs=0.2)
+

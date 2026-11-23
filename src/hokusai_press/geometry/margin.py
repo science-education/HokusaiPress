@@ -743,11 +743,14 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     if not have:
         return
     use_dpi = all(p.dpi for p in have)
+    # Match RenderSettings.target_dpi (600) when dpi is unknown so margin_px
+    # and the renderer's physical page size share the same pixel-to-mm scale.
+    fallback_dpi = 600.0
 
     def unit(p):  # pixels per output unit (inch, or pixel without dpi)
         return p.dpi if use_dpi else 1.0
 
-    default_margin = output_margin_mm / 25.4 * (1.0 if use_dpi else 96.0)
+    default_margin = output_margin_mm / 25.4 * (1.0 if use_dpi else fallback_dpi)
     reliable = [p for p in have if p.margin.confidence >= 0.2] or have
     UNIFORM_PCT = 97.5
     uni_w = float(np.percentile([p.margin.content.width / unit(p) for p in reliable], UNIFORM_PCT))
@@ -823,7 +826,7 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
         u = unit(p)
         tw_px, th_px = W * u, H * u
         c = p.margin.content
-        margin_px = output_margin_mm / 25.4 * (p.dpi if use_dpi else 96)
+        margin_px = output_margin_mm / 25.4 * (p.dpi if use_dpi else fallback_dpi)
         # the crop only has to CONTAIN the content (print running close to
         # the paper edge -- a full-width rule, a cover -- is legitimate); it
         # grows, and the page is scaled down, only when the content itself

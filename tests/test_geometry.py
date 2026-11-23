@@ -364,3 +364,37 @@ def test_scanner_bed_mask_covers_bed_and_pad_only():
     digital = np.full((2000, 1400), 255, np.uint8)              # flat white margin around
     digital[200:600, 300:700] = 123                             # flat gray print: no pad, no bed
     assert scanner_bed_mask(digital) is None
+
+
+def test_deskew_thin_strip_does_not_crash():
+    """C8: 1x2000 or 2000x1 image must not produce 0-sized cv2.resize target."""
+    for shape in ((2000, 1, 3), (1, 2000, 3)):
+        strip = np.full(shape, 255, np.uint8)
+        sk = find_skew(strip)
+        assert sk.angle_deg == 0.0
+
+
+def test_npu_pipelined_propagates_producer_and_consumer_errors(monkeypatch):
+    """C8: _analyze_pages_npu_pipelined must never hang when either _prep_page
+    (producer) or _finish_page (consumer) raises."""
+    import pytest
+    import hokusai_press.pipeline as pipeline_mod
+
+    # 1. Producer error
+    def bad_prep(_args):
+        raise ValueError("prep boom")
+
+    monkeypatch.setattr(pipeline_mod, "_prep_page", bad_prep)
+    with pytest.raises(ValueError, match="prep boom"):
+        pipeline_mod._analyze_pages_npu_pipelined([1, 2, 3])
+
+    # 2. Consumer error with >maxsize items so producer could block on queue.put
+    monkeypatch.setattr(pipeline_mod, "_prep_page", lambda args: (None, None))
+
+    def bad_finish(_args, _sk, _ocr_up):
+        raise RuntimeError("finish boom")
+
+    monkeypatch.setattr(pipeline_mod, "_finish_page", bad_finish)
+    with pytest.raises(RuntimeError, match="finish boom"):
+        pipeline_mod._analyze_pages_npu_pipelined([1, 2, 3, 4, 5])
+

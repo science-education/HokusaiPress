@@ -170,3 +170,27 @@ def test_c5_full_page_image_with_invisible_ocr_text_extracts_directly(tmp_path):
     assert ref.embedded_image_id == "img0"
     assert orig_bgr.shape == (400, 300, 3)
 
+
+def test_image_input_reads_dpi_metadata_and_handles_missing_dpi(tmp_path):
+    """A11: PNG/JPEG with DPI metadata returns that DPI; without DPI returns None."""
+    from PIL import Image
+
+    from hokusai_press.source import load_page, load_single
+
+    arr = np.full((100, 80, 3), 255, dtype=np.uint8)
+    with_dpi = tmp_path / "with_dpi.png"
+    Image.fromarray(arr).save(str(with_dpi), dpi=(300, 300))
+
+    _, _, _, dpi1 = next(load_page(str(with_dpi)))
+    _, dpi2 = load_single(str(with_dpi), 0)
+    assert dpi1 == pytest.approx(300.0, abs=1.0)
+    assert dpi2 == pytest.approx(300.0, abs=1.0)
+
+    no_dpi = tmp_path / "no_dpi.png"
+    Image.fromarray(arr).save(str(no_dpi))
+    _, _, _, dpi3 = next(load_page(str(no_dpi)))
+    _, dpi4 = load_single(str(no_dpi), 0)
+    assert dpi3 is None
+    assert dpi4 is None
+
+

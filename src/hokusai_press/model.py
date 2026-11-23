@@ -318,3 +318,11 @@ def refuse_overwrite(source_path: str | None, output_path: str) -> None:
             f"refusing to overwrite source '{source_path}' with output '{output_path}'; "
             "use --suffix or a different output folder"
         )
+
+
+def ensure_parent_dir(path: str) -> str:
+    """Create the parent directory of *path* if it does not exist; return *path*."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return path

@@ -42,6 +42,24 @@ def _imread_unicode(path: str) -> np.ndarray:
     return img
 
 
+def _read_image_dpi(path: str) -> float | None:
+    """Return image DPI from PIL metadata if present and valid, else None."""
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            dpi_info = im.info.get("dpi")
+            if isinstance(dpi_info, (tuple, list)) and len(dpi_info) >= 2:
+                dx, dy = float(dpi_info[0]), float(dpi_info[1])
+                if dx > 1.0 and dy > 1.0:
+                    return (dx + dy) / 2.0
+            elif isinstance(dpi_info, (int, float)) and float(dpi_info) > 1.0:
+                return float(dpi_info)
+    except Exception:
+        pass
+    return None
+
+
 def _downscale_for_ocr(img: np.ndarray, src_dpi: float | None) -> tuple[np.ndarray, float]:
     """Return (ocr_image, ocr_scale). If src dpi unknown, only downscale very
     large images so OCR stays fast; ocr_scale records the mapping."""
@@ -74,8 +92,9 @@ def load_page(
         if pages is not None and 0 not in pages:
             return
         img = _imread_unicode(path)
-        ocr, scale = _downscale_for_ocr(img, None)
-        yield SourceRef(path=path, ocr_scale=scale), img, ocr, None
+        dpi = _read_image_dpi(path)
+        ocr, scale = _downscale_for_ocr(img, dpi)
+        yield SourceRef(path=path, ocr_scale=scale), img, ocr, dpi
         return
 
     import pypdfium2 as pdfium
@@ -114,7 +133,7 @@ def load_single(path: str, page_index: int) -> tuple[np.ndarray, float | None]:
                 f"cannot read page {page_index + 1} (index {page_index}) from "
                 f"single-page image '{path}'"
             )
-        return _imread_unicode(path), None
+        return _imread_unicode(path), _read_image_dpi(path)
     import pypdfium2 as pdfium
 
     with _PDFIUM_LOCK:
