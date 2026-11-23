@@ -261,3 +261,57 @@ def test_recompute_shadows_and_margins_drops_originals_and_matches_params_json(t
         assert new_jsons == ref_jsons
     finally:
         store_new.close()
+
+
+def test_recompute_shadows_and_margins_preserves_verified_nombre(tmp_path):
+    """Regression: recompute_shadows_and_margins must not clobber verified
+    nombre_box / nombre_source / page_number / nombre_text with find_content_box's
+    shape-only _detect_nombre heuristic or an OCR-only nombre.resolve wipe."""
+    from PIL import Image
+
+    pdf_path = str(tmp_path / "book_nombre.pdf")
+    # Draw body + a decoy mark in the top band that _detect_nombre would grab
+    imgs = []
+    for _ in range(5):
+        img = np.full((700, 500, 3), 255, dtype=np.uint8)
+        cv2.rectangle(img, (100, 120), (400, 560), (0, 0, 0), -1)
+        # Decoy small component in top 8% band (center) -> _detect_nombre picks this
+        cv2.rectangle(img, (240, 18), (260, 34), (0, 0, 0), -1)
+        imgs.append(Image.fromarray(img))
+    imgs[0].save(pdf_path, save_all=True, append_images=imgs[1:], resolution=100)
+
+    doc_id = "book_nombre.pdf"
+    db_path = str(tmp_path / "test_preserve.db")
+    store = Store(db_path)
+    try:
+        expected = {}
+        for i in range(5):
+            nb = Box(380.0, 620.0, 405.0, 640.0) if i % 2 == 0 else Box(95.0, 620.0, 120.0, 640.0)
+            src = "folio" if i < 3 else ("ocr" if i == 3 else None)
+            p = _make_page(pdf_path, i, Box(100, 120, 400, 560), page_w=500.0, page_h=700.0)
+            p.margin.nombre_box = nb
+            p.margin.nombre_source = src
+            p.page_number = 10 + i
+            p.nombre_text = str(10 + i)
+            expected[i] = (nb, src, 10 + i, str(10 + i))
+            store.upsert_page(doc_id, i, p)
+
+        # First run with align_nombre=False
+        recompute_shadows_and_margins(store, doc_id, pdf_path, align_nombre=False)
+        for row in store.list_pages(doc_id):
+            nb, src, pnum, ntxt = expected[row.page_index]
+            assert row.params.margin.nombre_box == nb
+            assert row.params.margin.nombre_source == src
+            assert row.params.page_number == pnum
+            assert row.params.nombre_text == ntxt
+
+        # Also run with default align_nombre=True (5 pages -> guided Pass 2a skips)
+        recompute_shadows_and_margins(store, doc_id, pdf_path, align_nombre=True)
+        for row in store.list_pages(doc_id):
+            nb, src, pnum, ntxt = expected[row.page_index]
+            assert row.params.margin.nombre_box == nb
+            assert row.params.margin.nombre_source == src
+            assert row.params.page_number == pnum
+            assert row.params.nombre_text == ntxt
+    finally:
+        store.close()

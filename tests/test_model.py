@@ -58,3 +58,19 @@ def test_reading_text():
 def test_box_dims():
     b = Box(5, 10, 25, 60)
     assert b.width == 20 and b.height == 50
+
+
+def test_margin_nombre_source_round_trip_and_legacy_decode():
+    import json
+
+    doc = _sample_doc()
+    doc.pages[0].margin.nombre_source = "folio"
+    restored = Document.from_json(doc.to_json())
+    assert restored.pages[0].margin.nombre_source == "folio"
+
+    # Legacy DB JSON without nombre_source must decode cleanly to None
+    raw = json.loads(doc.to_json())
+    raw["pages"][0]["margin"].pop("nombre_source", None)
+    legacy = Document.from_json(json.dumps(raw))
+    assert legacy.pages[0].margin.nombre_source is None
+    assert legacy.pages[0].margin.nombre_box is not None

@@ -581,6 +581,7 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
         old = ([m.nombre_box.x0, m.nombre_box.y0, m.nombre_box.x1, m.nombre_box.y1]
                if m.nombre_box else None)
         m.nombre_box = Box(edit.x0, edit.y0, edit.x1, edit.y1)
+        m.nombre_source = "manual"
         store.log_decision(doc_id, page_index, edit.decided_by, "nombre",
                            old, [edit.x0, edit.y0, edit.x1, edit.y1],
                            page_features(params))
@@ -600,6 +601,7 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
         if params.margin is None or params.margin.nombre_box is None:
             raise HTTPException(404, "no nombre to delete")
         params.margin.nombre_box = None    # normalize falls back to centering
+        params.margin.nombre_source = None
         store.log_decision(doc_id, page_index, "human", "nombre_delete",
                            None, None, page_features(params))
         store.upsert_page(doc_id, page_index, params)

@@ -119,6 +119,9 @@ class Margin:
     confidence: float = 0.0
     # nombre (page-number) anchor used to align margins across pages, if found
     nombre_box: Optional[Box] = None
+    # provenance of nombre_box: "folio" (guided / folio_digit.onnx), "ocr",
+    # "geom" (shape-only _detect_nombre), "manual" (review UI), or None (legacy)
+    nombre_source: Optional[str] = None
     # normalized output crop (deskewed coords), set by margin normalization so
     # every page in a parity group renders to the same size with the body in a
     # consistent position. Already includes the output margin. When present the
@@ -280,6 +283,7 @@ def _decode_page(d) -> PageParams:
             content=_box(margin["content"]),
             confidence=margin.get("confidence", 0.0),
             nombre_box=_box(margin.get("nombre_box")),
+            nombre_source=margin.get("nombre_source"),
             crop=_box(margin.get("crop")),
             page_w=margin.get("page_w"),
             page_h=margin.get("page_h"),

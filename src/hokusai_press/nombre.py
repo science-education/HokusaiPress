@@ -402,11 +402,13 @@ def _assign_supported(pages, cands, band, votes, supported, max_v) -> list[str]:
             p.page_number, p.nombre_text = None, None
             if p.margin:           # drop the unreliable geometric box (often in
                 p.margin.nombre_box = None   # the wrong band) for unread pages
+                p.margin.nombre_source = None
             continue
         kind, v, r = choice
         p.page_number, p.nombre_text = v, r.ocr_text
         if p.margin:
             p.margin.nombre_box = r.box
+            p.margin.nombre_source = "folio" if r.source == "nombre_reader" else "ocr"
         assigns.append((p.source.page_index, kind, v))
     _clear_gap_flags(pages)
     return _gap_warnings(assigns, {p.source.page_index: p for p in pages})
@@ -659,6 +661,7 @@ def _assign_with_position_model(
     # Position is the only thing being trusted here, so a parse failure is no
     # reason to give up on it.
     geo_box: list = [None] * len(pages)
+    geo_src: list = [None] * len(pages)
     for i, (p, cl) in enumerate(zip(pages, cands)):
         if chosen[i] is not None:
             continue
@@ -667,6 +670,7 @@ def _assign_with_position_model(
             lambda kind, off: True)
         if cand is not None:
             geo_box[i] = cand[2].box
+            geo_src[i] = "folio" if cand[2].source == "nombre_reader" else "ocr"
             continue
         for r in p.regions:
             if not r.ocr_text or _band(r.box, page_heights[i]) != band:
@@ -674,6 +678,7 @@ def _assign_with_position_model(
             if _inside_position_model(p.source.page_index, r.box,
                                       page_heights[i], page_widths[i], model):
                 geo_box[i] = r.box
+                geo_src[i] = "ocr"
                 break
 
     assigns = []
@@ -689,13 +694,28 @@ def _assign_with_position_model(
                 # ink, so the render would still show each page's real nombre
                 # offset -- the very recto/verso height mismatch we're aligning.
                 p.margin.nombre_box = geo_box[i]
+                p.margin.nombre_source = geo_src[i] if geo_box[i] is not None else None
             continue
         kind, v, r = c
         p.page_number, p.nombre_text = v, r.ocr_text
         if p.margin:
             p.margin.nombre_box = r.box
+            p.margin.nombre_source = "folio" if r.source == "nombre_reader" else "ocr"
         assigns.append((p.source.page_index, kind, v))
 
+    _clear_gap_flags(pages)
+    return _gap_warnings(assigns, {p.source.page_index: p for p in pages})
+
+
+def refresh_gap_warnings(pages: list[PageParams]) -> list[str]:
+    """Recompute PAGE_NUMBER_GAP flags and warnings from current page_number values."""
+    assigns = []
+    for p in pages:
+        if p.page_number is None:
+            continue
+        kind = "roman" if (p.nombre_text and parse_roman(p.nombre_text) == p.page_number
+                           and parse_numeral(p.nombre_text) is None) else "num"
+        assigns.append((p.source.page_index, kind, p.page_number))
     _clear_gap_flags(pages)
     return _gap_warnings(assigns, {p.source.page_index: p for p in pages})
 
