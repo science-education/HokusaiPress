@@ -38,6 +38,7 @@ class OutOfProcessEngine:
         self._proc: subprocess.Popen[str] | None = None
         self._stdout_queue: queue.Queue[str | None] = queue.Queue()
         self._stdout_thread: threading.Thread | None = None
+        self._lock = threading.Lock()
 
     def capabilities(self) -> dict[str, Any]:
         return {
@@ -102,40 +103,42 @@ class OutOfProcessEngine:
         self._stdout_queue.put(None)
 
     def _infer(self, image_bgr: np.ndarray) -> dict[str, Any]:
-        self._start()
-        if self._proc is None or self._proc.stdin is None or self._proc.stdout is None:
-            raise RuntimeError("worker process is not available")
+        with self._lock:
+            self._start()
+            if self._proc is None or self._proc.stdin is None or self._proc.stdout is None:
+                raise RuntimeError("worker process is not available")
 
-        tmp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(prefix="deim_oop_", suffix=".npy", delete=False) as tmp:
-                tmp_path = tmp.name
-                np.save(tmp, np.ascontiguousarray(image_bgr, dtype=np.uint8))
-            request = {"image_npy": str(Path(tmp_path).resolve())}
-            self._proc.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
-            self._proc.stdin.flush()
+            tmp_path = None
             try:
-                line = self._stdout_queue.get(timeout=self.response_timeout)
-            except queue.Empty:
-                self._proc.kill()
-                raise TimeoutError(f"worker response timed out after {self.response_timeout}s")
-            if not line:
-                rc = self._proc.poll()
-                raise RuntimeError(f"worker exited without response; returncode={rc}")
-            result = json.loads(line)
-            if "error" in result:
-                raise RuntimeError(f"worker error: {result['error']}")
-            return result
-        finally:
-            if tmp_path:
+                with tempfile.NamedTemporaryFile(prefix="deim_oop_", suffix=".npy", delete=False) as tmp:
+                    tmp_path = tmp.name
+                    np.save(tmp, np.ascontiguousarray(image_bgr, dtype=np.uint8))
+                request = {"image_npy": str(Path(tmp_path).resolve())}
+                self._proc.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+                self._proc.stdin.flush()
                 try:
-                    Path(tmp_path).unlink(missing_ok=True)
-                except OSError:
-                    pass
+                    line = self._stdout_queue.get(timeout=self.response_timeout)
+                except queue.Empty:
+                    self._proc.kill()
+                    raise TimeoutError(f"worker response timed out after {self.response_timeout}s")
+                if not line:
+                    rc = self._proc.poll()
+                    raise RuntimeError(f"worker exited without response; returncode={rc}")
+                result = json.loads(line)
+                if "error" in result:
+                    raise RuntimeError(f"worker error: {result['error']}")
+                return result
+            finally:
+                if tmp_path:
+                    try:
+                        Path(tmp_path).unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
     def close(self) -> None:
-        proc = self._proc
-        self._proc = None
+        with self._lock:
+            proc = self._proc
+            self._proc = None
         if proc is None:
             return
         try:
