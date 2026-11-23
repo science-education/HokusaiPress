@@ -86,6 +86,41 @@ def create_app(db_path: str):
             _orig_cache.popitem(last=False)
         return original
 
+    _ink_valley_cache: "dict[tuple[str, int], Optional[int]]" = {}
+
+    def _doc_ink_valley(doc_id: str) -> Optional[int]:
+        rows = store.list_pages(doc_id)
+        key = (doc_id, len(rows))
+        if key in _ink_valley_cache:
+            return _ink_valley_cache[key]
+        import cv2
+        from ..geometry.margin import document_ink_valley
+        from ..source import load_single, orient
+
+        def _grays():
+            for r in rows:
+                src = r.params.source
+                ckey = (src.path, src.page_index, tuple(src.paper or ()), src.rotate)
+                if ckey in _orig_cache:
+                    img = _orig_cache[ckey]
+                else:
+                    img = orient(load_single(src.path, src.page_index)[0], src)
+                yield cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+
+        valley = document_ink_valley(_grays())
+        _ink_valley_cache[key] = valley
+        return valley
+
+    def _next_queue_url(current_doc_id: str, current_page_index: int) -> str:
+        rows = store.review_queue()
+        if not rows:
+            return "/"
+        for r in rows:
+            if r.doc_id == current_doc_id and r.page_index > current_page_index:
+                return f"/page/{r.doc_id}/{r.page_index + 1}"
+        r0 = rows[0]
+        return f"/page/{r0.doc_id}/{r0.page_index + 1}"
+
     @app.get("/", response_class=HTMLResponse)
     def index():
         rows = store.review_queue()
@@ -210,10 +245,14 @@ def create_app(db_path: str):
 button{{padding:3px 8px}}
 </style>
 <h2>{doc_id} &mdash; page {page_index + 1}</h2>
-<p>紙面全体が同一要素なら押す:
-  <button onclick="decide('bw')">白黒二値</button>
-  <button onclick="decide('gray')">グレースケール</button>
-  <button onclick="decide('color')">カラー</button>
+<p>この頁の確認:
+  <button onclick="decide({{approve:true}})">承認して次へ</button>
+  <button onclick="decide({{finish:true}})">編集を完了して次へ</button>
+  &nbsp;&nbsp;
+  紙面全体が同一要素なら押す:
+  <button onclick="decide({{page_kind:'bw'}})">白黒二値</button>
+  <button onclick="decide({{page_kind:'gray'}})">グレースケール</button>
+  <button onclick="decide({{page_kind:'color'}})">カラー</button>
   &nbsp;&nbsp;
   <button onclick="backToQueue()">キューに戻る</button>
 </p>
@@ -320,15 +359,18 @@ async function delBox(kind){{
   location.reload();
 }}
 async function backToQueue(){{
-  // recompute every page so the book keeps a uniform page size, then return
-  await fetch('/api/doc/{doc_id}/recompute',{{method:'POST'}});
   location.href='/';
 }}
-async function decide(kind){{
-  await fetch('/api/page/{doc_id}/{page}/decide',{{method:'POST',
+async function decide(payload){{
+  if(sessionStorage.getItem('hp_needs_recompute_{doc_id}')==='1'){{
+    await fetch('/api/doc/{doc_id}/recompute',{{method:'POST'}});
+    sessionStorage.removeItem('hp_needs_recompute_{doc_id}');
+  }}
+  const res=await fetch('/api/page/{doc_id}/{page}/decide',{{method:'POST',
     headers:{{'Content-Type':'application/json'}},
-    body:JSON.stringify({{page_kind:kind}})}});
-  location.href='/';
+    body:JSON.stringify(payload)}});
+  const data=await res.json();
+  location.href=data.next_url || '/';
 }}
 async function delRegion(i){{
   // double-click deletes immediately (no confirm); re-draw if it was a mistake
@@ -360,7 +402,8 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
         row = store.get_page(doc_id, page_index)
         if row is None:
             raise HTTPException(404, "page not found")
-        png = output_preview(_load_original(row.params), row.params, RenderSettings())
+        settings = RenderSettings(ink_valley=_doc_ink_valley(doc_id))
+        png = output_preview(_load_original(row.params), row.params, settings)
         return Response(content=png, media_type="image/png",
                         headers={"Cache-Control": "no-store"})
 
@@ -414,7 +457,8 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
             store.log_decision(doc_id, page_index, decision.decided_by,
                                "finish", None, True, features)
         store.upsert_page(doc_id, page_index, params)
-        return {"status": params.review_status.value}
+        return {"status": params.review_status.value,
+                "next_url": _next_queue_url(doc_id, page_index)}
 
     @app.post("/api/page/{doc_id}/{page}/region")
     def add_region(doc_id: str, page: int, edit: RegionEdit):
@@ -501,20 +545,22 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
     @app.post("/api/page/{doc_id}/{page}/content/delete")
     def delete_content(doc_id: str, page: int):
         page_index = _page_index(page)
-        from ..geometry.margin import find_content_box
         from ..learn import page_features
+        from ..pipeline import compute_margin
 
         row = store.get_page(doc_id, page_index)
         if row is None:
             raise HTTPException(404, "page not found")
         params = row.params
         # delete = revert content to auto-detection (keeps an existing nombre)
-        detected = find_content_box(_load_original(params), params.deskew)
+        _, detected = compute_margin(_load_original(params), params.deskew, params.regions)
         if params.margin is None:
             params.margin = detected
         else:
             params.margin.content = detected.content
             params.margin.confidence = detected.confidence
+            params.margin.page_w = detected.page_w
+            params.margin.page_h = detected.page_h
         store.log_decision(doc_id, page_index, "human", "content_delete",
                            None, "re-detected", page_features(params))
         store.upsert_page(doc_id, page_index, params)
