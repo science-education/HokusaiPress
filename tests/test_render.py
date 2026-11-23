@@ -253,3 +253,152 @@ def test_compose_fill_page_scales_up_to_the_target():
     mapped = _map_box(params.margin.crop, M)
     assert abs(mapped.x0) < 1e-3 and abs(mapped.y0) < 1e-3
     assert abs(mapped.x1 - 200) < 1e-3 and abs(mapped.y1 - 400) < 1e-3
+
+
+def _box_metrics(rect_a, rect_b):
+    a = np.asarray(rect_a, dtype=np.float64)
+    b = np.asarray(rect_b, dtype=np.float64)
+    inter = np.maximum(0.0, np.minimum(a[2:], b[2:]) - np.maximum(a[:2], b[:2])).prod()
+    union = np.prod(a[2:] - a[:2]) + np.prod(b[2:] - b[:2]) - inter
+    dist = float(np.linalg.norm((a[:2] + a[2:] - b[:2] - b[2:]) / 2.0))
+    iou = float(inter / union) if union > 0 else 0.0
+    return dist, iou
+
+
+def _bounds(mask: np.ndarray) -> list[int]:
+    yy, xx = np.where(mask)
+    return [int(xx.min()), int(yy.min()), int(xx.max() + 1), int(yy.max() + 1)]
+
+
+def _save_pdf_page(path, img_bgr: np.ndarray, dpi: int = 600) -> None:
+    from PIL import Image
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen.canvas import Canvas
+
+    h, w = img_bgr.shape[:2]
+    size = (w * 72.0 / dpi, h * 72.0 / dpi)
+    c = Canvas(str(path))
+    c.setPageSize(size)
+    c.drawImage(ImageReader(Image.fromarray(img_bgr[:, :, ::-1])), 0, 0, *size)
+    c.showPage()
+    c.save()
+
+
+def test_deskewed_6deg_text_layer_overlaps_output_mark(tmp_path, monkeypatch):
+    from contextlib import closing
+    from unittest.mock import patch
+    import pypdfium2 as pdfium
+    from hokusai_press import pipeline
+
+    monkeypatch.setenv("HOKUSAI_DISABLE_NOMBRE_READER", "1")
+
+    orig = np.full((1000, 800, 3), 255, dtype=np.uint8)
+    orig[140:166, 130:170] = 0
+    for y in range(350, 820, 36):
+        for x in range(235, 610, 24):
+            orig[y:y + 9, x:x + 18] = 0
+    raw = pipeline._apply_deskew(orig, -6.0)
+    src = tmp_path / "source6.pdf"
+    _save_pdf_page(src, raw, dpi=600)
+
+    def detector(im):
+        mask = im[:, :, 0] < 128
+        mask[im.shape[0] // 3:] = False
+        return {"lines": [{"box": _bounds(mask), "text": "H"}]}
+
+    db = tmp_path / "run6.db"
+    normalized = tmp_path / "normalized6.pdf"
+    with patch("hokusai_press.ocr.get_ocr_engine", return_value=detector):
+        pipeline.run(str(src), str(normalized), db_path=str(db), use_ocr=True)
+
+    keep = tmp_path / "keep6.pdf"
+    pipeline.rebuild(src.name, str(src), str(keep), str(db), margin_mode="none")
+
+    for pdf_path in (keep, normalized):
+        with closing(pdfium.PdfDocument(str(pdf_path))) as pdf:
+            pg = pdf[0]
+            bm = pg.render(scale=600.0 / 72.0)
+            pixels = np.array(bm.to_pil().convert("RGB"))
+            mask = pixels[:, :, 0] < 128
+            n, lab, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8))
+            assert n > 1
+            idx = int(np.argmax(stats[1:, cv2.CC_STAT_AREA])) + 1
+            mark = _bounds(lab == idx)
+
+            tp = pg.get_textpage()
+            assert tp.get_text_bounded() == "H"
+            x0, b, x1, t = tp.get_charbox(0)
+            px = 600.0 / 72.0
+            char_box = [x0 * px, (pg.get_height() - t) * px, x1 * px, (pg.get_height() - b) * px]
+
+        dist, iou = _box_metrics(mark, char_box)
+        assert dist <= 5.0, f"{pdf_path.name}: center distance {dist} > 5px"
+        assert iou >= 0.3, f"{pdf_path.name}: IoU {iou} < 0.3"
+
+
+def test_deskewed_6deg_photo_region_and_margin_fill_align(tmp_path, monkeypatch):
+    from contextlib import closing
+    from unittest.mock import patch
+    import pypdfium2 as pdfium
+    from hokusai_press import pipeline, render
+    from hokusai_press.geometry.margin import remove_edge_shadows, remove_region_shadows
+
+    monkeypatch.setenv("HOKUSAI_DISABLE_NOMBRE_READER", "1")
+
+    im = np.full((1000, 800, 3), 255, dtype=np.uint8)
+    im[140:166, 130:170, 0] = np.linspace(20, 155, 40, dtype=np.uint8)
+    im[140:166, 130:170, 1] = np.linspace(30, 240, 40, dtype=np.uint8)
+    im[140:166, 130:170, 2] = np.linspace(120, 250, 40, dtype=np.uint8)
+    for y in range(180, 310, 12):
+        for x in range(140, 300, 22):
+            im[y:y + 4, x:x + 15] = 0
+    src = tmp_path / "photo_source6.pdf"
+    _save_pdf_page(src, pipeline._apply_deskew(im, -6.0), dpi=600)
+
+    def labels(ocr_im):
+        return {
+            "lines": [],
+            "layout_boxes": [{"label": "photo", "box": _bounds(np.ptp(ocr_im, axis=2) > 30)}],
+        }
+
+    with patch("hokusai_press.ocr.get_ocr_engine", return_value=labels):
+        analysis = pipeline.analyze_document(str(src))
+
+    doc = analysis.document
+    p = doc.pages[0]
+    original = analysis.originals[0]
+    assert abs(p.deskew.angle_deg - 6.0) < 0.5
+
+    for mode in ("none", "normalize"):
+        doc.render.margin_mode = mode
+        dst = tmp_path / f"photo_{mode}6.pdf"
+        render.build_pdf(doc, analysis.originals, str(dst))
+        out, _, _, boxes = render.render_page_image(original, p, doc.render)
+
+        clean = (
+            remove_edge_shadows(remove_region_shadows(original, p.regions))
+            if mode == "normalize"
+            else original
+        )
+        matrix, size, _ = render.compose_transform(original.shape, p, doc.render)
+        before = cv2.warpAffine(
+            clean, matrix, size, flags=cv2.INTER_AREA, borderValue=(255, 255, 255)
+        )
+        whitened_dark = int(np.sum((before.max(axis=2) < 100) & (out.min(axis=2) == 255)))
+        assert whitened_dark == 0
+
+        warped_photo_box = _bounds(np.ptp(out, axis=2) > 30)
+        assert len(boxes) == 1
+        overlay_box = list(boxes[0][:4])
+        dist, iou = _box_metrics(warped_photo_box, overlay_box)
+        assert dist <= 2.0
+        assert iou >= 0.8
+
+        with closing(pdfium.PdfDocument(str(dst))) as pdf:
+            pg = pdf[0]
+            rgb = np.array(pg.render(scale=600.0 / 72.0).to_pil().convert("RGB"))
+        colored_mask = np.ptp(rgb, axis=2) > 30
+        assert int(np.sum(colored_mask)) >= 900
+        _, photo_iou = _box_metrics(warped_photo_box, _bounds(colored_mask))
+        assert photo_iou >= 0.8
+
