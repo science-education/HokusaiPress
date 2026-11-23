@@ -652,6 +652,26 @@ def rebuild(doc_id: str, source_path: str, out_pdf: str,
     return {"doc_id": doc_id, "pages": len(rows), "out_pdf": out_pdf}
 
 
+_RECOMPUTED_MARGIN_FLAGS = frozenset({
+    Flag.MARGIN_NOT_FOUND,
+    Flag.MARGIN_INCONSISTENT,
+    Flag.PAGE_NUMBER_GAP,
+    Flag.CONTENT_SCALED_DOWN,
+})
+
+
+def _sync_review_status(pages: list[PageParams]) -> None:
+    """Update review_status for auto/needs_review pages from current flags.
+
+    Human-decided pages (approved / corrected) are never overwritten.
+    """
+    for p in pages:
+        if p.review_status in (ReviewStatus.AUTO, ReviewStatus.NEEDS_REVIEW):
+            p.review_status = (
+                ReviewStatus.NEEDS_REVIEW if p.flags else ReviewStatus.AUTO
+            )
+
+
 def recompute_margins(store: Store, doc_id: str,
                       output_margin_mm: float = 5.0) -> int:
     """Re-run nombre-anchored margin normalization across a document's stored
@@ -666,6 +686,7 @@ def recompute_margins(store: Store, doc_id: str,
     rows = store.list_pages(doc_id)
     pages = [r.params for r in rows]
     margin_mod.normalize_margins(pages, output_margin_mm)
+    _sync_review_status(pages)
     for p in pages:
         store.upsert_page(doc_id, p.source.page_index, p)
     return len(pages)
@@ -673,12 +694,12 @@ def recompute_margins(store: Store, doc_id: str,
 
 def _load_and_compute_margin(args):
     source_path, p = args
-    from .source import load_single
-
-    from .source import orient
+    from .source import load_single, orient
 
     original, _ = load_single(source_path, p.source.page_index)
-    return compute_margin(orient(original, p.source), p.deskew, p.regions)
+    cleaned, mg = compute_margin(orient(original, p.source), p.deskew, p.regions)
+    h, w = cleaned.shape[:2]
+    return h, w, mg
 
 
 def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
@@ -713,20 +734,24 @@ def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
             results = list(ex.map(_load_and_compute_margin, worker_args))
     else:
         results = [_load_and_compute_margin(a) for a in worker_args]
-    originals = []
-    for p, (original, mg) in zip(pages, results):
+    heights: list[int] = []
+    widths: list[int] = []
+    for p, (h, w, mg) in zip(pages, results):
         p.margin = mg
-        originals.append(original)
+        heights.append(h)
+        widths.append(w)
+
+    for p in pages:
+        p.flags = [f for f in p.flags if f not in _RECOMPUTED_MARGIN_FLAGS]
 
     from . import nombre as nombre_mod
 
-    heights = [o.shape[0] for o in originals]
-    widths = [o.shape[1] for o in originals]
     nombre_mod.resolve(pages, heights, widths)
     for p, flag in zip(pages, margin_mod.align_margins([p.margin for p in pages])):
         if flag is not None and not p.blank and flag not in p.flags:
             p.flags.append(flag)
     margin_mod.normalize_margins(pages, output_margin_mm)
+    _sync_review_status(pages)
 
     for p in pages:
         store.upsert_page(doc_id, p.source.page_index, p)
