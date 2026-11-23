@@ -122,8 +122,9 @@ def _finish_page(args, sk, ocr_up) -> tuple[PageParams, np.ndarray, Margin]:
 
     original, mg = compute_margin(original, sk, regions)
 
+    ocr_succeeded = use_ocr and (Flag.OCR_FAILED not in cflags)
     blank = False
-    if use_ocr and not regions:
+    if ocr_succeeded and not regions:
         import cv2
         from .geometry.margin import ink_threshold, remove_edge_shadows
         gg = cv2.cvtColor(remove_edge_shadows(ocr_img), cv2.COLOR_BGR2GRAY)
@@ -211,6 +212,24 @@ def analyze_document(
     originals: list[np.ndarray] = []
     margins = []
     prof: dict = defaultdict(float)
+
+    # Validate / build the OCR engine up front before loading pages or writing
+    # outputs so missing OCR dependencies fail fast with an actionable error.
+    if use_ocr:
+        from .ocr import get_ocr_engine
+
+        try:
+            get_ocr_engine(
+                ocr_engine,
+                model_dir=model_dir,
+                device=device,
+                openvino_cache_dir=openvino_cache_dir,
+                runtime=runtime,
+                layout_engine=layout_engine,
+                text_engine=text_engine,
+            )
+        except ImportError as exc:
+            raise content_mod.wrap_ocr_import_error(exc, ocr_engine) from exc
 
     # Phase A: load every page first. A document-level binarization valley needs
     # all pages in hand; originals are retained and returned anyway, so this adds
