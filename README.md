@@ -164,8 +164,8 @@ hokusai-press run scan.pdf --out book.pdf --learned-model model.json
 # 保存済みOCR領域を再利用し、影除去・余白だけを再計算して再生成
 hokusai-press remargin scan.pdf --out remargin.pdf --db hokusai.db
 
-# 0始まりのページ指定でプレビュー処理、段階別時間も表示
-hokusai-press run scan.pdf --out preview.pdf --pages 20-39 --profile
+# PDFの頁番号（1始まり）で頁を指定してプレビュー処理、段階別時間も表示
+hokusai-press run scan.pdf --out preview.pdf --pages 21-40 --profile
 ```
 
 `--no-ocr` で OCR を省略し幾何処理＋ヒューリスティック分離のみでも動作します。

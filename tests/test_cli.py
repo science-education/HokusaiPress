@@ -1,5 +1,7 @@
 import os
 
+import pytest
+
 from hokusai_press.cli import (
     _expand_sources,
     _is_folder_out,
@@ -93,12 +95,16 @@ def test_rebuild_pages_filter_limits_output_without_touching_stored_data(tmp_pat
 
 
 def test_parse_pages():
+    # PDF page numbers in (1 = the first page), 0-based page indices out
     assert _parse_pages(None) is None
     assert _parse_pages("") is None
-    assert _parse_pages("9") == {9}
-    assert _parse_pages("52,236-237") == {52, 236, 237}
-    assert _parse_pages("0-4") == {0, 1, 2, 3, 4}
-    assert _parse_pages(" 3 , 5 ") == {3, 5}
+    assert _parse_pages("10") == {9}
+    assert _parse_pages("53,237-238") == {52, 236, 237}
+    assert _parse_pages("1-5") == {0, 1, 2, 3, 4}
+    assert _parse_pages(" 4 , 6 ") == {3, 5}
+    for bad in ("0", "0-4", "5-3", "x", "3-"):
+        with pytest.raises(ValueError):
+            _parse_pages(bad)
 
 
 def test_out_file_path_is_used_verbatim(tmp_path):
