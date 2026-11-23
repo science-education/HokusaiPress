@@ -130,12 +130,13 @@ def _ranges(nums: list[int]) -> str:
 
 
 def streak_warning(found: dict[int, list[tuple[float, int]]]) -> "str | None":
-    """One warning line for a book: {page_index: streaks}."""
+    """One warning line for a book: {page_index: streaks}, the pages named
+    by their PDF page numbers (page_index + 1)."""
     found = {i: s for i, s in found.items() if s}
     if not found:
         return None
     where = sorted({round(pos * 100) for s in found.values() for pos, _w in s})
-    return (f"scanner streak on {len(found)} page(s): {_ranges(list(found))} "
+    return (f"scanner streak on {len(found)} page(s): {_ranges([i + 1 for i in found])} "
             f"(a line the full length of the scan at {', '.join(f'{p}%' for p in where)} "
             f"of the width) -- dust on the scanner glass/sensor; clean it and "
             f"rescan these pages: deskew and OCR can be thrown off")

@@ -83,7 +83,7 @@ def create_app(db_path: str):
         rows = store.review_queue()
         items = "".join(
             f'<li><a href="/page/{r.doc_id}/{r.page_index}">{r.doc_id} '
-            f"p{r.page_index}</a> &mdash; {', '.join(r.flags)}</li>"
+            f"p{r.page_index + 1}</a> &mdash; {', '.join(r.flags)}</li>"
             for r in rows
         )
         return (
@@ -200,7 +200,7 @@ def create_app(db_path: str):
 .rbox:hover{{background:rgba(221,0,0,.20);outline:2px solid var(--c)}}
 button{{padding:3px 8px}}
 </style>
-<h2>{doc_id} &mdash; page {page_index}</h2>
+<h2>{doc_id} &mdash; page {page_index + 1}</h2>
 <p>紙面全体が同一要素なら押す:
   <button onclick="decide('bw')">白黒二値</button>
   <button onclick="decide('gray')">グレースケール</button>

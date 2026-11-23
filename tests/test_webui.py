@@ -304,3 +304,10 @@ def test_page_view_has_page_kind_buttons_and_drag(tmp_path):
     assert "analysis 凡例" not in html
     # drag mapping needs the deskewed-original dims (seed image is 300x400)
     assert "ORIG_W=300" in html and "ORIG_H=400" in html
+
+
+def test_pages_are_shown_by_pdf_page_number(tmp_path):
+    db = _seed(tmp_path)                       # page_index 0 = PDF page 1
+    client = TestClient(create_app(db))
+    assert "scan.png p1</a>" in client.get("/").text
+    assert "page 1</h2>" in client.get("/page/scan.png/0").text
