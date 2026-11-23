@@ -417,6 +417,24 @@ def _apply_deskew(img: np.ndarray, angle: float) -> np.ndarray:
                           borderValue=(255, 255, 255))
 
 
+def check_doc_conflict(store: Store, path: str, doc_id: str | None = None) -> str | None:
+    """Return an English error message if *doc_id* in *store* already refers to
+    a different existing file on disk, else None."""
+    if doc_id is None:
+        doc_id = os.path.basename(path)
+    from .model import same_path
+
+    for row in store.list_pages(doc_id):
+        stored_path = row.params.source.path
+        if stored_path and not same_path(stored_path, path) and os.path.exists(stored_path):
+            return (
+                f"error: doc_id '{doc_id}' in DB already refers to existing file "
+                f"'{stored_path}', which conflicts with '{path}'; "
+                f"use a separate --db or rename one of the files"
+            )
+    return None
+
+
 def run(
     path: str,
     out_pdf: str,
@@ -439,6 +457,14 @@ def run(
     from .render import build_pdf
 
     refuse_overwrite(path, out_pdf)
+    doc_id = os.path.basename(path)
+    if os.path.exists(db_path):
+        store = Store(db_path)
+        try:
+            if err := check_doc_conflict(store, path, doc_id):
+                raise ValueError(err)
+        finally:
+            store.close()
 
     learned = learn.load(learned_model_path) if learned_model_path else None
     result = analyze_document(path, model_dir=model_dir, device=device,
@@ -450,19 +476,20 @@ def run(
                               openvino_cache_dir=openvino_cache_dir,
                               runtime=runtime, pages=pages,
                               keep_orientation=keep_orientation)
-    doc_id = os.path.basename(path)
     t = perf_counter()
     store = Store(db_path)
     try:
-        # key by the TRUE pdf page index (not enumeration) so a --pages subset
-        # keeps real page numbers in the queue / UI / rebuild
-        for params in result.document.pages:
-            store.upsert_page(doc_id, params.source.page_index, params)
-        # parameter-profile features (docs/PARAM_PROFILE_PLAN.md): geometry /
-        # structure / statistics only, never OCR text. Only on a full run -- a
-        # --pages subset must not overwrite the whole-book profile.
         if pages is None:
+            store.replace_doc_pages(doc_id, result.document.pages)
+            # parameter-profile features (docs/PARAM_PROFILE_PLAN.md): geometry /
+            # structure / statistics only, never OCR text. Only on a full run -- a
+            # --pages subset must not overwrite the whole-book profile.
             _save_profile(store, doc_id, result)
+        else:
+            # key by the TRUE pdf page index (not enumeration) so a --pages subset
+            # keeps real page numbers in the queue / UI / rebuild
+            for params in result.document.pages:
+                store.upsert_page(doc_id, params.source.page_index, params)
     finally:
         store.close()
     result.profile["db"] = perf_counter() - t
@@ -635,6 +662,8 @@ def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
     that one lock.
     """
     rows = store.list_pages(doc_id)
+    if err := check_doc_conflict(store, source_path, doc_id):
+        raise ValueError(err)
     pages = [r.params for r in rows]
     worker_args = [(source_path, p) for p in pages]
     if max_workers > 1 and len(worker_args) > 1:

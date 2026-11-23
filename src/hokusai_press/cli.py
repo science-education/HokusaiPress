@@ -35,6 +35,37 @@ def _norm_path(path: str) -> str:
     return os.path.normcase(os.path.realpath(path))
 
 
+def _check_doc_id_collisions(sources: list[str], db_path: str) -> str | None:
+    """Return an English error message if multiple inputs in *sources* share the
+    same basename (doc_id), or if any input's doc_id already exists in *db_path*
+    pointing to a different existing file on disk."""
+    from .pipeline import check_doc_conflict
+    from .store import Store
+
+    seen_basenames: dict[str, str] = {}
+    for src in sources:
+        doc_id = os.path.basename(src)
+        key = os.path.normcase(doc_id)
+        if key in seen_basenames:
+            prev = seen_basenames[key]
+            return (
+                f"error: duplicate input filename '{doc_id}': '{prev}' and "
+                f"'{src}' share the same doc_id and would collide in the DB; "
+                f"run them with separate --db paths or rename one of the files"
+            )
+        seen_basenames[key] = src
+
+    if os.path.exists(db_path):
+        store = Store(db_path)
+        try:
+            for src in sources:
+                if err := check_doc_conflict(store, src, os.path.basename(src)):
+                    return err
+        finally:
+            store.close()
+    return None
+
+
 def _check_output_collisions(
     sources: list[str],
     planned_outputs: list[tuple[str, str]],
@@ -169,7 +200,7 @@ def _print_summary(summary: dict, profile: bool) -> bool:
     return flagged
 
 
-def _merge_dbs(target_db: str, worker_dbs: list[str]) -> None:
+def _merge_dbs(target_db: str, worker_dbs: list[str], full_run: bool = True) -> None:
     """Fold each worker's pages into the target db, then remove the temp dbs."""
     from .store import Store
 
@@ -179,8 +210,12 @@ def _merge_dbs(target_db: str, worker_dbs: list[str]) -> None:
             ws = Store(wdb)
             try:
                 for doc in ws.doc_ids():
-                    for row in ws.list_pages(doc):
-                        tgt.upsert_page(doc, row.page_index, row.params)
+                    rows = ws.list_pages(doc)
+                    if full_run:
+                        tgt.replace_doc_pages(doc, [r.params for r in rows])
+                    else:
+                        for row in rows:
+                            tgt.upsert_page(doc, row.page_index, row.params)
             finally:
                 ws.close()
     finally:
@@ -416,6 +451,9 @@ def main(argv=None) -> int:
         if err := _check_output_collisions(sources, planned):
             print(err)
             return 1
+        if err := _check_doc_id_collisions(sources, args.db):
+            print(err)
+            return 1
         if args.skip_existing:
             kept = [s for s in sources
                     if not os.path.exists(_resolve_out(args.out, s, args.suffix))]
@@ -472,7 +510,7 @@ def main(argv=None) -> int:
                 for summary in ex.map(_run_one, payloads):
                     if _print_summary(summary, args.profile):
                         flagged_docs += 1
-            _merge_dbs(args.db, worker_dbs)
+            _merge_dbs(args.db, worker_dbs, full_run=(pages_sel is None))
             try:
                 os.rmdir(tmpdir)
             except OSError:
@@ -645,10 +683,14 @@ def main(argv=None) -> int:
             print(err)
             return 1
         out = _resolve_out(args.out, args.source, args.suffix)
-        summary = rebuild(args.doc, args.source, out, db_path=args.db,
-                          max_workers=args.workers,
-                          use_processes=args.process_pool,
-                          margin_mode=args.margin_mode)
+        try:
+            summary = rebuild(args.doc, args.source, out, db_path=args.db,
+                              max_workers=args.workers,
+                              use_processes=args.process_pool,
+                              margin_mode=args.margin_mode)
+        except ValueError as e:
+            print(f"error: {e}")
+            return 1
         print(f"[OK] rebuilt {summary['doc_id']}: {summary['pages']} pages "
               f"-> {summary['out_pdf']}", flush=True)
         if args.image_only_out:
@@ -674,6 +716,9 @@ def main(argv=None) -> int:
         if err := _check_output_collisions(sources, planned):
             print(err)
             return 1
+        if err := _check_doc_id_collisions(sources, args.db):
+            print(err)
+            return 1
 
         try:
             pages_sel = _parse_pages(args.pages)
@@ -685,13 +730,17 @@ def main(argv=None) -> int:
             for src in sources:
                 doc_id = os.path.basename(src)
                 out = _resolve_out(args.out, src)
-                n = recompute_shadows_and_margins(
-                    store, doc_id, src, output_margin_mm=args.output_margin_mm,
-                    max_workers=args.workers)
-                summary = rebuild(doc_id, src, out, db_path=args.db,
-                                  max_workers=args.workers,
-                                  use_processes=args.process_pool,
-                                  pages=pages_sel)
+                try:
+                    n = recompute_shadows_and_margins(
+                        store, doc_id, src, output_margin_mm=args.output_margin_mm,
+                        max_workers=args.workers)
+                    summary = rebuild(doc_id, src, out, db_path=args.db,
+                                      max_workers=args.workers,
+                                      use_processes=args.process_pool,
+                                      pages=pages_sel)
+                except ValueError as e:
+                    print(f"error: {e}")
+                    return 1
                 print(f"[OK] remargin {doc_id}: {n} pages recomputed (no OCR), "
                       f"{summary['pages']} rendered -> {summary['out_pdf']}")
         finally:
