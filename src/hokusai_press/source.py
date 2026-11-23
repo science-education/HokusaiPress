@@ -105,14 +105,31 @@ def load_page(
 
 def load_single(path: str, page_index: int) -> tuple[np.ndarray, float | None]:
     """Re-extract one page's original image (for the review UI / re-render)."""
+    if not os.path.exists(path):
+        raise ValueError(f"source file not found: '{path}'")
     ext = os.path.splitext(path)[1].lower()
     if ext != ".pdf":
+        if page_index != 0:
+            raise ValueError(
+                f"cannot read page {page_index + 1} (index {page_index}) from "
+                f"single-page image '{path}'"
+            )
         return _imread_unicode(path), None
     import pypdfium2 as pdfium
 
     with _PDFIUM_LOCK:
-        doc = pdfium.PdfDocument(path)
         try:
+            doc = pdfium.PdfDocument(path)
+        except Exception as e:
+            raise ValueError(f"cannot open source PDF '{path}': {e}") from e
+        try:
+            n = len(doc)
+            if page_index < 0 or page_index >= n:
+                raise ValueError(
+                    f"source PDF '{path}' has only {n} page(s), but DB expects "
+                    f"page {page_index + 1} (index {page_index}); re-run "
+                    f"`hokusai-press run` on '{path}' to update the DB"
+                )
             original, dpi, _ = _extract_original(doc[page_index], doc, page_index)
         finally:
             doc.close()

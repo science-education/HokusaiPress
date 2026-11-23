@@ -169,6 +169,45 @@ class Store:
             )
             self.conn.commit()
 
+    def replace_doc_pages(self, doc_id: str, pages: list[PageParams]) -> None:
+        """Upsert all pages for *doc_id* and prune any stale rows with
+        page_index >= len(pages) in a single transaction."""
+        now = time.time()
+        n = len(pages)
+        rows = [
+            (
+                doc_id,
+                p.source.page_index,
+                json.dumps(_page_to_dict(p), ensure_ascii=False),
+                p.review_status.value,
+                json.dumps([f.value for f in p.flags]),
+                now,
+            )
+            for p in pages
+        ]
+        with self._lock:
+            with self.conn:
+                self.conn.executemany(
+                    "INSERT INTO pages(doc_id, page_index, params_json, review_status, "
+                    "flags, updated_at) VALUES(?,?,?,?,?,?) "
+                    "ON CONFLICT(doc_id, page_index) DO UPDATE SET "
+                    "params_json=excluded.params_json, review_status=excluded.review_status, "
+                    "flags=excluded.flags, updated_at=excluded.updated_at",
+                    rows,
+                )
+                self.conn.execute(
+                    "DELETE FROM pages WHERE doc_id=? AND page_index>=?",
+                    (doc_id, n),
+                )
+                self.conn.execute(
+                    "DELETE FROM page_feature WHERE book_id=? AND page_index>=?",
+                    (doc_id, n),
+                )
+                self.conn.execute(
+                    "DELETE FROM region_feature WHERE book_id=? AND page_index>=?",
+                    (doc_id, n),
+                )
+
     def get_page(self, doc_id: str, page_index: int) -> Optional[PageRow]:
         with self._lock:
             row = self.conn.execute(

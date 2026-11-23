@@ -410,3 +410,202 @@ def test_save_safety_net_refuses_overwrite(tmp_path):
     with pytest.raises(ValueError, match="refusing to overwrite"):
         builder.save(src, source_path=src)
     assert _read_bytes(src) == orig_bytes
+
+
+def _make_npage_pdf(path, n_pages: int) -> str:
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    imgs = []
+    for i in range(n_pages):
+        arr = np.full((300, 200, 3), 255, np.uint8)
+        cv2.rectangle(arr, (20, 20), (180, 280), (0, 0, 0), 2)
+        cv2.putText(arr, f"P{i + 1}", (60, 150), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 2)
+        imgs.append(Image.fromarray(arr))
+    p = str(path)
+    imgs[0].save(p, save_all=True, append_images=imgs[1:], resolution=100)
+    return p
+
+
+def test_doc_conflict_different_folders_both_exist(tmp_path, capsys):
+    """A/scan.pdf -> B/scan.pdf (both exist): 2nd run and remargin fail with exit code 1,
+    and DB stays pointing to A."""
+    pytest.importorskip("pikepdf")
+    from hokusai_press.cli import main
+    from hokusai_press.model import same_path
+    from hokusai_press.store import Store
+
+    dir_a = tmp_path / "A"
+    dir_b = tmp_path / "B"
+    out_a = tmp_path / "outA"
+    out_b = tmp_path / "outB"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    pdf_a = _make_npage_pdf(dir_a / "scan.pdf", 3)
+    pdf_b = _make_npage_pdf(dir_b / "scan.pdf", 2)
+    db = str(tmp_path / "hokusai.db")
+
+    rc1 = main(["run", pdf_a, "--out", str(out_a), "--db", db, "--no-ocr"])
+    assert rc1 == 0
+    capsys.readouterr()
+
+    rc2 = main(["run", pdf_b, "--out", str(out_b), "--db", db, "--no-ocr"])
+    out2 = capsys.readouterr().out
+    assert rc2 == 1
+    assert pdf_a in out2 and pdf_b in out2
+    assert "--db" in out2
+
+    rc_rem = main(["remargin", pdf_b, "--out", str(out_b), "--db", db])
+    out_rem = capsys.readouterr().out
+    assert rc_rem == 1
+    assert pdf_a in out_rem and pdf_b in out_rem
+
+    store = Store(db)
+    try:
+        rows = store.list_pages("scan.pdf")
+        assert len(rows) == 3
+        assert all(same_path(r.params.source.path, pdf_a) for r in rows)
+    finally:
+        store.close()
+
+
+def test_doc_moved_after_original_deleted_replaces_pages(tmp_path):
+    """After processing A/scan.pdf (3 pages), delete A and run B/scan.pdf (2 pages):
+    succeeds, all stored pages come from B, and count matches B (no trailing old rows)."""
+    pytest.importorskip("pikepdf")
+    from hokusai_press.cli import main
+    from hokusai_press.model import same_path
+    from hokusai_press.store import Store
+
+    dir_a = tmp_path / "A"
+    dir_b = tmp_path / "B"
+    out_dir = tmp_path / "out"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    pdf_a = _make_npage_pdf(dir_a / "scan.pdf", 3)
+    pdf_b = _make_npage_pdf(dir_b / "scan.pdf", 2)
+    db = str(tmp_path / "hokusai.db")
+
+    assert main(["run", pdf_a, "--out", str(out_dir), "--db", db, "--no-ocr"]) == 0
+    os.remove(pdf_a)
+
+    assert main(["run", pdf_b, "--out", str(out_dir), "--db", db, "--no-ocr"]) == 0
+
+    store = Store(db)
+    try:
+        rows = store.list_pages("scan.pdf")
+        assert [r.page_index for r in rows] == [0, 1]
+        assert all(same_path(r.params.source.path, pdf_b) for r in rows)
+        assert len(store.page_features("scan.pdf")) == 2
+    finally:
+        store.close()
+
+    # Rebuild on B succeeds without trying to read non-existent page 3
+    rebuilt = str(tmp_path / "rebuilt_b.pdf")
+    assert main(["rebuild", pdf_b, "--doc", "scan.pdf", "--out", rebuilt, "--db", db]) == 0
+    assert os.path.exists(rebuilt)
+
+
+def test_same_path_replaced_with_shorter_pdf_prunes_trailing_pages(tmp_path):
+    """Replacing the same source path from 3 pages to 1 page and running full-page analysis
+    leaves exactly 1 row in DB."""
+    pytest.importorskip("pikepdf")
+    from hokusai_press.cli import main
+    from hokusai_press.store import Store
+
+    src = tmp_path / "scan.pdf"
+    out_dir = tmp_path / "out"
+    db = str(tmp_path / "hokusai.db")
+
+    _make_npage_pdf(src, 3)
+    assert main(["run", str(src), "--out", str(out_dir), "--db", db, "--no-ocr"]) == 0
+
+    _make_npage_pdf(src, 1)
+    assert main(["run", str(src), "--out", str(out_dir), "--db", db, "--no-ocr"]) == 0
+
+    store = Store(db)
+    try:
+        rows = store.list_pages("scan.pdf")
+        assert [r.page_index for r in rows] == [0]
+        assert len(store.page_features("scan.pdf")) == 1
+    finally:
+        store.close()
+
+
+def test_partial_pages_run_preserves_other_pages(tmp_path):
+    """--pages partial processing must NOT delete other pages in DB."""
+    pytest.importorskip("pikepdf")
+    from hokusai_press.cli import main
+    from hokusai_press.store import Store
+
+    src = _make_npage_pdf(tmp_path / "scan.pdf", 3)
+    out_dir = tmp_path / "out"
+    db = str(tmp_path / "hokusai.db")
+
+    assert main(["run", src, "--out", str(out_dir), "--db", db, "--no-ocr"]) == 0
+    assert main(["run", src, "--out", str(out_dir), "--db", db, "--no-ocr", "--pages", "1"]) == 0
+
+    store = Store(db)
+    try:
+        rows = store.list_pages("scan.pdf")
+        assert [r.page_index for r in rows] == [0, 1, 2]
+        assert len(store.page_features("scan.pdf")) == 3
+    finally:
+        store.close()
+
+
+def test_single_run_duplicate_basenames_fails(tmp_path, capsys):
+    """A single run with dir1/x.pdf and dir2/x.pdf fails before processing."""
+    from hokusai_press.cli import main
+    from hokusai_press.store import Store
+
+    d1 = tmp_path / "dir1"
+    d2 = tmp_path / "dir2"
+    out_dir = tmp_path / "out"
+    d1.mkdir()
+    d2.mkdir()
+    p1 = _make_npage_pdf(d1 / "x.pdf", 1)
+    p2 = _make_npage_pdf(d2 / "x.pdf", 1)
+    db = str(tmp_path / "hokusai.db")
+
+    # Even if output collision were avoided or checked, duplicate doc_id must fail cleanly.
+    rc = main(["run", p1, p2, "--out", str(out_dir), "--db", db, "--no-ocr"])
+    out_text = capsys.readouterr().out
+    assert rc == 1
+    assert p1 in out_text and p2 in out_text
+    if os.path.exists(db):
+        s = Store(db)
+        try:
+            assert s.doc_ids() == []
+        finally:
+            s.close()
+
+
+def test_rebuild_with_fewer_pdf_pages_than_db_reports_clean_error(tmp_path, capsys):
+    """If DB has 3 pages but the PDF on disk only has 1 page, rebuild prints a clear error
+    and exits with code 1 instead of crashing with a raw traceback."""
+    pytest.importorskip("pikepdf")
+    from hokusai_press.cli import main
+    from hokusai_press.model import Box, Deskew, Margin, PageParams, SourceRef
+    from hokusai_press.store import Store
+
+    src = _make_npage_pdf(tmp_path / "short.pdf", 1)
+    db = str(tmp_path / "hokusai.db")
+    store = Store(db)
+    for i in range(3):
+        store.upsert_page("short.pdf", i, PageParams(
+            source=SourceRef(path=src, page_index=i),
+            deskew=Deskew(),
+            margin=Margin(content=Box(20, 20, 180, 280), confidence=1.0),
+        ))
+    store.close()
+
+    out_pdf = str(tmp_path / "rebuilt.pdf")
+    rc = main(["rebuild", src, "--doc", "short.pdf", "--out", out_pdf, "--db", db])
+    out_text = capsys.readouterr().out
+    assert rc == 1
+    assert "error:" in out_text
+    assert "short.pdf" in out_text
