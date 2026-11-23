@@ -166,25 +166,45 @@ def _analyze_pages_npu_pipelined(worker_args):
     import threading
 
     prep_q: "queue.Queue" = queue.Queue(maxsize=2)
-    SENTINEL = object()
+    stop = threading.Event()
+
+    def _put_until_stopped(msg) -> bool:
+        while not stop.is_set():
+            try:
+                prep_q.put(msg, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def producer():
-        for args in worker_args:
-            prep_q.put((args, *_prep_page(args)))
-        prep_q.put(SENTINEL)
+        try:
+            for args in worker_args:
+                if stop.is_set():
+                    return
+                item = (args, *_prep_page(args))
+                if not _put_until_stopped(("ok", item)):
+                    return
+        except Exception as exc:
+            _put_until_stopped(("error", exc))
+        else:
+            _put_until_stopped(("done", None))
 
     th = threading.Thread(target=producer, daemon=True)
     th.start()
     try:
         results = []
         while True:
-            item = prep_q.get()
-            if item is SENTINEL:
+            kind, payload = prep_q.get()
+            if kind == "done":
                 break
-            args, sk, ocr_up = item
+            if kind == "error":
+                raise payload
+            args, sk, ocr_up = payload
             results.append(_finish_page(args, sk, ocr_up))
         return results
     finally:
+        stop.set()
         th.join()
 
 
@@ -472,10 +492,11 @@ def run(
 ) -> dict:
     """Full batch run: analyze, persist params, render the PDF."""
     from . import learn
-    from .model import refuse_overwrite
+    from .model import ensure_parent_dir, refuse_overwrite
     from .render import build_pdf
 
     refuse_overwrite(path, out_pdf)
+    ensure_parent_dir(out_pdf)
     doc_id = os.path.basename(path)
     if os.path.exists(db_path):
         store = Store(db_path)

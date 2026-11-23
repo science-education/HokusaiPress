@@ -147,3 +147,49 @@ def test_margin_mode_none_keeps_the_whole_page():
     s2 = RenderSettings(target_dpi=300)
     out2, _, _, _ = render_page_image(orig, p, s2)
     assert out2.shape[:2] != (1000, 700) or out2[30, 100].min() > 200
+
+
+@pytest.mark.parametrize("inherited", [False, True])
+def test_reocr_rejects_rotated_pdf_before_running_ocr(tmp_path, inherited):
+    """A9: ocr_pdf must detect /Rotate (including inherited /Pages /Rotate)
+    before running OCR on any page."""
+    from hokusai_press.reocr import ocr_pdf
+
+    src, rotated, out = tmp_path / "scan.pdf", tmp_path / "rot.pdf", tmp_path / "out.pdf"
+    _scan_pdf(src)
+    with pikepdf.open(src) as pdf:
+        if inherited:
+            pdf.Root.Pages["/Rotate"] = 90
+        else:
+            pdf.pages[0].obj["/Rotate"] = 90
+        pdf.save(rotated)
+
+    calls = 0
+
+    def counting_engine(_img):
+        nonlocal calls
+        calls += 1
+        return {"lines": []}
+
+    with pytest.raises(NotImplementedError, match="/Rotate 90"):
+        ocr_pdf(str(rotated), str(out), counting_engine)
+    assert calls == 0
+
+
+def test_overlay_text_resolves_inherited_cropbox(tmp_path):
+    """A9: overlay_text uses pikepdf's page.cropbox so inherited /CropBox works."""
+    src, cropped, out = tmp_path / "scan.pdf", tmp_path / "crop.pdf", tmp_path / "out.pdf"
+    _scan_pdf(src)
+    with pikepdf.open(src) as pdf:
+        mb = [float(v) for v in pdf.pages[0].mediabox]
+        # Inherit a half-height CropBox from /Pages
+        pdf.Root.Pages["/CropBox"] = pikepdf.Array([mb[0], mb[1], mb[2], mb[3] / 2])
+        pdf.save(cropped)
+
+    textlayer.overlay_text(
+        str(cropped),
+        [(W, H // 2, [{"box": (100, 50, 500, 120), "text": "継承CropBox", "direction": "h"}])],
+        str(out),
+    )
+    assert "継承CropBox" in _text(out)
+

@@ -28,6 +28,10 @@ def _resolve_out(out: str, source: str, suffix: str = "", mkdir: bool = True) ->
             os.makedirs(out, exist_ok=True)
         stem = os.path.splitext(os.path.basename(source))[0]
         return os.path.join(out, stem + suffix + ".pdf")
+    if mkdir:
+        from .model import ensure_parent_dir
+
+        ensure_parent_dir(out)
     return out
 
 
@@ -632,12 +636,14 @@ def main(argv=None) -> int:
     if args.command == "identify":
         import csv
 
+        from .model import ensure_parent_dir
         from .naming import identify
 
         sources = _expand_sources(args.source)
         if not sources:
             print("no input files matched")
             return 1
+        ensure_parent_dir(args.csv)
         rows = []
         for src in sources:
             suffix = args.suffix
@@ -744,6 +750,8 @@ def main(argv=None) -> int:
             print(err)
             return 1
         out = _resolve_out(args.out, args.source, args.suffix)
+        bare = (_resolve_out(args.image_only_out, args.source, args.suffix)
+                if args.image_only_out else None)
         try:
             summary = rebuild(args.doc, args.source, out, db_path=args.db,
                               max_workers=args.workers,
@@ -754,10 +762,9 @@ def main(argv=None) -> int:
             return 1
         print(f"[OK] rebuilt {summary['doc_id']}: {summary['pages']} pages "
               f"-> {summary['out_pdf']}", flush=True)
-        if args.image_only_out:
+        if bare:
             from .textlayer import image_only_copy
 
-            bare = _resolve_out(args.image_only_out, args.source, args.suffix)
             image_only_copy(out, bare)
             print(f"  [image-only] {bare}", flush=True)
         return 0

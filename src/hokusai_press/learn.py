@@ -114,6 +114,9 @@ def is_confident(confidence: float) -> bool:
 
 
 def save(model: dict, path: str) -> None:
+    from .model import ensure_parent_dir
+
+    ensure_parent_dir(path)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(model, f, ensure_ascii=False, indent=2)
 

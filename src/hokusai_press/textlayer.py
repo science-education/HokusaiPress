@@ -288,9 +288,10 @@ def strip_text(pdf, page) -> int:
 def image_only_copy(src: str, dst: str) -> None:
     """Write src without its text layer to dst (images untouched)."""
     import pikepdf
-    from .model import refuse_overwrite
+    from .model import ensure_parent_dir, refuse_overwrite
 
     refuse_overwrite(src, dst)
+    ensure_parent_dir(dst)
     with pikepdf.open(src) as pdf:
         for page in pdf.pages:
             strip_text(pdf, page)
@@ -298,6 +299,27 @@ def image_only_copy(src: str, dst: str) -> None:
 
 
 # --- adding a text layer to an existing PDF ----------------------------------
+
+def _page_rotation(page) -> int:
+    """Return effective /Rotate (0, 90, 180, 270), resolving inherited /Parent."""
+    node = page.obj
+    while node is not None:
+        if "/Rotate" in node:
+            return int(node["/Rotate"]) % 360
+        node = node.get("/Parent")
+    return 0
+
+
+def check_no_rotated_pages(src: str) -> None:
+    """Raise NotImplementedError before OCR if any page in *src* has /Rotate."""
+    import pikepdf
+
+    with pikepdf.open(src) as pdf:
+        for page in pdf.pages:
+            rot = _page_rotation(page)
+            if rot:
+                raise NotImplementedError(f"{src}: /Rotate {rot} pages are not supported")
+
 
 def overlay_text(src: str, pages: list, dst: str, strip_existing: bool = True,
                  font_path: str | None = None) -> None:
@@ -308,12 +330,17 @@ def overlay_text(src: str, pages: list, dst: str, strip_existing: bool = True,
     and line boxes in those pixels; None leaves the page as it is."""
     import pikepdf
     from reportlab.pdfgen import canvas
-    from .model import refuse_overwrite
+    from .model import ensure_parent_dir, refuse_overwrite
 
     refuse_overwrite(src, dst)
+    ensure_parent_dir(dst)
     with pikepdf.open(src) as pdf:
         if len(pdf.pages) != len(pages):
             raise ValueError(f"{src}: {len(pdf.pages)} pages but {len(pages)} OCR results")
+        for page in pdf.pages:
+            rot = _page_rotation(page)
+            if rot:
+                raise NotImplementedError(f"{src}: /Rotate {rot} pages are not supported")
         if strip_existing:
             for page in pdf.pages:
                 strip_text(pdf, page)
@@ -321,11 +348,8 @@ def overlay_text(src: str, pages: list, dst: str, strip_existing: bool = True,
         c = canvas.Canvas(buf, pageCompression=1)
         fonts = None
         for page, ocr in zip(pdf.pages, pages):
-            rot = int(page.obj.get("/Rotate", 0)) % 360
-            if rot:
-                raise NotImplementedError(f"{src}: /Rotate {rot} pages are not supported")
             mb = [float(v) for v in page.mediabox]
-            cb = [float(v) for v in (page.obj.get("/CropBox") or page.mediabox)]
+            cb = [float(v) for v in page.cropbox]
             c.setPageSize((mb[2] - mb[0], mb[3] - mb[1]))
             if ocr is not None:
                 iw, ih, lines = ocr

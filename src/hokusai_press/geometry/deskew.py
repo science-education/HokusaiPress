@@ -38,7 +38,11 @@ def _binary(img_bgr: np.ndarray) -> np.ndarray:
     h, w = gray.shape
     if max(h, w) > WORK_MAX_SIDE:
         s = WORK_MAX_SIDE / max(h, w)
-        gray = cv2.resize(gray, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA)
+        gray = cv2.resize(
+            gray,
+            (max(1, int(w * s)), max(1, int(h * s))),
+            interpolation=cv2.INTER_AREA,
+        )
     # binding/ADF shadows and the scanner bed skew the profile (the bed's
     # axis-aligned edge against the white pad pinned img20261121_0010
     # p243-244 at 0 deg)
