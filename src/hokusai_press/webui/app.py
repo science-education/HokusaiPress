@@ -53,6 +53,14 @@ def create_app(db_path: str):
     from fastapi.responses import HTMLResponse, Response
 
     app = FastAPI(title="HokusaiPress review")
+
+    def _page_index(page: int) -> int:
+        """URLs name a page by its PDF page number (1 = the first page), as the
+        warnings, `queue` and --pages do; the store keys it 0-based."""
+        if page < 1:
+            raise HTTPException(404, "page numbers start at 1")
+        return page - 1
+
     store = Store(db_path)
 
     # Small cache of extracted originals: a single page view fires analysis.png
@@ -82,7 +90,7 @@ def create_app(db_path: str):
     def index():
         rows = store.review_queue()
         items = "".join(
-            f'<li><a href="/page/{r.doc_id}/{r.page_index}">{r.doc_id} '
+            f'<li><a href="/page/{r.doc_id}/{r.page_index + 1}">{r.doc_id} '
             f"p{r.page_index + 1}</a> &mdash; {', '.join(r.flags)}</li>"
             for r in rows
         )
@@ -92,12 +100,13 @@ def create_app(db_path: str):
             f"<ul>{items or '<li>empty</li>'}</ul>"
         )
 
-    @app.get("/page/{doc_id}/{page_index}", response_class=HTMLResponse)
-    def page_view(doc_id: str, page_index: int):
+    @app.get("/page/{doc_id}/{page}", response_class=HTMLResponse)
+    def page_view(doc_id: str, page: int):
+        page_index = _page_index(page)
         row = store.get_page(doc_id, page_index)
         if row is None:
             raise HTTPException(404, "page not found")
-        base = f"/img/{doc_id}/{page_index}"
+        base = f"/img/{doc_id}/{page}"
         # deskewed-original dimensions (= original; deskew keeps the canvas
         # size), so the browser can map a drag back to region pixels.
         oh, ow = _load_original(row.params).shape[:2]
@@ -292,14 +301,14 @@ function setMode(m){{
   }});
 }}
 async function addPhoto(x0,y0,x1,y1){{
-  await fetch('/api/page/{doc_id}/{page_index}/region',{{method:'POST',
+  await fetch('/api/page/{doc_id}/{page}/region',{{method:'POST',
     headers:{{'Content-Type':'application/json'}},
     body:JSON.stringify({{kind:'photo',tone:MODE,x0:x0,y0:y0,x1:x1,y1:y1}})}});
   location.reload();   // box appears on overlay; stays in queue until done
 }}
 async function setBox(kind,x0,y0,x1,y1){{
   // kind = content | nombre. The endpoint recomputes all pages' crops.
-  await fetch('/api/page/{doc_id}/{page_index}/'+kind,{{method:'POST',
+  await fetch('/api/page/{doc_id}/{page}/'+kind,{{method:'POST',
     headers:{{'Content-Type':'application/json'}},
     body:JSON.stringify({{x0:x0,y0:y0,x1:x1,y1:y1}})}});
   location.reload();
@@ -307,7 +316,7 @@ async function setBox(kind,x0,y0,x1,y1){{
 async function delBox(kind){{
   const label = kind==='content' ? '内容領域（削除すると自動検出に戻す）' : 'ページ番号領域';
   if(!confirm(label+'を削除し、全ページを再計算しますか？')) return;
-  await fetch('/api/page/{doc_id}/{page_index}/'+kind+'/delete',{{method:'POST'}});
+  await fetch('/api/page/{doc_id}/{page}/'+kind+'/delete',{{method:'POST'}});
   location.reload();
 }}
 async function backToQueue(){{
@@ -316,22 +325,23 @@ async function backToQueue(){{
   location.href='/';
 }}
 async function decide(kind){{
-  await fetch('/api/page/{doc_id}/{page_index}/decide',{{method:'POST',
+  await fetch('/api/page/{doc_id}/{page}/decide',{{method:'POST',
     headers:{{'Content-Type':'application/json'}},
     body:JSON.stringify({{page_kind:kind}})}});
   location.href='/';
 }}
 async function delRegion(i){{
   // double-click deletes immediately (no confirm); re-draw if it was a mistake
-  await fetch('/api/page/{doc_id}/{page_index}/region/'+i+'/delete',
+  await fetch('/api/page/{doc_id}/{page}/region/'+i+'/delete',
     {{method:'POST'}});
   location.reload();
 }}
 setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
 </script>"""
 
-    @app.get("/img/{doc_id}/{page_index}/analysis.png")
-    def analysis_png(doc_id: str, page_index: int):
+    @app.get("/img/{doc_id}/{page}/analysis.png")
+    def analysis_png(doc_id: str, page: int):
+        page_index = _page_index(page)
         from ..preview import analysis_overlay
 
         row = store.get_page(doc_id, page_index)
@@ -341,8 +351,9 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
         return Response(content=png, media_type="image/png",
                         headers={"Cache-Control": "no-store"})
 
-    @app.get("/img/{doc_id}/{page_index}/output.png")
-    def output_png(doc_id: str, page_index: int):
+    @app.get("/img/{doc_id}/{page}/output.png")
+    def output_png(doc_id: str, page: int):
+        page_index = _page_index(page)
         from ..model import RenderSettings
         from ..preview import output_preview
 
@@ -356,12 +367,14 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
     @app.get("/api/queue")
     def queue():
         return [
-            {"doc_id": r.doc_id, "page_index": r.page_index, "flags": r.flags}
+            {"doc_id": r.doc_id, "page": r.page_index + 1,
+             "page_index": r.page_index, "flags": r.flags}
             for r in store.review_queue()
         ]
 
-    @app.get("/api/page/{doc_id}/{page_index}")
-    def get_page(doc_id: str, page_index: int):
+    @app.get("/api/page/{doc_id}/{page}")
+    def get_page(doc_id: str, page: int):
+        page_index = _page_index(page)
         row = store.get_page(doc_id, page_index)
         if row is None:
             raise HTTPException(404, "page not found")
@@ -372,8 +385,9 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
 
         return json.loads(json.dumps(asdict(row.params), default=_enc))
 
-    @app.post("/api/page/{doc_id}/{page_index}/decide")
-    def decide(doc_id: str, page_index: int, decision: Decision):
+    @app.post("/api/page/{doc_id}/{page}/decide")
+    def decide(doc_id: str, page: int, decision: Decision):
+        page_index = _page_index(page)
         row = store.get_page(doc_id, page_index)
         if row is None:
             raise HTTPException(404, "page not found")
@@ -402,8 +416,9 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
         store.upsert_page(doc_id, page_index, params)
         return {"status": params.review_status.value}
 
-    @app.post("/api/page/{doc_id}/{page_index}/region")
-    def add_region(doc_id: str, page_index: int, edit: RegionEdit):
+    @app.post("/api/page/{doc_id}/{page}/region")
+    def add_region(doc_id: str, page: int, edit: RegionEdit):
+        page_index = _page_index(page)
         from ..learn import page_features
         from ..model import Box, Region, RegionKind
 
@@ -428,8 +443,9 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
         return {"status": params.review_status.value,
                 "regions": len(params.regions)}
 
-    @app.post("/api/page/{doc_id}/{page_index}/region/{index}/delete")
-    def delete_region(doc_id: str, page_index: int, index: int):
+    @app.post("/api/page/{doc_id}/{page}/region/{index}/delete")
+    def delete_region(doc_id: str, page: int, index: int):
+        page_index = _page_index(page)
         from ..learn import page_features
 
         row = store.get_page(doc_id, page_index)
@@ -459,8 +475,9 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
             params.margin = Margin(content=Box(0, 0, 1, 1), confidence=1.0)
         return params.margin
 
-    @app.post("/api/page/{doc_id}/{page_index}/content")
-    def set_content(doc_id: str, page_index: int, edit: BoxEdit):
+    @app.post("/api/page/{doc_id}/{page}/content")
+    def set_content(doc_id: str, page: int, edit: BoxEdit):
+        page_index = _page_index(page)
         from ..learn import page_features
         from ..model import Box
 
@@ -481,8 +498,9 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
         n = _recompute(doc_id)
         return {"status": params.review_status.value, "recomputed": n}
 
-    @app.post("/api/page/{doc_id}/{page_index}/content/delete")
-    def delete_content(doc_id: str, page_index: int):
+    @app.post("/api/page/{doc_id}/{page}/content/delete")
+    def delete_content(doc_id: str, page: int):
+        page_index = _page_index(page)
         from ..geometry.margin import find_content_box
         from ..learn import page_features
 
@@ -503,8 +521,9 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
         n = _recompute(doc_id)
         return {"status": params.review_status.value, "recomputed": n}
 
-    @app.post("/api/page/{doc_id}/{page_index}/nombre")
-    def set_nombre(doc_id: str, page_index: int, edit: BoxEdit):
+    @app.post("/api/page/{doc_id}/{page}/nombre")
+    def set_nombre(doc_id: str, page: int, edit: BoxEdit):
+        page_index = _page_index(page)
         from ..learn import page_features
         from ..model import Box
 
@@ -523,8 +542,9 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
         n = _recompute(doc_id)
         return {"status": params.review_status.value, "recomputed": n}
 
-    @app.post("/api/page/{doc_id}/{page_index}/nombre/delete")
-    def delete_nombre(doc_id: str, page_index: int):
+    @app.post("/api/page/{doc_id}/{page}/nombre/delete")
+    def delete_nombre(doc_id: str, page: int):
+        page_index = _page_index(page)
         from ..learn import page_features
 
         row = store.get_page(doc_id, page_index)
