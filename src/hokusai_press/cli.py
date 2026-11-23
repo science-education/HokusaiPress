@@ -200,31 +200,51 @@ def _print_summary(summary: dict, profile: bool) -> bool:
     return flagged
 
 
-def _merge_dbs(target_db: str, worker_dbs: list[str], full_run: bool = True) -> None:
-    """Fold each worker's pages into the target db, then remove the temp dbs."""
+def _merge_worker_db(target_db: str, wdb: str, full_run: bool = True) -> None:
+    """Fold one worker temp db's tables into *target_db*, then remove *wdb* on
+    success. If merging raises an exception, *wdb* is preserved on disk."""
     from .store import Store
 
-    tgt = Store(target_db)
+    ws = Store(wdb)
     try:
-        for wdb in worker_dbs:
-            ws = Store(wdb)
-            try:
-                for doc in ws.doc_ids():
-                    rows = ws.list_pages(doc)
-                    if full_run:
-                        tgt.replace_doc_pages(doc, [r.params for r in rows])
-                    else:
-                        for row in rows:
-                            tgt.upsert_page(doc, row.page_index, row.params)
-            finally:
-                ws.close()
-    finally:
-        tgt.close()
-    for wdb in worker_dbs:
+        tgt = Store(target_db)
         try:
-            os.remove(wdb)
-        except OSError:
-            pass
+            tgt.merge_from(ws, full_run=full_run)
+        finally:
+            tgt.close()
+    finally:
+        ws.close()
+    try:
+        os.remove(wdb)
+    except OSError:
+        pass
+
+
+def _merge_dbs(target_db: str, worker_dbs: list[str], full_run: bool = True) -> None:
+    """Fold each worker's tables into the target db, then remove merged temp dbs."""
+    for wdb in worker_dbs:
+        if os.path.exists(wdb):
+            _merge_worker_db(target_db, wdb, full_run=full_run)
+
+
+def _should_skip_existing(
+    src: str,
+    out_arg: str,
+    image_only_arg: str | None,
+    suffix: str,
+    docs_with_pages: set[str],
+) -> bool:
+    """True iff the primary output PDF exists, the requested image-only PDF (if
+    any) also exists, and *docs_with_pages* already contains this source's doc_id."""
+    out_pdf = _resolve_out(out_arg, src, suffix, mkdir=False)
+    if not os.path.exists(out_pdf):
+        return False
+    if image_only_arg:
+        img_pdf = _resolve_out(image_only_arg, src, suffix, mkdir=False)
+        if not os.path.exists(img_pdf):
+            return False
+    doc_id = os.path.basename(src)
+    return doc_id in docs_with_pages
 
 
 def main(argv=None) -> int:
@@ -455,8 +475,21 @@ def main(argv=None) -> int:
             print(err)
             return 1
         if args.skip_existing:
-            kept = [s for s in sources
-                    if not os.path.exists(_resolve_out(args.out, s, args.suffix))]
+            docs_with_pages: set[str] = set()
+            if os.path.exists(args.db):
+                from .store import Store
+
+                st = Store(args.db)
+                try:
+                    docs_with_pages = set(st.doc_ids())
+                finally:
+                    st.close()
+            kept = [
+                s for s in sources
+                if not _should_skip_existing(
+                    s, args.out, args.image_only_out, args.suffix, docs_with_pages
+                )
+            ]
             for s in sources:
                 if s not in kept:
                     print(f"[skip] {os.path.basename(s)}: output exists")
@@ -487,6 +520,8 @@ def main(argv=None) -> int:
             }
 
         flagged_docs = 0
+        failed = 0
+        full_run = pages_sel is None
         parallel = args.workers > 1 and len(sources) > 1
         if parallel:
             # THREAD pool in ONE process (not multiprocessing): a single NPU/OCR
@@ -496,28 +531,54 @@ def main(argv=None) -> int:
             # This makes --device npu safe in parallel -- unlike multiprocessing,
             # which opened one NPU context per process and hung the device.
             # Each thread writes its own temp db (no sqlite lock contention),
-            # merged into --db at the end.
-            from concurrent.futures import ThreadPoolExecutor
+            # merged serially on the main thread into --db as each book succeeds.
+            from concurrent.futures import ThreadPoolExecutor, as_completed
 
             tmpdir = tempfile.mkdtemp(prefix="hokusai-")
-            payloads, worker_dbs = [], []
-            for k, src in enumerate(sources):
-                wdb = os.path.join(tmpdir, f"w{k}.db")
-                worker_dbs.append(wdb)
-                payloads.append(_payload(src, wdb))
+            futures = {}
             with ThreadPoolExecutor(
                     max_workers=min(args.workers, len(sources))) as ex:
-                for summary in ex.map(_run_one, payloads):
+                for k, src in enumerate(sources):
+                    wdb = os.path.join(tmpdir, f"w{k}.db")
+                    fut = ex.submit(_run_one, _payload(src, wdb))
+                    futures[fut] = (src, wdb)
+                for fut in as_completed(futures):
+                    src, wdb = futures[fut]
+                    try:
+                        summary = fut.result()
+                    except Exception as e:
+                        failed += 1
+                        print(f"[FAIL] {os.path.basename(src)}: {e}", flush=True)
+                        if os.path.exists(wdb):
+                            try:
+                                os.remove(wdb)
+                            except OSError:
+                                pass
+                        continue
+                    try:
+                        _merge_worker_db(args.db, wdb, full_run=full_run)
+                    except Exception as e:
+                        failed += 1
+                        print(
+                            f"[FAIL] {os.path.basename(src)}: DB merge failed ({e}); "
+                            f"temp DB kept at {wdb}",
+                            flush=True,
+                        )
+                        continue
                     if _print_summary(summary, args.profile):
                         flagged_docs += 1
-            _merge_dbs(args.db, worker_dbs, full_run=(pages_sel is None))
             try:
                 os.rmdir(tmpdir)
             except OSError:
                 pass
         else:
             for src in sources:
-                summary = _run_one(_payload(src, args.db))
+                try:
+                    summary = _run_one(_payload(src, args.db))
+                except Exception as e:
+                    failed += 1
+                    print(f"[FAIL] {os.path.basename(src)}: {e}", flush=True)
+                    continue
                 if _print_summary(summary, args.profile):
                     flagged_docs += 1
 
@@ -525,7 +586,7 @@ def main(argv=None) -> int:
             print(f"[done] {len(sources)} files, {flagged_docs} need review")
         if flagged_docs:
             print("  run: hokusai-press review")
-        return 0
+        return 1 if failed else 0
 
     if args.command == "ocr":
         from .ocr import get_ocr_engine

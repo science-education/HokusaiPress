@@ -379,6 +379,135 @@ class Store:
                  binding or "", param_name)).fetchone()
         return (row["median"], row["mad"], row["n"]) if row else None
 
+    def merge_from(self, other: "Store", full_run: bool = True) -> None:
+        """Fold *other* store's tables into this store inside a single transaction.
+
+        When *full_run* is True (whole-book analysis), replaces each doc's pages
+        via replace_doc_pages (pruning stale trailing rows) and copies the
+        per-book profile tables (book, scan_profile, page_feature, region_feature).
+        When *full_run* is False (--pages subset), only upserts the processed
+        pages and leaves profile tables untouched.
+        Any rows in decisions and bucket_profile present in *other* are also
+        merged.
+        """
+        doc_ids = other.doc_ids()
+        pages_by_doc = {doc: other.list_pages(doc) for doc in doc_ids}
+        with other._lock:
+            books = other.conn.execute("SELECT * FROM book").fetchall()
+            scan_profiles = other.conn.execute("SELECT * FROM scan_profile").fetchall()
+            page_feats = other.conn.execute("SELECT * FROM page_feature").fetchall()
+            region_feats = other.conn.execute("SELECT * FROM region_feature").fetchall()
+            decisions = other.conn.execute(
+                "SELECT doc_id, page_index, decided_by, field, old_value, "
+                "new_value, features, created_at FROM decisions ORDER BY id"
+            ).fetchall()
+            buckets = other.conn.execute("SELECT * FROM bucket_profile").fetchall()
+
+        with self._lock:
+            for doc, rows in pages_by_doc.items():
+                if full_run:
+                    self.replace_doc_pages(doc, [r.params for r in rows])
+                else:
+                    for row in rows:
+                        self.upsert_page(doc, row.page_index, row.params)
+
+            with self.conn:
+                if full_run:
+                    for b in books:
+                        self.conn.execute(
+                            "INSERT INTO book(book_id,isbn,title,author,publisher,year,ndc,"
+                            "fmt,writing_dir,binding,source,confidence,resolved_at) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                            "ON CONFLICT(book_id) DO UPDATE SET isbn=excluded.isbn,"
+                            "title=excluded.title,author=excluded.author,"
+                            "publisher=excluded.publisher,year=excluded.year,ndc=excluded.ndc,"
+                            "fmt=excluded.fmt,writing_dir=excluded.writing_dir,"
+                            "binding=excluded.binding,source=excluded.source,"
+                            "confidence=excluded.confidence,resolved_at=excluded.resolved_at",
+                            (
+                                b["book_id"], b["isbn"], b["title"], b["author"],
+                                b["publisher"], b["year"], b["ndc"], b["fmt"],
+                                b["writing_dir"], b["binding"], b["source"],
+                                b["confidence"], b["resolved_at"],
+                            ),
+                        )
+                    for sp in scan_profiles:
+                        self.conn.execute(
+                            "INSERT INTO scan_profile(book_id,scanner_sig,front_end,body_end,"
+                            "page_count,ocr_pages,profile_json,created_at) "
+                            "VALUES(?,?,?,?,?,?,?,?) "
+                            "ON CONFLICT(book_id) DO UPDATE SET scanner_sig=excluded.scanner_sig,"
+                            "front_end=excluded.front_end,body_end=excluded.body_end,"
+                            "page_count=excluded.page_count,ocr_pages=excluded.ocr_pages,"
+                            "profile_json=excluded.profile_json,created_at=excluded.created_at",
+                            (
+                                sp["book_id"], sp["scanner_sig"], sp["front_end"],
+                                sp["body_end"], sp["page_count"], sp["ocr_pages"],
+                                sp["profile_json"], sp["created_at"],
+                            ),
+                        )
+                    pf_book_ids = {b["book_id"] for b in books} | {pf["book_id"] for pf in page_feats} | set(doc_ids)
+                    for bid in pf_book_ids:
+                        self.conn.execute("DELETE FROM page_feature WHERE book_id=?", (bid,))
+                    if page_feats:
+                        self.conn.executemany(
+                            "INSERT INTO page_feature(book_id,page_index,is_ocr,region_count,"
+                            "deskew_angle,deskew_conf,content_w,content_h,nombre_value,"
+                            "nombre_cx,nombre_cy,blank) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                            [
+                                (
+                                    pf["book_id"], pf["page_index"], pf["is_ocr"],
+                                    pf["region_count"], pf["deskew_angle"], pf["deskew_conf"],
+                                    pf["content_w"], pf["content_h"], pf["nombre_value"],
+                                    pf["nombre_cx"], pf["nombre_cy"], pf["blank"],
+                                )
+                                for pf in page_feats
+                            ],
+                        )
+                    rf_book_ids = {b["book_id"] for b in books} | {rf["book_id"] for rf in region_feats} | set(doc_ids)
+                    for bid in rf_book_ids:
+                        self.conn.execute("DELETE FROM region_feature WHERE book_id=?", (bid,))
+                    if region_feats:
+                        self.conn.executemany(
+                            "INSERT INTO region_feature(book_id,page_index,cls,x0,y0,x1,y1,"
+                            "conf,source) VALUES(?,?,?,?,?,?,?,?,?)",
+                            [
+                                (
+                                    rf["book_id"], rf["page_index"], rf["cls"],
+                                    rf["x0"], rf["y0"], rf["x1"], rf["y1"],
+                                    rf["conf"], rf["source"],
+                                )
+                                for rf in region_feats
+                            ],
+                        )
+
+                if decisions:
+                    self.conn.executemany(
+                        "INSERT INTO decisions(doc_id, page_index, decided_by, field, "
+                        "old_value, new_value, features, created_at) VALUES(?,?,?,?,?,?,?,?)",
+                        [
+                            (
+                                d["doc_id"], d["page_index"], d["decided_by"], d["field"],
+                                d["old_value"], d["new_value"], d["features"], d["created_at"],
+                            )
+                            for d in decisions
+                        ],
+                    )
+
+                for bp in buckets:
+                    self.conn.execute(
+                        "INSERT INTO bucket_profile(scanner,fmt,genre,writing,binding,"
+                        "param_name,median,mad,n,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(scanner,fmt,genre,writing,binding,param_name) DO "
+                        "UPDATE SET median=excluded.median,mad=excluded.mad,n=excluded.n,"
+                        "updated_at=excluded.updated_at",
+                        (
+                            bp["scanner"], bp["fmt"], bp["genre"], bp["writing"],
+                            bp["binding"], bp["param_name"], bp["median"],
+                            bp["mad"], bp["n"], bp["updated_at"],
+                        ),
+                    )
+
 
 def _page_to_dict(params: PageParams) -> dict:
     from dataclasses import asdict

@@ -609,3 +609,283 @@ def test_rebuild_with_fewer_pdf_pages_than_db_reports_clean_error(tmp_path, caps
     assert rc == 1
     assert "error:" in out_text
     assert "short.pdf" in out_text
+
+
+def _dump_db_tables(db_path: str) -> dict:
+    """Read all relevant tables from *db_path*, stripping timestamp columns so
+    serial and parallel runs can be compared for exact content equality."""
+    from hokusai_press.store import Store
+
+    s = Store(db_path)
+    try:
+        books = [
+            {k: v for k, v in dict(r).items() if k != "resolved_at"}
+            for r in s.conn.execute("SELECT * FROM book ORDER BY book_id").fetchall()
+        ]
+        scan_profiles = [
+            {k: v for k, v in dict(r).items() if k != "created_at"}
+            for r in s.conn.execute("SELECT * FROM scan_profile ORDER BY book_id").fetchall()
+        ]
+        page_features = [
+            dict(r)
+            for r in s.conn.execute(
+                "SELECT * FROM page_feature ORDER BY book_id, page_index"
+            ).fetchall()
+        ]
+        region_features = [
+            dict(r)
+            for r in s.conn.execute(
+                "SELECT * FROM region_feature ORDER BY book_id, page_index, cls, x0, y0, x1, y1"
+            ).fetchall()
+        ]
+        pages = [
+            {k: v for k, v in dict(r).items() if k != "updated_at"}
+            for r in s.conn.execute(
+                "SELECT * FROM pages ORDER BY doc_id, page_index"
+            ).fetchall()
+        ]
+        return {
+            "book": books,
+            "scan_profile": scan_profiles,
+            "page_feature": page_features,
+            "region_feature": region_features,
+            "pages": pages,
+        }
+    finally:
+        s.close()
+
+
+def test_workers_merges_all_tables_matching_serial(tmp_path):
+    """Serial (--workers 1) and parallel (--workers 2) runs on the same inputs
+    must produce identical book, scan_profile, page_feature, region_feature, and
+    pages rows (excluding timestamps), and prune stale trailing rows on full runs."""
+    pytest.importorskip("pikepdf")
+    from hokusai_press.cli import main
+    from hokusai_press.model import Box, Deskew, Margin, PageParams, SourceRef
+    from hokusai_press.store import Store
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    pdf_a = _make_npage_pdf(src_dir / "a.pdf", 2)
+    pdf_b = _make_npage_pdf(src_dir / "b.pdf", 3)
+
+    out_serial = tmp_path / "out_serial"
+    out_parallel = tmp_path / "out_parallel"
+    db_serial = str(tmp_path / "serial.db")
+    db_parallel = str(tmp_path / "parallel.db")
+
+    # Seed a stale page_index=5 row in both DBs for a.pdf to verify replace_doc_pages pruning
+    for db_p in (db_serial, db_parallel):
+        st = Store(db_p)
+        st.upsert_page(
+            "a.pdf",
+            5,
+            PageParams(
+                source=SourceRef(path=pdf_a, page_index=5),
+                deskew=Deskew(),
+                margin=Margin(content=Box(0, 0, 10, 10)),
+            ),
+        )
+        st.close()
+
+    rc_s = main(["run", pdf_a, pdf_b, "--out", str(out_serial), "--db", db_serial, "--no-ocr", "--workers", "1"])
+    rc_p = main(["run", pdf_a, pdf_b, "--out", str(out_parallel), "--db", db_parallel, "--no-ocr", "--workers", "2"])
+    assert rc_s == 0
+    assert rc_p == 0
+
+    dump_s = _dump_db_tables(db_serial)
+    dump_p = _dump_db_tables(db_parallel)
+
+    assert len(dump_p["book"]) == 2
+    assert len(dump_p["scan_profile"]) == 2
+    assert len(dump_p["page_feature"]) == 5  # 2 + 3 (stale page 5 pruned)
+    assert len(dump_p["pages"]) == 5
+    assert dump_p == dump_s
+
+
+def test_workers_partial_pages_upserts_only_without_overwriting_profile(tmp_path):
+    """With --pages on --workers 2, only the requested pages are upserted and
+    existing whole-book profile tables and other pages remain intact."""
+    pytest.importorskip("pikepdf")
+    from hokusai_press.cli import main
+    from hokusai_press.store import Store
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    pdf_a = _make_npage_pdf(src_dir / "a.pdf", 3)
+    pdf_b = _make_npage_pdf(src_dir / "b.pdf", 3)
+    out_dir = tmp_path / "out"
+    db = str(tmp_path / "hokusai.db")
+
+    assert main(["run", pdf_a, pdf_b, "--out", str(out_dir), "--db", db, "--no-ocr", "--workers", "2"]) == 0
+    before = _dump_db_tables(db)
+    assert len(before["pages"]) == 6
+    assert len(before["page_feature"]) == 6
+
+    # Partial run of page 1 only with --workers 2
+    assert main(["run", pdf_a, pdf_b, "--out", str(out_dir), "--db", db, "--no-ocr", "--workers", "2", "--pages", "1"]) == 0
+    after = _dump_db_tables(db)
+    assert len(after["pages"]) == 6
+    assert after["book"] == before["book"]
+    assert after["scan_profile"] == before["scan_profile"]
+    assert after["page_feature"] == before["page_feature"]
+
+    st = Store(db)
+    try:
+        assert [r.page_index for r in st.list_pages("a.pdf")] == [0, 1, 2]
+        assert [r.page_index for r in st.list_pages("b.pdf")] == [0, 1, 2]
+    finally:
+        st.close()
+
+
+def test_workers_one_book_fails_other_succeeds_and_merges(tmp_path, capsys, monkeypatch):
+    """When 1 of 2 books raises an exception in a worker, the successful book is
+    still merged into the target DB, [FAIL] is printed for the broken book, and
+    main returns exit code 1."""
+    pytest.importorskip("pikepdf")
+    import hokusai_press.pipeline as pipeline_mod
+    from hokusai_press.cli import main
+    from hokusai_press.store import Store
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    pdf_ok = _make_npage_pdf(src_dir / "good.pdf", 2)
+    pdf_bad = _make_npage_pdf(src_dir / "bad.pdf", 2)
+    out_dir = tmp_path / "out"
+    db = str(tmp_path / "hokusai.db")
+
+    orig_run = pipeline_mod.run
+
+    def _flaky_run(path, *args, **kwargs):
+        if os.path.basename(path) == "bad.pdf":
+            raise RuntimeError("corrupt scan simulation")
+        return orig_run(path, *args, **kwargs)
+
+    monkeypatch.setattr(pipeline_mod, "run", _flaky_run)
+
+    rc = main(["run", pdf_ok, pdf_bad, "--out", str(out_dir), "--db", db, "--no-ocr", "--workers", "2"])
+    out_text = capsys.readouterr().out
+    assert rc == 1
+    assert "[FAIL] bad.pdf: corrupt scan simulation" in out_text
+    assert "[OK] good.pdf:" in out_text
+
+    st = Store(db)
+    try:
+        assert st.doc_ids() == ["good.pdf"]
+        assert len(st.list_pages("good.pdf")) == 2
+        assert len(st.page_features("good.pdf")) == 2
+        book_row = st.conn.execute("SELECT * FROM book WHERE book_id='good.pdf'").fetchone()
+        assert book_row is not None
+        sp_row = st.conn.execute("SELECT * FROM scan_profile WHERE book_id='good.pdf'").fetchone()
+        assert sp_row is not None
+    finally:
+        st.close()
+
+
+def test_workers_keeps_temp_db_on_merge_failure(tmp_path, capsys, monkeypatch):
+    """If merging a worker's temp DB fails, the temp DB is preserved on disk and
+    its path is reported in the [FAIL] output."""
+    pytest.importorskip("pikepdf")
+    from hokusai_press.cli import main
+    from hokusai_press.store import Store
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    pdf_a = _make_npage_pdf(src_dir / "a.pdf", 1)
+    pdf_b = _make_npage_pdf(src_dir / "b.pdf", 1)
+    out_dir = tmp_path / "out"
+    db = str(tmp_path / "hokusai.db")
+
+    orig_merge = Store.merge_from
+
+    def _failing_merge(self, other, full_run=True):
+        if "b.pdf" in other.doc_ids():
+            raise RuntimeError("disk full during merge")
+        return orig_merge(self, other, full_run=full_run)
+
+    monkeypatch.setattr(Store, "merge_from", _failing_merge)
+
+    rc = main(["run", pdf_a, pdf_b, "--out", str(out_dir), "--db", db, "--no-ocr", "--workers", "2"])
+    out_text = capsys.readouterr().out
+    assert rc == 1
+    assert "[FAIL] b.pdf:" in out_text
+    assert "disk full during merge" in out_text
+
+    # Extract kept temp db path from output and verify it still exists while a.pdf's was removed
+    import re
+    m = re.search(r"temp DB kept at (\S+\.db)", out_text)
+    assert m is not None, out_text
+    kept_wdb = m.group(1)
+    assert os.path.exists(kept_wdb)
+
+    # Clean up kept temp db + dir
+    os.remove(kept_wdb)
+    try:
+        os.rmdir(os.path.dirname(kept_wdb))
+    except OSError:
+        pass
+
+
+def test_skip_existing_checks_out_pdf_image_only_and_db(tmp_path, capsys):
+    """--skip-existing only skips when primary PDF exists, requested
+    --image-only-out exists, and the target DB has pages for doc_id."""
+    pytest.importorskip("pikepdf")
+    from hokusai_press.cli import main
+    from hokusai_press.store import Store
+
+    src_dir = tmp_path / "src"
+    src_dir.mkdir()
+    pdf_a = _make_npage_pdf(src_dir / "a.pdf", 2)
+    out_dir = tmp_path / "out"
+    img_dir = tmp_path / "img"
+    db = str(tmp_path / "hokusai.db")
+
+    # 1. Full run creates out/a.pdf, img/a.pdf, and DB entries
+    assert main([
+        "run", pdf_a, "--out", str(out_dir), "--image-only-out", str(img_dir),
+        "--db", db, "--no-ocr",
+    ]) == 0
+    capsys.readouterr()
+
+    # All three present -> skipped
+    assert main([
+        "run", pdf_a, "--out", str(out_dir), "--image-only-out", str(img_dir),
+        "--db", db, "--no-ocr", "--skip-existing",
+    ]) == 0
+    out_text = capsys.readouterr().out
+    assert "[skip] a.pdf" in out_text
+
+    # 2. Remove DB pages for a.pdf (main PDF & image-only PDF still exist) -> must NOT skip
+    st = Store(db)
+    st.conn.execute("DELETE FROM pages WHERE doc_id='a.pdf'")
+    st.conn.commit()
+    st.close()
+
+    assert main([
+        "run", pdf_a, "--out", str(out_dir), "--image-only-out", str(img_dir),
+        "--db", db, "--no-ocr", "--skip-existing",
+    ]) == 0
+    out_text = capsys.readouterr().out
+    assert "[skip] a.pdf" not in out_text
+    assert "[OK] a.pdf:" in out_text
+
+    st = Store(db)
+    try:
+        assert len(st.list_pages("a.pdf")) == 2
+    finally:
+        st.close()
+
+    # 3. Remove image-only PDF (main PDF & DB pages still exist) -> must NOT skip when --image-only-out is requested
+    img_pdf = img_dir / "a.pdf"
+    os.remove(img_pdf)
+    assert not img_pdf.exists()
+
+    assert main([
+        "run", pdf_a, "--out", str(out_dir), "--image-only-out", str(img_dir),
+        "--db", db, "--no-ocr", "--skip-existing",
+    ]) == 0
+    out_text = capsys.readouterr().out
+    assert "[skip] a.pdf" not in out_text
+    assert "[OK] a.pdf:" in out_text
+    assert img_pdf.exists()
+
