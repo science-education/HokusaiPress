@@ -77,6 +77,23 @@ def _downscale_for_ocr(img: np.ndarray, src_dpi: float | None) -> tuple[np.ndarr
     return ocr, scale
 
 
+def pdf_page_sizes(path: str) -> list[tuple[float, float]]:
+    """Return (width_pt, height_pt) for each page of a PDF without decoding or
+    rendering pixels (via pypdfium2 page.get_size()). Returns [] for non-PDFs
+    or missing files."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext != ".pdf" or not os.path.exists(path):
+        return []
+    import pypdfium2 as pdfium
+
+    with _PDFIUM_LOCK:
+        doc = pdfium.PdfDocument(path)
+        try:
+            return [doc[i].get_size() for i in range(len(doc))]
+        finally:
+            doc.close()
+
+
 def load_page(
     path: str, pages: "set[int] | None" = None
 ) -> Iterator[tuple[SourceRef, np.ndarray, np.ndarray, float | None]]:

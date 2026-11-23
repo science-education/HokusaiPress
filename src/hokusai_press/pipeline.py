@@ -223,6 +223,7 @@ def analyze_document(
     pages: "set[int] | None" = None,
     max_workers: int = 4,
     keep_orientation: bool = False,
+    stored_pages: "dict[int, PageParams] | list[PageParams] | None" = None,
 ) -> AnalyzeResult:
     from .source import load_page
 
@@ -267,40 +268,82 @@ def analyze_document(
     # stored. Both are recorded in SourceRef (paper, rotate) so every later
     # load (rebuild, remargin, review UI) sees the same page.
     from . import orientation as orient_mod
-    from .source import find_paper, orient
+    from .source import find_paper, orient, pdf_page_sizes
+
+    page_sizes = pdf_page_sizes(path) if pages is not None else []
+    total_pages: int | None = (
+        len(loaded) if pages is None else (len(page_sizes) if page_sizes else None)
+    )
+    stored_map: dict[int, PageParams] | None = None
+    if pages is not None and stored_pages:
+        cand_map = (
+            dict(stored_pages)
+            if isinstance(stored_pages, dict)
+            else {p.source.page_index: p for p in stored_pages}
+        )
+        if total_pages is not None and total_pages > 0:
+            if all(i in cand_map for i in range(total_pages)):
+                stored_map = cand_map
+        elif (
+            len(cand_map) > len(loaded)
+            and set(cand_map.keys()) == set(range(len(cand_map)))
+        ):
+            stored_map = cand_map
+            total_pages = len(cand_map)
 
     reoriented: set[int] = set()
-    if len(loaded) >= 3:
-        is_landscape = [o.shape[1] > o.shape[0] for (_s, o, _w, _d) in loaded]
-        dominant_landscape = sum(is_landscape) * 2 > len(loaded)
+    if pages is not None and stored_map is not None:
         fixed = []
-        engine = None
-        for (s, o, w, d), landscape in zip(loaded, is_landscape):
-            if landscape != dominant_landscape:
-                box = find_paper(o)
-                if box is not None:
-                    s.paper = box
-                    pw, ph = box[2] - box[0], box[3] - box[1]
-                    landscape = pw > ph
-                if landscape != dominant_landscape and not keep_orientation:
-                    if use_ocr:
-                        if engine is None:
-                            from .ocr import get_ocr_engine
-
-                            engine = get_ocr_engine(
-                                ocr_engine, model_dir=model_dir, device=device,
-                                openvino_cache_dir=openvino_cache_dir,
-                                runtime=runtime, layout_engine=layout_engine,
-                                text_engine=text_engine)
-                        s.rotate, _ = orient_mod.choose_rotation(
-                            orient(w, s, s.ocr_scale), engine)
-                    else:
-                        s.rotate = 90       # no OCR to tell: flagged for review
+        for s, o, w, d in loaded:
+            sp = stored_map.get(s.page_index)
+            if sp is not None:
+                s.paper = list(sp.source.paper) if sp.source.paper is not None else None
+                s.rotate = 0 if keep_orientation else int(sp.source.rotate or 0)
+                if s.rotate:
                     reoriented.add(s.page_index)
-                o = orient(o, s)
-                w = orient(w, s, s.ocr_scale)
+                if s.paper or s.rotate:
+                    o = orient(o, s)
+                    w = orient(w, s, s.ocr_scale)
             fixed.append((s, o, w, d))
         loaded = fixed
+    else:
+        is_landscape = [o.shape[1] > o.shape[0] for (_s, o, _w, _d) in loaded]
+        dominant_landscape: bool | None = None
+        if pages is not None and len(page_sizes) >= 3:
+            all_landscape = [pw > ph for pw, ph in page_sizes]
+            dominant_landscape = sum(all_landscape) * 2 > len(all_landscape)
+        elif len(loaded) >= 3:
+            dominant_landscape = sum(is_landscape) * 2 > len(loaded)
+
+        if dominant_landscape is not None:
+            fixed = []
+            engine = None
+            for (s, o, w, d), landscape in zip(loaded, is_landscape):
+                if landscape != dominant_landscape:
+                    box = find_paper(o)
+                    if box is not None:
+                        s.paper = box
+                        pw, ph = box[2] - box[0], box[3] - box[1]
+                        landscape = pw > ph
+                    if landscape != dominant_landscape and not keep_orientation:
+                        if use_ocr:
+                            if engine is None:
+                                from .ocr import get_ocr_engine
+
+                                engine = get_ocr_engine(
+                                    ocr_engine, model_dir=model_dir, device=device,
+                                    openvino_cache_dir=openvino_cache_dir,
+                                    runtime=runtime, layout_engine=layout_engine,
+                                    text_engine=text_engine)
+                            s.rotate, _ = orient_mod.choose_rotation(
+                                orient(w, s, s.ocr_scale), engine)
+                        else:
+                            s.rotate = 90       # no OCR to tell: flagged for review
+                        reoriented.add(s.page_index)
+                    o = orient(o, s)
+                    w = orient(w, s, s.ocr_scale)
+                fixed.append((s, o, w, d))
+            loaded = fixed
 
     # 2-pass binarization valley: robust book-wide Otsu (median), so a
     # show-through page uses the book valley at render instead of a fixed floor.
@@ -407,7 +450,7 @@ def analyze_document(
                 )
                 for c in rcands
             ]
-    warnings = nombre_mod.resolve(doc.pages, heights, widths)
+    warnings = nombre_mod.resolve(doc.pages, heights, widths, total_pages=total_pages)
     from .streak import streak_warning
     w = streak_warning({p.source.page_index: getattr(p, "_streaks", [])
                         for p in doc.pages})
@@ -422,7 +465,14 @@ def analyze_document(
     for params, flag in zip(doc.pages, margin_mod.align_margins(margins)):
         if flag is not None and not params.blank:
             params.flags.append(flag)
-    margin_mod.normalize_margins(doc.pages, doc.render.output_margin_mm)
+    if pages is not None and stored_map is not None:
+        combined = dict(stored_map)
+        for params in doc.pages:
+            combined[params.source.page_index] = params
+        norm_pages = [combined[idx] for idx in sorted(combined)]
+    else:
+        norm_pages = doc.pages
+    margin_mod.normalize_margins(norm_pages, doc.render.output_margin_mm)
     prof["nombre+normalize"] += perf_counter() - t
 
     # 6. learned page-kind override (from accumulated review decisions)
@@ -498,11 +548,16 @@ def run(
     refuse_overwrite(path, out_pdf)
     ensure_parent_dir(out_pdf)
     doc_id = os.path.basename(path)
+    existing_pages: dict[int, PageParams] | None = None
     if os.path.exists(db_path):
         store = Store(db_path)
         try:
             if err := check_doc_conflict(store, path, doc_id):
                 raise ValueError(err)
+            if pages is not None:
+                existing_pages = {
+                    r.page_index: r.params for r in store.list_pages(doc_id)
+                }
         finally:
             store.close()
 
@@ -515,7 +570,8 @@ def run(
                               learned_model=learned,
                               openvino_cache_dir=openvino_cache_dir,
                               runtime=runtime, pages=pages,
-                              keep_orientation=keep_orientation)
+                              keep_orientation=keep_orientation,
+                              stored_pages=existing_pages)
     t = perf_counter()
     store = Store(db_path)
     try:
@@ -537,7 +593,7 @@ def run(
     t = perf_counter()
     build_pdf(result.document, result.originals, out_pdf)
     result.profile["render+pdf"] = perf_counter() - t
-    flagged = [i for i, p in enumerate(result.document.pages) if p.needs_review()]
+    flagged = [p.source.page_index for p in result.document.pages if p.needs_review()]
     return {
         "doc_id": doc_id,
         "pages": len(result.document.pages),

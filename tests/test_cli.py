@@ -938,4 +938,99 @@ def test_output_parent_dirs_created_before_save(tmp_path):
     assert model_out.is_file()
     assert learn_mod.load(str(model_out)) is not None
 
+def test_c9_partial_pages_normalizes_with_stored_full_book_and_returns_page_index(tmp_path):
+    """C9 & C13: When the DB already has all pages of the book, `run --pages`
+    must normalize margins using the stored other pages so a subsequent full
+    `rebuild` keeps uniform book dimensions, without overwriting the other
+    pages' DB rows. Also verifies `run()` returns true 0-based `page_index` in
+    `needs_review`."""
+    pytest.importorskip("pikepdf")
+    import numpy as np
+    import pypdfium2 as pdfium
+    from PIL import Image
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen.canvas import Canvas
+
+    from hokusai_press import pipeline
+    from hokusai_press.store import Store
+
+    def _bars(span=170, h=320, w=240):
+        arr = np.full((h, w, 3), 255, dtype=np.uint8)
+        for y in range(h // 5, 4 * h // 5, 13):
+            x = (w - span) // 2
+            arr[y:y + 4, x:x + span] = 0
+        return arr
+
+    # Page 8 (index 7) has a narrower span=105 and only 1 short bar so it triggers
+    # MARGIN_NOT_FOUND (needs_review) while testing C9 + C13 flagged page_index.
+    p8 = _bars(105)
+    src = str(tmp_path / "book.pdf")
+    c = Canvas(src)
+    for arr in [_bars(170)] * 7 + [p8]:
+        h, w = arr.shape[:2]
+        pw, ph = w * 72.0 / 600.0, h * 72.0 / 600.0
+        c.setPageSize((pw, ph))
+        c.drawImage(ImageReader(Image.fromarray(arr)), 0, 0, pw, ph)
+        c.showPage()
+    c.save()
+
+    db = str(tmp_path / "run.db")
+    full_pdf = str(tmp_path / "full.pdf")
+    pipeline.run(src, full_pdf, db_path=db, use_ocr=False)
+
+    st = Store(db)
+    try:
+        ts_before = {
+            r["page_index"]: r["updated_at"]
+            for r in st.conn.execute(
+                "SELECT page_index, updated_at FROM pages WHERE doc_id='book.pdf'"
+            ).fetchall()
+        }
+    finally:
+        st.close()
+
+    preview_pdf = str(tmp_path / "preview.pdf")
+    # Run with use_ocr=True and a stubbed content.analyze that flags NO_TEXT on page 7
+    import hokusai_press.content as content_mod
+    from hokusai_press.model import Flag
+    orig_analyze = content_mod.analyze
+    try:
+        content_mod.analyze = lambda *a, **k: ([], [Flag.NO_TEXT])
+        summary = pipeline.run(src, preview_pdf, db_path=db, use_ocr=False, pages={7})
+    finally:
+        content_mod.analyze = orig_analyze
+    # C13/A2: flagged pages in summary["needs_review"] must use true 0-based page_index (7, not 0)
+    assert summary["needs_review"] == [7]
+
+    st = Store(db)
+    try:
+        ts_after = {
+            r["page_index"]: r["updated_at"]
+            for r in st.conn.execute(
+                "SELECT page_index, updated_at FROM pages WHERE doc_id='book.pdf'"
+            ).fetchall()
+        }
+    finally:
+        st.close()
+
+    # Other pages (0..6) must not have been overwritten in DB
+    for idx in range(7):
+        assert ts_after[idx] == ts_before[idx]
+
+    rebuilt_pdf = str(tmp_path / "rebuilt.pdf")
+    pipeline.rebuild("book.pdf", src, rebuilt_pdf, db_path=db)
+
+    def _sizes(p):
+        doc = pdfium.PdfDocument(p)
+        try:
+            return [(round(doc[i].get_size()[0], 2), round(doc[i].get_size()[1], 2))
+                    for i in range(len(doc))]
+        finally:
+            doc.close()
+
+    full_sizes = _sizes(full_pdf)
+    rebuilt_sizes = _sizes(rebuilt_pdf)
+    assert len(set(full_sizes)) == 1
+    assert rebuilt_sizes == full_sizes
+
 

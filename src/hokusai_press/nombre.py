@@ -250,7 +250,8 @@ def _position_clustered_candidates(cands, pages, page_heights, page_widths, max_
             continue
         vote_pages: dict[tuple[str, int], set[int]] = {}
         for i, _, kind, v, _, _ in c["items"]:
-            vote_pages.setdefault((kind, v - i), set()).add(i)
+            pidx = pages[i].source.page_index
+            vote_pages.setdefault((kind, v - pidx), set()).add(i)
         support = max((len(s) for s in vote_pages.values()), default=0)
         if support < POS_CLUSTER_MIN_OFFSET_SUPPORT:
             continue
@@ -298,13 +299,21 @@ def resolve(
     pages: list[PageParams],
     page_heights: list[float],
     page_widths: list[float],
+    total_pages: Optional[int] = None,
 ) -> list[str]:
     """Assign page_number/nombre_text robustly and return gap warnings.
 
     Mutates each page's margin.nombre_box / page_number / nombre_text / flags.
     """
     raw_cands = [_candidates(p, h) for p, h in zip(pages, page_heights)]
-    max_v = len(pages) + 50
+    if total_pages is None and pages:
+        src_path = pages[0].source.path if pages[0].source else ""
+        if src_path and src_path.lower().endswith(".pdf") and os.path.exists(src_path):
+            from .source import pdf_page_sizes
+
+            total_pages = len(pdf_page_sizes(src_path))
+    max_idx_pages = max((p.source.page_index + 1 for p in pages), default=0)
+    max_v = max(len(pages), max_idx_pages, total_pages or 0) + 50
     # Position clustering rejects body-text fragments but currently interacts with
     # the position model so the "missing pages" gap warning can be lost. Keep it
     # opt-in until that is made gap-warning-safe (default OFF = proven behavior).
@@ -337,10 +346,11 @@ def resolve(
 
     # vote for (kind, offset) with slope 1; a real run clusters, noise scatters
     votes: Counter = Counter()
-    for i, cl in enumerate(cands):
+    for p, cl in zip(pages, cands):
+        pidx = p.source.page_index
         for b, kind, v, _ in cl:
             if b == band and v is not None and v <= max_v:
-                votes[(kind, v - i)] += 1
+                votes[(kind, v - pidx)] += 1
     supported = {k for k, c in votes.items() if c >= min_support}
     if not supported and clustered is not None:
         min_support = POS_CLUSTER_MIN_OFFSET_SUPPORT
@@ -359,12 +369,13 @@ def resolve(
         pages, assign_cands, band, votes, supported, max_v)
 
     anchors = []
-    for i, cl in enumerate(assign_cands):
+    for i, (p, cl) in enumerate(zip(pages, assign_cands)):
+        pidx = p.source.page_index
         for b, kind, v, r in cl:
-            if b != band or v is None or v > max_v or (kind, v - i) != dominant:
+            if b != band or v is None or v > max_v or (kind, v - pidx) != dominant:
                 continue
             fx, fy = _box_center_frac(r.box, page_widths[i], page_heights[i])
-            anchors.append((pages[i].source.page_index, fx, fy))
+            anchors.append((pidx, fx, fy))
             break
     model = _build_position_model(anchors, min_anchors)
     if model is None:
@@ -378,12 +389,13 @@ def resolve(
 def _assign_supported(pages, cands, band, votes, supported, max_v) -> list[str]:
     # assign each page the candidate matching the strongest supported cluster
     assigns = []  # (page_index, kind, value)
-    for i, (p, cl) in enumerate(zip(pages, cands)):
+    for p, cl in zip(pages, cands):
+        pidx = p.source.page_index
         choice, best_sup = None, -1
         for b, kind, v, r in cl:
             if b != band or v is None or v > max_v:
                 continue
-            key = (kind, v - i)
+            key = (kind, v - pidx)
             if key in supported and votes[key] > best_sup:
                 choice, best_sup = (kind, v, r), votes[key]
         if choice is None:
@@ -524,16 +536,17 @@ def _in_position_candidate(p, cl, i, band, max_v, page_heights, page_widths,
                            model, predicate):
     """Best in-position candidate satisfying predicate(kind, offset, votes-key),
     as (kind, v, r), or None."""
+    pidx = p.source.page_index
     best = None
     for b, kind, v, r in cl:
         if b != band:
             continue
         if v is not None and v > max_v:
             continue
-        if not predicate(kind, v if v is not None else -1 - i):
+        if not predicate(kind, v if v is not None else -1 - pidx):
             continue
         if _inside_position_model(
-                p.source.page_index, r.box, page_heights[i], page_widths[i],
+                pidx, r.box, page_heights[i], page_widths[i],
                 model):
             if best is None:
                 best = (kind, v, r)
@@ -558,18 +571,19 @@ def _assign_with_position_model(
         primary = {(dom_kind, dom_offset)}
 
     for i, (p, cl) in enumerate(zip(pages, cands)):
+        pidx = p.source.page_index
         in_model = []
         for b, kind, v, r in cl:
-            if b != band or v is None or v > max_v or (kind, v - i) not in primary:
+            if b != band or v is None or v > max_v or (kind, v - pidx) not in primary:
                 continue
             if _inside_position_model(
-                    p.source.page_index, r.box, page_heights[i],
+                    pidx, r.box, page_heights[i],
                     page_widths[i], model):
-                in_model.append((votes[(kind, v - i)], kind, v, r))
+                in_model.append((votes[(kind, v - pidx)], kind, v, r))
         if in_model:
             _, kind, v, r = max(in_model, key=lambda item: item[0])
             chosen[i] = (kind, v, r)
-            if kind == dom_kind and v - i == dom_offset:
+            if kind == dom_kind and v - pidx == dom_offset:
                 dom_idx.append(i)
 
     has_before = [False] * len(pages)
@@ -587,6 +601,7 @@ def _assign_with_position_model(
             seen = True
 
     for i, (p, cl) in enumerate(zip(pages, cands)):
+        pidx = p.source.page_index
         near_short_cluster = (
             strict_dominant and (has_before[i] or has_after[i])
             and dom_idx and min(dom_idx) - 1 <= i <= max(dom_idx) + 1
@@ -598,16 +613,16 @@ def _assign_with_position_model(
             p, cl, i, band, max_v, page_heights, page_widths, model,
             lambda kind, off: kind == dom_kind)
         if cand is not None:
-            chosen[i] = (dom_kind, i + dom_offset, cand[2])  # misread -> expected
+            chosen[i] = (dom_kind, pidx + dom_offset, cand[2])  # misread -> expected
 
     # Pass 2.5: Similarity Rescue
     # For pages that still have no valid candidate, check unparsed candidates.
     # If an unparsed candidate sits in the correct geometric position, compute
-    # similarity to the expected number (i + dom_offset).
+    # similarity to the expected number (p.source.page_index + dom_offset).
     for i, (p, cl) in enumerate(zip(pages, cands)):
         if chosen[i] is not None:
             continue
-        expected_val = i + dom_offset
+        expected_val = p.source.page_index + dom_offset
         if expected_val <= 0:
             continue
         expected_str = str(expected_val)

@@ -92,3 +92,100 @@ def test_layout_score_tells_upright_from_upside_down_tategaki():
     flipped = [{"box": (1400 - x1, 1800 - y1, 1400 - x0, 1800 - y0)}
                for x0, y0, x1, y1 in (c["box"] for c in cols)]
     assert up > 0 > orientation.layout_score(flipped)
+
+
+def _bars_img(h=380, w=240, span=170):
+    img = np.full((h, w, 3), 255, dtype=np.uint8)
+    x1 = min(w - 16, 16 + span)
+    for y in range(24, h - 24, 18):
+        img[y:y + 4, 16:x1] = 0
+    return img
+
+
+def _make_pdf_from_arrays(path, arrays, dpi=300.0):
+    from PIL import Image
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen.canvas import Canvas
+
+    c = Canvas(str(path))
+    for arr in arrays:
+        h, w = arr.shape[:2]
+        pw, ph = w * 72.0 / dpi, h * 72.0 / dpi
+        c.setPageSize((pw, ph))
+        rgb = arr[:, :, ::-1] if arr.ndim == 3 else arr
+        c.drawImage(ImageReader(Image.fromarray(rgb)), 0, 0, pw, ph)
+        c.showPage()
+    c.save()
+    return str(path)
+
+
+def test_a8_partial_pages_crops_bed_and_rotates_via_pdf_sizes_and_db(tmp_path, monkeypatch):
+    """A8: 1-2 page --pages runs must still crop the scanner bed and unify
+    orientation: (1) when DB has no full book, using pypdfium2 get_size() across
+    the PDF; (2) when DB already has the full book, inheriting SourceRef
+    (paper, rotate) from the stored page."""
+    import hokusai_press.source as source_mod
+    from hokusai_press import pipeline
+    from hokusai_press.store import Store
+
+    # Page 4 (index 3): landscape scan with gray bed around a portrait dark sheet
+    bed = np.full((300, 480, 3), 125, dtype=np.uint8)
+    bed[:, 125:355] = 65
+    bed[100:115, 172:270] = 245
+    bed[:4] = bed[-4:] = 255
+    bed[:, :4] = bed[:, -4:] = 255
+
+    # 5-page PDF: 3 portrait pages + page 4 (bed) + page 5 (landscape rotated)
+    pdf_path = _make_pdf_from_arrays(
+        tmp_path / "orientation.pdf",
+        [_bars_img(380, 240)] * 3 + [bed, _bars_img(240, 360)],
+    )
+
+    # Case 1: Fresh DB (no prior full run) with 1 or 2 pages in --pages
+    db_fresh = str(tmp_path / "fresh.db")
+    pipeline.run(
+        pdf_path, str(tmp_path / "fresh_sub.pdf"),
+        db_path=db_fresh, use_ocr=False, pages={3, 4},
+    )
+    st = Store(db_fresh)
+    try:
+        p3 = st.get_page("orientation.pdf", 3).params
+        p4 = st.get_page("orientation.pdf", 4).params
+        assert p3.source.paper == [125.0, 0.0, 355.0, 300.0]
+        assert p3.source.rotate == 0
+        assert p4.source.paper is None
+        assert p4.source.rotate == 90
+    finally:
+        st.close()
+
+    # Case 2: Full run first, then partial --pages 4-5 and --pages 5 on same DB
+    db_full = str(tmp_path / "full.db")
+    pipeline.run(pdf_path, str(tmp_path / "full.pdf"), db_path=db_full, use_ocr=False)
+
+    find_calls = []
+    orig_find = source_mod.find_paper
+    monkeypatch.setattr(
+        source_mod, "find_paper",
+        lambda img: (find_calls.append(1), orig_find(img))[1],
+    )
+    pipeline.run(
+        pdf_path, str(tmp_path / "sub45.pdf"),
+        db_path=db_full, use_ocr=False, pages={3, 4},
+    )
+    pipeline.run(
+        pdf_path, str(tmp_path / "sub5.pdf"),
+        db_path=db_full, use_ocr=False, pages={4},
+    )
+    # Inherited from stored full-book DB without re-running find_paper
+    assert find_calls == []
+    st = Store(db_full)
+    try:
+        p3 = st.get_page("orientation.pdf", 3).params
+        p4 = st.get_page("orientation.pdf", 4).params
+        assert p3.source.paper == [125.0, 0.0, 355.0, 300.0]
+        assert p3.source.rotate == 0
+        assert p4.source.paper is None
+        assert p4.source.rotate == 90
+    finally:
+        st.close()
+
