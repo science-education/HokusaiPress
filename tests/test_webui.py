@@ -46,7 +46,7 @@ def test_queue_and_decide_flow(tmp_path):
     q = client.get("/api/queue").json()
     assert q and q[0]["doc_id"] == "scan.png"
 
-    r = client.post("/api/page/scan.png/0/decide", json={"page_kind": "bw"})
+    r = client.post("/api/page/scan.png/1/decide", json={"page_kind": "bw"})
     assert r.json()["status"] == "corrected"
     # decision logged with features
     store = Store(db)
@@ -61,9 +61,9 @@ def test_region_edit_keeps_page_in_queue_for_continuous_adds(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))
     # add two regions in a row
-    r1 = client.post("/api/page/scan.png/0/region",
+    r1 = client.post("/api/page/scan.png/1/region",
                      json={"kind": "text", "x0": 10, "y0": 10, "x1": 90, "y1": 40})
-    r2 = client.post("/api/page/scan.png/0/region",
+    r2 = client.post("/api/page/scan.png/1/region",
                      json={"kind": "photo", "x0": 10, "y0": 50, "x1": 90, "y1": 90})
     # page stays in the queue between adds (not finalized)
     assert r1.json()["status"] == "needs_review" and r1.json()["regions"] == 1
@@ -79,7 +79,7 @@ def test_region_edit_keeps_page_in_queue_for_continuous_adds(tmp_path):
         store.close()
 
     # done finalizes -> corrected, removed from queue
-    fin = client.post("/api/page/scan.png/0/decide", json={"finish": True})
+    fin = client.post("/api/page/scan.png/1/decide", json={"finish": True})
     assert fin.json()["status"] == "corrected"
     assert client.get("/api/queue").json() == []
 
@@ -87,12 +87,12 @@ def test_region_edit_keeps_page_in_queue_for_continuous_adds(tmp_path):
 def test_region_delete_removes_and_logs(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))
-    client.post("/api/page/scan.png/0/region",
+    client.post("/api/page/scan.png/1/region",
                 json={"kind": "text", "x0": 0, "y0": 0, "x1": 30, "y1": 30})
-    client.post("/api/page/scan.png/0/region",
+    client.post("/api/page/scan.png/1/region",
                 json={"kind": "photo", "x0": 40, "y0": 40, "x1": 90, "y1": 90})
     # delete the first one
-    r = client.post("/api/page/scan.png/0/region/0/delete")
+    r = client.post("/api/page/scan.png/1/region/0/delete")
     assert r.json()["regions"] == 1
     store = Store(db)
     try:
@@ -106,7 +106,7 @@ def test_region_delete_removes_and_logs(tmp_path):
 def test_set_content_updates_box_and_recomputes(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))
-    r = client.post("/api/page/scan.png/0/content",
+    r = client.post("/api/page/scan.png/1/content",
                     json={"x0": 20, "y0": 20, "x1": 280, "y1": 360})
     assert r.json()["recomputed"] >= 1
     store = Store(db)
@@ -122,14 +122,14 @@ def test_set_content_updates_box_and_recomputes(tmp_path):
 def test_set_and_delete_nombre(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))
-    client.post("/api/page/scan.png/0/nombre",
+    client.post("/api/page/scan.png/1/nombre",
                 json={"x0": 120, "y0": 360, "x1": 180, "y1": 380})
     store = Store(db)
     try:
         assert store.get_page("scan.png", 0).params.margin.nombre_box is not None
     finally:
         store.close()
-    r = client.post("/api/page/scan.png/0/nombre/delete")
+    r = client.post("/api/page/scan.png/1/nombre/delete")
     assert r.json()["recomputed"] >= 1
     store = Store(db)
     try:
@@ -137,16 +137,16 @@ def test_set_and_delete_nombre(tmp_path):
     finally:
         store.close()
     # deleting again => nothing to delete
-    assert client.post("/api/page/scan.png/0/nombre/delete").status_code == 404
+    assert client.post("/api/page/scan.png/1/nombre/delete").status_code == 404
 
 
 def test_delete_content_redetects(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))
     # first override content, then delete -> reverts to auto-detection
-    client.post("/api/page/scan.png/0/content",
+    client.post("/api/page/scan.png/1/content",
                 json={"x0": 0, "y0": 0, "x1": 5, "y1": 5})
-    r = client.post("/api/page/scan.png/0/content/delete")
+    r = client.post("/api/page/scan.png/1/content/delete")
     assert r.json()["recomputed"] >= 1
     store = Store(db)
     try:
@@ -166,9 +166,9 @@ def test_doc_recompute_endpoint(tmp_path):
 def test_page_view_has_content_nombre_modes(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))
-    client.post("/api/page/scan.png/0/nombre",
+    client.post("/api/page/scan.png/1/nombre",
                 json={"x0": 120, "y0": 360, "x1": 180, "y1": 380})
-    html = client.get("/page/scan.png/0").text
+    html = client.get("/page/scan.png/1").text
     assert "setMode('content')" in html and "setMode('nombre')" in html
     assert "内容領域" in html and "ページ番号領域" in html
     assert "delBox('content')" in html       # content box deletable overlay
@@ -179,11 +179,11 @@ def test_page_view_has_content_nombre_modes(tmp_path):
 def test_overlays_are_grouped_for_mode_scoped_hover(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))
-    client.post("/api/page/scan.png/0/region",
+    client.post("/api/page/scan.png/1/region",
                 json={"kind": "photo", "x0": 10, "y0": 10, "x1": 90, "y1": 90})
-    client.post("/api/page/scan.png/0/nombre",
+    client.post("/api/page/scan.png/1/nombre",
                 json={"x0": 120, "y0": 360, "x1": 180, "y1": 380})
-    html = client.get("/page/scan.png/0").text
+    html = client.get("/page/scan.png/1").text
     # each overlay tags its kind so setMode can scope hover/click to one group
     assert 'data-group="photo"' in html
     assert 'data-group="content"' in html      # seed page has a content box
@@ -196,11 +196,11 @@ def test_overlays_are_grouped_for_mode_scoped_hover(tmp_path):
 def test_region_list_shows_classes_and_delete_buttons(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))
-    client.post("/api/page/scan.png/0/region",
+    client.post("/api/page/scan.png/1/region",
                 json={"kind": "text", "x0": 0, "y0": 0, "x1": 30, "y1": 30})
-    client.post("/api/page/scan.png/0/region",
+    client.post("/api/page/scan.png/1/region",
                 json={"kind": "photo", "x0": 40, "y0": 40, "x1": 90, "y1": 90})
-    html = client.get("/page/scan.png/0").text
+    html = client.get("/page/scan.png/1").text
     assert "検出領域" in html and "text:1" in html and "photo:1" in html
     assert "delRegion(0)" in html and "delRegion(1)" in html   # per-row delete
     assert "削除" in html
@@ -209,15 +209,15 @@ def test_region_list_shows_classes_and_delete_buttons(tmp_path):
 def test_region_delete_out_of_range_404(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))
-    assert client.post("/api/page/scan.png/0/region/5/delete").status_code == 404
+    assert client.post("/api/page/scan.png/1/region/5/delete").status_code == 404
 
 
 def test_page_view_has_mode_buttons_and_dblclick_delete(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))
-    client.post("/api/page/scan.png/0/region",
+    client.post("/api/page/scan.png/1/region",
                 json={"kind": "photo", "x0": 10, "y0": 10, "x1": 90, "y1": 90})
-    html = client.get("/page/scan.png/0").text
+    html = client.get("/page/scan.png/1").text
     assert 'class="rbox"' in html               # clickable region overlay
     assert "ondblclick=\"delRegion(0)\"" in html  # double-click deletes, no arg event
     assert "oncontextmenu" not in html          # right-click delete removed
@@ -232,7 +232,7 @@ def test_page_view_has_mode_buttons_and_dblclick_delete(tmp_path):
 def test_region_edit_photo_tone_persisted(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))
-    r = client.post("/api/page/scan.png/0/region",
+    r = client.post("/api/page/scan.png/1/region",
                     json={"kind": "photo", "tone": "gray",
                           "x0": 10, "y0": 10, "x1": 90, "y1": 90})
     assert r.json()["status"] == "needs_review"  # stays until finish
@@ -247,7 +247,7 @@ def test_region_edit_photo_tone_persisted(tmp_path):
 def test_region_edit_tone_ignored_for_non_photo(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))
-    client.post("/api/page/scan.png/0/region",
+    client.post("/api/page/scan.png/1/region",
                 json={"kind": "figure", "tone": "gray",
                       "x0": 10, "y0": 10, "x1": 90, "y1": 90})
     store = Store(db)
@@ -261,7 +261,7 @@ def test_region_edit_tone_ignored_for_non_photo(tmp_path):
 def test_analysis_preview_png(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))
-    r = client.get("/img/scan.png/0/analysis.png")
+    r = client.get("/img/scan.png/1/analysis.png")
     assert r.status_code == 200
     assert r.headers["content-type"] == "image/png"
     assert r.content[:8] == b"\x89PNG\r\n\x1a\n"
@@ -271,11 +271,11 @@ def test_previews_are_not_cached_and_versioned(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))
     # page embeds cache-busting tokens so a reload after an edit refetches
-    html = client.get("/page/scan.png/0").text
+    html = client.get("/page/scan.png/1").text
     assert "analysis.png?v=" in html and "output.png?v=" in html
     # image responses opt out of caching
     for kind in ("analysis", "output"):
-        r = client.get(f"/img/scan.png/0/{kind}.png")
+        r = client.get(f"/img/scan.png/1/{kind}.png")
         assert r.headers.get("cache-control") == "no-store"
 
 
@@ -295,7 +295,7 @@ def test_legend_colors_match_overlay():
 def test_page_view_has_page_kind_buttons_and_drag(tmp_path):
     db = _seed(tmp_path)
     client = TestClient(create_app(db))
-    html = client.get("/page/scan.png/0").text
+    html = client.get("/page/scan.png/1").text
     # whole-page kind buttons relocated to the top, relabeled in Japanese
     assert "紙面全体が同一要素なら押す" in html
     assert "白黒二値" in html and "グレースケール" in html and "キューに戻る" in html
@@ -310,4 +310,18 @@ def test_pages_are_shown_by_pdf_page_number(tmp_path):
     db = _seed(tmp_path)                       # page_index 0 = PDF page 1
     client = TestClient(create_app(db))
     assert "scan.png p1</a>" in client.get("/").text
-    assert "page 1</h2>" in client.get("/page/scan.png/0").text
+    assert "page 1</h2>" in client.get("/page/scan.png/1").text
+
+
+def test_urls_name_pages_by_pdf_page_number(tmp_path):
+    db = _seed(tmp_path)                       # page_index 0 = PDF page 1
+    client = TestClient(create_app(db))
+    assert 'href="/page/scan.png/1"' in client.get("/").text
+    html = client.get("/page/scan.png/1").text
+    assert "/img/scan.png/1/analysis.png" in html
+    assert "/api/page/scan.png/1/decide" in html
+    assert client.get("/api/queue").json()[0]["page"] == 1
+    assert client.get("/api/page/scan.png/1").status_code == 200
+    assert client.get("/page/scan.png/0").status_code == 404     # no page 0
+    assert client.get("/api/page/scan.png/0").status_code == 404
+    assert client.get("/page/scan.png/2").status_code == 404     # past the end
