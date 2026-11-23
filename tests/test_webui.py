@@ -325,3 +325,172 @@ def test_urls_name_pages_by_pdf_page_number(tmp_path):
     assert client.get("/page/scan.png/0").status_code == 404     # no page 0
     assert client.get("/api/page/scan.png/0").status_code == 404
     assert client.get("/page/scan.png/2").status_code == 404     # past the end
+
+
+def test_page_view_has_approve_finish_and_back_without_recompute(tmp_path):
+    db = _seed(tmp_path)
+    client = TestClient(create_app(db))
+    html = client.get("/page/scan.png/1").text
+    assert "承認して次へ" in html
+    assert "編集を完了して次へ" in html
+    assert "decide({approve:true})" in html
+    assert "decide({finish:true})" in html
+    # backToQueue returns to '/' without unconditionally calling /recompute
+    idx_back = html.index("function backToQueue()")
+    idx_decide = html.index("async function decide(")
+    back_body = html[idx_back:idx_decide]
+    assert "recompute" not in back_body
+    assert "location.href='/'" in back_body
+
+
+def test_decide_returns_next_queue_url(tmp_path):
+    import cv2
+
+    img_path = tmp_path / "book.png"
+    img = np.full((200, 200, 3), 255, dtype=np.uint8)
+    cv2.imwrite(str(img_path), img)
+    db = str(tmp_path / "book.db")
+    store = Store(db)
+    for i in range(3):
+        store.upsert_page("book", i, PageParams(
+            source=SourceRef(path=str(img_path), page_index=0),
+            dpi=300,
+            deskew=Deskew(angle_deg=0.0, confidence=1.0),
+            margin=Margin(content=Box(10, 10, 190, 190), confidence=0.8),
+            review_status=ReviewStatus.NEEDS_REVIEW,
+        ))
+    store.close()
+
+    client = TestClient(create_app(db))
+    r1 = client.post("/api/page/book/1/decide", json={"approve": True})
+    assert r1.json()["status"] == "approved"
+    assert r1.json()["next_url"] == "/page/book/2"
+
+    r2 = client.post("/api/page/book/2/decide", json={"finish": True})
+    assert r2.json()["status"] == "corrected"
+    assert r2.json()["next_url"] == "/page/book/3"
+
+    r3 = client.post("/api/page/book/3/decide", json={"approve": True})
+    assert r3.json()["status"] == "approved"
+    assert r3.json()["next_url"] == "/"
+
+
+def test_delete_content_uses_compute_margin_with_regions_and_keeps_nombre(tmp_path):
+    import cv2
+    from hokusai_press.model import Region, RegionKind
+
+    img_path = tmp_path / "a7.png"
+    img = np.full((300, 300, 3), 255, dtype=np.uint8)
+    # Small dark bar inside [40..140, 40..80] + photo content inside [160..260, 120..220]
+    cv2.rectangle(img, (40, 40), (140, 80), (0, 0, 0), -1)
+    cv2.rectangle(img, (170, 130), (250, 210), (120, 120, 120), -1)
+    cv2.imwrite(str(img_path), img)
+
+    db = str(tmp_path / "a7.db")
+    store = Store(db)
+    nb = Box(130, 260, 170, 280)
+    params = PageParams(
+        source=SourceRef(path=str(img_path), page_index=0),
+        dpi=300,
+        deskew=Deskew(angle_deg=0.0, confidence=1.0),
+        margin=Margin(content=Box(0, 0, 10, 10), confidence=1.0, nombre_box=nb),
+        regions=[Region(kind=RegionKind.PHOTO, box=Box(160, 120, 260, 220), source="manual")],
+        review_status=ReviewStatus.NEEDS_REVIEW,
+    )
+    store.upsert_page("a7", 0, params)
+    store.close()
+
+    client = TestClient(create_app(db))
+    r = client.post("/api/page/a7/1/content/delete")
+    assert r.status_code == 200
+
+    store = Store(db)
+    try:
+        m = store.get_page("a7", 0).params.margin
+        # Region [160,120,260,220] must be merged into content and confidence == 1.0
+        assert m.confidence == 1.0
+        assert m.content.x1 >= 260 and m.content.y1 >= 220
+        assert m.nombre_box == nb
+    finally:
+        store.close()
+
+
+def test_output_png_matches_built_pdf_with_ink_valley_despeckle_and_vecfill(tmp_path):
+    import cv2
+    import pypdfium2 as pdfium
+    from hokusai_press.model import Document, Region, RegionKind, RenderSettings
+    from hokusai_press.render import build_pdf
+
+    # Page 0: normal text page (gives dark ink_valley ~130)
+    p0 = np.full((200, 200, 3), 245, dtype=np.uint8)
+    cv2.rectangle(p0, (20, 20), (180, 50), (15, 15, 15), -1)
+    p0_path = tmp_path / "p0.png"
+    cv2.imwrite(str(p0_path), p0)
+
+    # Page 1: show-through (light gray ~215, no dark ink) + 1px isolated speck + solid FIGURE
+    p1 = np.full((200, 200, 3), 245, dtype=np.uint8)
+    cv2.rectangle(p1, (15, 15), (95, 45), (215, 215, 215), -1)  # show-through -> stays white under book ink_valley
+    p1[10, 10] = (0, 0, 0)                                     # 1px speck -> despeckled
+    cv2.rectangle(p1, (50, 70), (150, 150), (160, 160, 160), -1)  # solid FIGURE fill
+    p1_path = tmp_path / "p1.png"
+    cv2.imwrite(str(p1_path), p1)
+
+    db = str(tmp_path / "a13.db")
+    store = Store(db)
+    params0 = PageParams(
+        source=SourceRef(path=str(p0_path), page_index=0),
+        dpi=600,
+        deskew=Deskew(angle_deg=0.0, confidence=1.0),
+        margin=Margin(content=Box(0, 0, 200, 200), crop=Box(0, 0, 200, 200), confidence=1.0),
+    )
+    params1 = PageParams(
+        source=SourceRef(path=str(p1_path), page_index=0),
+        dpi=600,
+        deskew=Deskew(angle_deg=0.0, confidence=1.0),
+        margin=Margin(content=Box(0, 0, 200, 200), crop=Box(0, 0, 200, 200), confidence=1.0),
+        regions=[Region(kind=RegionKind.FIGURE, box=Box(50, 70, 150, 150), source="ocr")],
+        review_status=ReviewStatus.NEEDS_REVIEW,
+    )
+    # Seed 2 normal pages + 1 show-through page so book median ink_valley is from normal pages
+    store.upsert_page("a13", 0, params0)
+    store.upsert_page("a13", 1, params0)
+    store.upsert_page("a13", 2, params1)
+    store.close()
+
+    client = TestClient(create_app(db))
+    r = client.get("/img/a13/3/output.png")
+    assert r.status_code == 200
+    prev = cv2.imdecode(np.frombuffer(r.content, np.uint8), cv2.IMREAD_COLOR)
+
+    # Build real PDF with the same document ink_valley
+    from hokusai_press.geometry.margin import document_ink_valley
+
+    valley = document_ink_valley([
+        cv2.cvtColor(p0, cv2.COLOR_BGR2GRAY),
+        cv2.cvtColor(p0, cv2.COLOR_BGR2GRAY),
+        cv2.cvtColor(p1, cv2.COLOR_BGR2GRAY),
+    ])
+    doc = Document(
+        source_path=str(p1_path),
+        pages=[params1],
+        render=RenderSettings(target_dpi=600, ink_valley=valley),
+    )
+    out_pdf = str(tmp_path / "out.pdf")
+    build_pdf(doc, [p1], out_pdf)
+
+    pdf = pdfium.PdfDocument(out_pdf)
+    try:
+        # 600 DPI page rendered at 600 DPI (scale = 600 / 72) matches 200x200 px
+        bmp = pdf[0].render(scale=600 / 72).to_numpy()
+    finally:
+        pdf.close()
+
+    # Check exact pixel match (or near-zero difference due to anti-aliasing on vector rect edges)
+    assert prev.shape == bmp.shape
+    diff = np.abs(prev.astype(np.int16) - bmp.astype(np.int16)).max(axis=2)
+    diff_px = int((diff > 2).sum())
+    assert diff_px == 0 or diff_px < 50
+    # Specifically check speck was removed, show-through stayed white, and FIGURE center is gray ~160
+    assert prev[10, 10].tolist() == [255, 255, 255]
+    assert prev[30, 50].tolist() == [255, 255, 255]
+    assert 140 <= int(prev[80, 60, 0]) <= 180

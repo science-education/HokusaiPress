@@ -391,19 +391,7 @@ class MrcPageBuilder:
                     "page_h_px": h,
                     "posterize": poster_stats,
                 })
-            for fill in vector_fills:
-                x0, y0, x1, y1 = fill["rect"]
-                x0i, y0i = max(0, int(x0)), max(0, int(y0))
-                x1i, y1i = min(w, int(x1)), min(h, int(y1))
-                if x1i - x0i < 1 or y1i - y0i < 1:
-                    continue
-                crop = out_bgr[y0i:y1i, x0i:x1i]
-                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-                ink = gray < max(0, int(round(fill["gray"] * 255)) - 50)
-                ink[_rect_edge_dirt_mask(gray)] = False
-                binary[y0i:y1i, x0i:x1i] = 255
-                region = binary[y0i:y1i, x0i:x1i]
-                region[ink] = 0
+            apply_vector_fills_to_bilevel(binary, out_bgr, vector_fills)
             binary = _despeckle_bilevel(binary)
             base_pdf = encode_page_pdf(binary, "bw", self.compress)
 
@@ -466,6 +454,29 @@ class MrcPageBuilder:
         finally:
             for s in sources:
                 s.close()
+
+
+def apply_vector_fills_to_bilevel(
+    binary: np.ndarray,
+    out_bgr: np.ndarray,
+    vector_fills: list[dict],
+) -> None:
+    """Carve dark foreground strokes out of solid-fill FIGURE regions on the
+    bilevel layer so the Multiply gray vector fill sits cleanly behind them."""
+    h, w = binary.shape[:2]
+    for fill in vector_fills:
+        x0, y0, x1, y1 = fill["rect"]
+        x0i, y0i = max(0, int(x0)), max(0, int(y0))
+        x1i, y1i = min(w, int(x1)), min(h, int(y1))
+        if x1i - x0i < 1 or y1i - y0i < 1:
+            continue
+        crop = out_bgr[y0i:y1i, x0i:x1i]
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        ink = gray < max(0, int(round(fill["gray"] * 255)) - 50)
+        ink[_rect_edge_dirt_mask(gray)] = False
+        binary[y0i:y1i, x0i:x1i] = 255
+        region = binary[y0i:y1i, x0i:x1i]
+        region[ink] = 0
 
 
 def _despeckle_bilevel(binary: np.ndarray) -> np.ndarray:

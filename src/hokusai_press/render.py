@@ -413,22 +413,46 @@ def render_output_preview(
     if mode == "color":
         return out
 
-    # bw / MRC: binarize the base, then paste photo regions back as gray/color
-    from .mrc import _is_grayish
+    # bw / MRC: binarize with book ink_valley, carve figure vecfills, despeckle,
+    # then composite photo overlays and Multiply-equivalent figure fills.
+    from .mrc import _despeckle_bilevel, _is_grayish, apply_vector_fills_to_bilevel
 
     h, w = out.shape[:2]
-    canvas = cv2.cvtColor(_binarize_for_preview(out), cv2.COLOR_GRAY2BGR)
+    binary = binarize_bw(out, getattr(settings, "ink_valley", None))
+    valid_photos = []
     for (x0, y0, x1, y1, tone) in photo_boxes:
         x0i, y0i = max(0, int(x0)), max(0, int(y0))
         x1i, y1i = min(w, int(x1)), min(h, int(y1))
         if x1i - x0i < 4 or y1i - y0i < 4:
             continue
+        binary[y0i:y1i, x0i:x1i] = 255
+        valid_photos.append((x0i, y0i, x1i, y1i, tone))
+
+    vecfills = _figure_vecfills(out, params, settings, original_bgr.shape)
+    apply_vector_fills_to_bilevel(binary, out, vecfills)
+    if getattr(settings, "despeckle", True):
+        binary = _despeckle_bilevel(binary)
+
+    canvas = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+    for (x0i, y0i, x1i, y1i, tone) in valid_photos:
         crop = out[y0i:y1i, x0i:x1i]
         cmode = tone or ("gray" if _is_grayish(crop) else "color")
         if cmode == "gray":
             g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
             crop = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
         canvas[y0i:y1i, x0i:x1i] = crop
+
+    for fill in vecfills:
+        x0, y0, x1, y1 = fill["rect"]
+        x0i, y0i = max(0, int(x0)), max(0, int(y0))
+        x1i, y1i = min(w, int(x1)), min(h, int(y1))
+        if x1i - x0i < 1 or y1i - y0i < 1:
+            continue
+        region = canvas[y0i:y1i, x0i:x1i]
+        canvas[y0i:y1i, x0i:x1i] = np.clip(
+            np.round(region.astype(np.float32) * float(fill["gray"])), 0, 255
+        ).astype(np.uint8)
+
     return canvas
 
 
