@@ -58,6 +58,21 @@ def _pad_box(x0: int, y0: int, x1: int, y1: int, w: int, h: int) -> tuple[int, i
 TEXT_LAYOUT_LABELS = frozenset({"page_number", "running_head"})
 FIGURE_LAYOUT_LABELS = FIGURE_LIKE_LABELS | frozenset({"image"})
 
+def wrap_ocr_import_error(exc: ImportError, ocr_engine: str) -> ImportError:
+    """Build a clear ImportError mentioning the missing module and --no-ocr."""
+    missing = getattr(exc, "name", None) or str(exc) or "unknown module"
+    msg = (
+        f"Failed to initialize OCR engine '{ocr_engine}': missing module "
+        f"'{missing}' ({exc}). Install the required OCR dependencies or "
+        f"re-run with --no-ocr to process without OCR."
+    )
+    return ImportError(
+        msg,
+        name=getattr(exc, "name", None),
+        path=getattr(exc, "path", None),
+    )
+
+
 def analyze(
     original_bgr: np.ndarray,
     ocr_bgr: np.ndarray,
@@ -85,9 +100,9 @@ def analyze(
     engine = None
     layout_boxes_px: list[tuple] = []
     if use_ocr:
-        try:
-            from .ocr import get_ocr_engine
+        from .ocr import get_ocr_engine
 
+        try:
             engine = get_ocr_engine(
                 ocr_engine,
                 model_dir,
@@ -97,13 +112,8 @@ def analyze(
                 layout_engine=layout_engine,
                 text_engine=text_engine,
             )
-        except ImportError:
-            # optional OCR engine not installed: geometry-only is a supported mode
-            use_ocr = False
-        # NOTE: any other construction error (e.g. the requested device's
-        # onnxruntime provider is missing, or models can't be found) is NOT
-        # swallowed. OCR was explicitly requested, so failing loudly beats
-        # silently degrading a whole batch to geometry-only.
+        except ImportError as exc:
+            raise wrap_ocr_import_error(exc, ocr_engine) from exc
     if engine is not None:
         try:
             result = engine(ocr_bgr)
