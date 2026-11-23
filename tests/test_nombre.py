@@ -244,3 +244,44 @@ def test_page_number_gap_warning_names_the_pdf_page():
     from hokusai_press.nombre import _gap_warnings
     w = _gap_warnings([(10, "arabic", 11), (20, "arabic", 40)], {})
     assert w == ["p21: page number 11 -> 40 (~19 page(s) may be missing)"]
+
+
+def test_resolve_partial_pages_late_slice_and_non_contiguous():
+    # C13/A2: --pages in the second half of a book (e.g. 101..104 -> indices 100..103)
+    # and non-contiguous pages (e.g. 1,3,5,7 -> indices 0,2,4,6) must vote with
+    # true page_index and not reject numbers > len(pages) + 50.
+    late_pages = [_page(100 + k, text=str(101 + k)) for k in range(4)]
+    warnings = nombre.resolve(late_pages, [1000] * 4, [1000] * 4)
+    assert warnings == []
+    assert [p.page_number for p in late_pages] == [101, 102, 103, 104]
+
+    sparse_indices = [0, 2, 4, 6]
+    sparse_pages = [_page(idx, text=str(idx + 1)) for idx in sparse_indices]
+    warnings = nombre.resolve(sparse_pages, [1000] * 4, [1000] * 4)
+    assert warnings == []
+    assert [p.page_number for p in sparse_pages] == [1, 3, 5, 7]
+
+
+def test_resolve_position_model_partial_late_pages_misread_and_similarity():
+    # C13/A2: position-model Pass 1, Pass 2 (bracketed misread recovery), and
+    # Pass 2.5 (similarity rescue) must all use p.source.page_index + dom_offset.
+    pages = []
+    for k in range(20):
+        idx = 200 + k
+        expected = idx + 1
+        if k == 9:
+            text = "214"        # Pass 2: bracketed OCR numeric misread (<= max_v)
+        elif k == 14:
+            text = "215."       # Pass 2.5: unparsed token similar to "215"
+        else:
+            text = str(expected)
+        p = _page(idx, text=None)
+        p.regions.append(Region(kind=RegionKind.TEXT,
+                                box=_box_at(500, 950),
+                                ocr_text=text, source="dbnet"))
+        pages.append(p)
+
+    warnings = nombre.resolve(pages, [1000] * 20, [1000] * 20)
+    assert warnings == []
+    assert [p.page_number for p in pages] == [201 + k for k in range(20)]
+
