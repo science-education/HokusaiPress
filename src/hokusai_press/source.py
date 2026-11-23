@@ -142,15 +142,93 @@ _ROTATE_CV2 = {
     270: cv2.ROTATE_90_COUNTERCLOCKWISE,
 }
 
+# Tolerance for a full-page embedded image covering the page's visible box
+# (CropBox intersected with MediaBox): each edge within 2% of page width/height,
+# and off-diagonal CTM terms within 1% of the dominant axis scale.
+_FULL_PAGE_EDGE_TOL = 0.02
+_CTM_SKEW_TOL = 0.01
+
+
+def _simple_image_ctm_rotation(
+    a: float, b: float, c: float, d: float
+) -> int | None:
+    """Return clockwise rotation (0, 90, 180, 270) for a pure scale + 90-deg-
+    multiple rotation CTM (no flip, no significant skew), or None."""
+    # Positive determinant means orientation-preserving (rotation + positive
+    # scale, not a reflection/flip).
+    det = a * d - b * c
+    scale = max(abs(a), abs(b), abs(c), abs(d))
+    if scale <= 0 or det <= 0:
+        return None
+    if max(abs(b), abs(c)) <= _CTM_SKEW_TOL * min(abs(a), abs(d)):
+        if a > 0 and d > 0:
+            return 0
+        if a < 0 and d < 0:
+            return 180
+        return None
+    if max(abs(a), abs(d)) <= _CTM_SKEW_TOL * min(abs(b), abs(c)):
+        if b < 0 and c > 0:
+            return 90
+        if b > 0 and c < 0:
+            return 270
+        return None
+    return None
+
+
+def _can_extract_single_image(page) -> tuple[object, int] | None:
+    """Return (img_obj, ctm_rotation_deg) when the page consists solely of one
+    full-page embedded image (plus optional invisible text-render-mode-3 OCR
+    glyphs and container Form XObjects), else None."""
+    import pypdfium2.raw as pdfium_c
+
+    images = []
+    for obj in page.get_objects(max_depth=16):
+        t = obj.type
+        if t == pdfium_c.FPDF_PAGEOBJ_IMAGE:
+            images.append(obj)
+            if len(images) > 1:
+                return None
+        elif t == pdfium_c.FPDF_PAGEOBJ_FORM:
+            continue
+        elif t == pdfium_c.FPDF_PAGEOBJ_TEXT:
+            if (
+                pdfium_c.FPDFTextObj_GetTextRenderMode(obj)
+                != pdfium_c.FPDF_TEXTRENDERMODE_INVISIBLE
+            ):
+                return None
+        else:
+            # FPDF_PAGEOBJ_PATH, FPDF_PAGEOBJ_SHADING, etc.
+            return None
+
+    if len(images) != 1:
+        return None
+
+    img_obj = images[0]
+    cb_l, cb_b, cb_r, cb_t = page.get_bbox()
+    cw, ch = cb_r - cb_l, cb_t - cb_b
+    if cw <= 0 or ch <= 0:
+        return None
+
+    il, ib, ir, it = img_obj.get_pos()
+    if (
+        abs(il - cb_l) > _FULL_PAGE_EDGE_TOL * cw
+        or abs(ir - cb_r) > _FULL_PAGE_EDGE_TOL * cw
+        or abs(ib - cb_b) > _FULL_PAGE_EDGE_TOL * ch
+        or abs(it - cb_t) > _FULL_PAGE_EDGE_TOL * ch
+    ):
+        return None
+
+    a, b, c, d, _, _ = img_obj.get_matrix().get()
+    ctm_rot = _simple_image_ctm_rotation(a, b, c, d)
+    if ctm_rot is None:
+        return None
+
+    return img_obj, ctm_rot
+
 
 def _extract_original(page, doc, index: int) -> tuple[np.ndarray, float | None, str | None]:
     """Prefer the single embedded full-page image (lossless original). Fall
     back to a 300 dpi rasterization when a page is not a simple scan."""
-    import pypdfium2 as pdfium
-    import pypdfium2.raw as pdfium_c
-
-    images = [obj for obj in page.get_objects()
-              if obj.type == pdfium_c.FPDF_PAGEOBJ_IMAGE]
     # get_size() already reflects /Rotate (it's the page's DISPLAY size), but
     # the embedded image bytes are in the page's own unrotated frame -- e.g. a
     # wide table scanned sideways and tagged /Rotate=270 so it displays as a
@@ -159,16 +237,18 @@ def _extract_original(page, doc, index: int) -> tuple[np.ndarray, float | None, 
     # resample) so the original matches what every viewer/the rest of the
     # pipeline treats as "this page", instead of staying landscape while
     # every other page in the book is portrait.
-    page_w_pt, page_h_pt = page.get_size()
+    page_w_pt, _ = page.get_size()
     rotation = page.get_rotation() % 360
 
-    if len(images) == 1:
-        img_obj = images[0]
+    cand = _can_extract_single_image(page)
+    if cand is not None:
+        img_obj, ctm_rot = cand
         try:
             pil = img_obj.get_bitmap(render=False).to_pil()
             arr = np.array(pil.convert("RGB"))
             bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-            cv2_rot = _ROTATE_CV2.get(rotation)
+            total_rot = (rotation + ctm_rot) % 360
+            cv2_rot = _ROTATE_CV2.get(total_rot)
             if cv2_rot is not None:
                 bgr = cv2.rotate(bgr, cv2_rot)
             # dpi from embedded pixel size vs page point size (both now in
@@ -178,8 +258,9 @@ def _extract_original(page, doc, index: int) -> tuple[np.ndarray, float | None, 
         except Exception:
             pass
 
-    bitmap = page.render(scale=OCR_DPI / 72)
-    bgr = cv2.cvtColor(bitmap.to_numpy()[..., :3], cv2.COLOR_RGB2BGR)
+    # pypdfium2's default render output is BGR(A/X) when rev_byteorder=False.
+    bitmap = page.render(scale=OCR_DPI / 72, rev_byteorder=False)
+    bgr = np.ascontiguousarray(bitmap.to_numpy()[..., :3])
     return bgr, float(OCR_DPI), None
 
 
