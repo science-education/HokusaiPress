@@ -285,3 +285,56 @@ def test_resolve_position_model_partial_late_pages_misread_and_similarity():
     assert warnings == []
     assert [p.page_number for p in pages] == [201 + k for k in range(20)]
 
+
+
+def test_infer_runs_rebuilds_only_bracketed_numeric_holes():
+    pages = [_page(i) for i in range(26)]
+    for i in (1, 2, 4, 10, 23, 24, 25):
+        pages[i].page_number = i + 1
+        pages[i].margin.nombre_source = "folio"
+    pages[5].blank = True
+    pages[6].page_number, pages[6].nombre_text = 4, "iv"
+    pages[7].margin.nombre_source = "manual"
+    expected = {3: 4, 8: 9, 9: 10}
+    assert nombre.infer_folio_runs(pages[::-1]) == expected
+    assert nombre.infer_folio_runs(pages) == expected
+    assert all(pages[i].margin.nombre_box is None for i in expected)
+    pages[10].page_number = None
+    assert nombre.infer_folio_runs(pages) == {}
+    assert all(pages[i].page_number is None for i in expected)
+
+def test_number_source_roundtrip_and_legacy_page():
+    import json
+    from hokusai_press.model import Document
+
+    page = _page(3)
+    page.page_number = 4
+    page.page_number_source = "inferred"
+    doc = Document(source_path="x.pdf", pages=[page])
+    restored = Document.from_json(doc.to_json()).pages[0]
+    assert (restored.page_number, restored.page_number_source) == (4, "inferred")
+    legacy = json.loads(doc.to_json())
+    del legacy["pages"][0]["page_number_source"]
+    legacy["pages"][0]["margin"]["nombre_source"] = "folio"
+    assert Document.from_json(json.dumps(legacy)).pages[0].page_number_source == "folio"
+
+
+def test_inverted_tab_consensus_needs_both_parities_and_rejects_outlier():
+    import numpy as np
+    from hokusai_press.nombre_reader import _read_inverted_tabs
+
+    class Reader:
+        def __init__(self, values):
+            self.values = iter(values)
+
+        def predict(self, crop, method):
+            return str(next(self.values)), .99
+
+    tab = np.full((40, 30), 120, dtype=np.uint8)
+    tab[12:28, 13:18] = 255
+    pages = [_page(i) for i in range(12)]
+    records = [(p, tab, 0, (0, 0, 30, 40), False, []) for p in pages]
+    assert _read_inverted_tabs(records[::2], Reader(range(1, 13, 2)), 30) == 0
+    assert _read_inverted_tabs(records, Reader([*range(1, 12), 20]), 30) == 11
+    assert pages[10].page_number_source == "inverted_folio"
+    assert pages[11].page_number is None

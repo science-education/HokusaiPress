@@ -233,6 +233,8 @@ def create_app(db_path: str):
         pageno = row.params.page_number
         pageno_html = (f'　ページ番号: <b>{pageno}</b>' if pageno is not None
                        else '　ページ番号: <span style="color:#a00">未読取</span>')
+        if row.params.page_number_source == "inferred":
+            pageno_html += "（推定）"
         # cache-busting token so a reload after an edit refetches the previews
         # instead of showing the browser-cached image at the same URL
         import time
