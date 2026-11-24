@@ -553,11 +553,12 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
             raise HTTPException(404, "page not found")
         params = row.params
         # delete = revert content to auto-detection (keeps an existing nombre)
-        _, detected = compute_margin(_load_original(params), params.deskew, params.regions)
+        _, detected = compute_margin(_load_original(params), params.deskew, params.regions, params.dpi)
         if params.margin is None:
             params.margin = detected
         else:
             params.margin.content = detected.content
+            params.margin.glyph_box = detected.glyph_box
             params.margin.confidence = detected.confidence
             params.margin.page_w = detected.page_w
             params.margin.page_h = detected.page_h

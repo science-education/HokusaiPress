@@ -23,7 +23,7 @@ edge) -- see docs/OCR_CONSOLIDATION_PLAN.md.
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -960,8 +960,76 @@ def normalize_margins_pass1(pages, output_margin_mm: float = 5.0) -> dict:
 NOMBRE_BLEED_MM = 3.0   # regions this close to the page image edge are bleed decoration
 
 
+def glyph_components(image: np.ndarray, deskew: Deskew, dpi: float) -> list[Box]:
+    """Find adjacent glyphs, including text printed over a tint or photo."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    h, w = gray.shape
+    scale = min(1.0, 150 / dpi)
+    sw, sh = max(1, round(w * scale)), max(1, round(h * scale))
+    gray = cv2.resize(gray, (sw, sh), interpolation=cv2.INTER_AREA)
+    if abs(deskew.angle_deg) > 1e-3:
+        matrix = cv2.getRotationMatrix2D((sw / 2, sh / 2), deskew.angle_deg, 1)
+        gray = cv2.warpAffine(gray, matrix, (sw, sh), borderValue=255)
+    # Average residual screen dots before measuring local contrast.
+    gray = cv2.GaussianBlur(gray, (3, 3), 0.65)
+    unit = dpi * scale / 25.4
+    # A stroke is darker (or lighter for reversed type) than both sides
+    # of its local background. Unlike a mean threshold this does not trace
+    # the perimeter of a uniformly shaded rectangular chapter tab.
+    window = max(3, round(1.6 * unit) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (window, window))
+    dark = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel) >= 27
+    light_window = max(3, round(2.2 * unit) | 1)
+    light = cv2.adaptiveThreshold(gray, 1, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                  cv2.THRESH_BINARY, light_window, -18)
+    light[gray < 195] = 0
+    candidates = []
+    for mask, reversed_type in ((dark, False), (light, True)):
+        _, _, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8))
+        xs, ys, widths, heights, areas = stats[1:].T
+        keep = ((xs > 0) & (ys > 0) & (xs + widths < sw) & (ys + heights < sh)
+                & (widths >= 0.5 * unit) & (heights >= 1.2 * unit)
+                & (widths <= 10 * unit) & (heights <= 10 * unit)
+                & (widths >= 0.16 * heights) & (widths <= 2.4 * heights)
+                & (areas >= 0.15 * widths * heights) & (areas <= 0.91 * widths * heights))
+        for x, y, bw, bh, _ in stats[1:][keep].tolist():
+            if reversed_type:
+                # A light glyph sits in a dark field. Exclude the white
+                # counters and spaces between dark strokes on ordinary paper.
+                pad = max(2, round(bh / 5))
+                patch = gray[max(0, y - pad):y + bh + pad, max(0, x - pad):x + bw + pad]
+                borders = (gray[y:y + bh, x - 1], gray[y:y + bh, x + bw],
+                           gray[y - 1, x:x + bw], gray[y + bh, x:x + bw])
+                if cv2.mean(patch)[0] > 194 or any(
+                    np.count_nonzero(edge > 225) * 2 >= edge.size for edge in borders
+                ):
+                    continue
+            candidates.append((x, y, bw, bh, reversed_type))
+    groups = defaultdict(list)
+    paired = set()
+    cell = max(1, round(18 * unit))
+    for i, (x, y, bw, bh, light_ink) in enumerate(candidates):
+        cx, cy = x + bw / 2, y + bh / 2
+        col, row = int(cx // cell), int(cy // cell)
+        for gx in range(col - 1, col + 2):
+            for gy in range(row - 1, row + 2):
+                for j, px, py, ph, other_light in groups.get((gx, gy), ()):
+                    with_light = light_ink or other_light
+                    if min(bh, ph) < (0.32 if with_light else 0.55) * max(bh, ph):
+                        continue
+                    dx, dy = abs(cx - px), abs(cy - py)
+                    em = max(bh, ph)
+                    same_baseline = with_light and abs(y + bh - (py + ph / 2)) < 0.3 * em
+                    if ((dy <= 0.32 * em or same_baseline) and 0.4 * em <= dx <= 1.7 * em
+                            or dx <= 0.32 * em and 0.65 * em <= dy <= 1.7 * em):
+                        paired.update((i, j))
+        groups[col, row].append((i, cx, cy, bh, light_ink))
+    return [Box(x * w / sw, y * h / sh, (x + bw) * w / sw, (y + bh) * h / sh)
+            for i, (x, y, bw, bh, _) in enumerate(candidates) if i in paired]
+
+
 def _protected_box(p, dpi: float) -> Box:
-    """Box the Pass-3 translation must never clip: OCR regions + the folio.
+    """Box the Pass-3 translation must never clip: interior OCR regions, glyphs and the folio.
 
     Plain ink (tint panels, page-edge rules, chapter tabs) may be trimmed --
     only characters/figures must survive. Regions reaching within
@@ -983,7 +1051,9 @@ def _protected_box(p, dpi: float) -> Box:
     if m.nombre_box is not None:
         boxes.append(m.nombre_box)
     if not boxes:
-        return m.content
+        boxes.append(m.content)
+    if m.glyph_box is not None:
+        boxes.append(m.glyph_box)
     return Box(
         min(b.x0 for b in boxes), min(b.y0 for b in boxes),
         max(b.x1 for b in boxes), max(b.y1 for b in boxes),
@@ -1292,8 +1362,8 @@ def _refine_margins_with_nombre(pages, pass1: dict) -> NombreAlignReport:
             new_x0 = crop.x0 + shift_x_px
             new_y0 = crop.y0 + shift_y_px
 
-            # Pass 3: Strict no-clip clamp (preserve exact Margin.content containment)
-            if m.confidence >= 0.2:
+            # Pass 3: Strict no-clip clamp (preserve the protected marks)
+            if m.confidence >= 0.2 or m.glyph_box is not None:
                 c = _protected_box(p, dpi)
                 clamped_x0 = max(min(new_x0, c.x0), c.x1 - crop_w)
                 clamped_y0 = max(min(new_y0, c.y0), c.y1 - crop_h)

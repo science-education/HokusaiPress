@@ -151,6 +151,8 @@ class Margin:
     # target exactly (scaled up or down a little) instead of shrunk with white
     # bands around it.
     fill: bool = False
+    # Bounds of locally dark, character-sized components in deskewed pixels.
+    glyph_box: Optional[Box] = None
 
 
 @dataclass
@@ -283,6 +285,7 @@ def _decode_page(d) -> PageParams:
             content=_box(margin["content"]),
             confidence=margin.get("confidence", 0.0),
             nombre_box=_box(margin.get("nombre_box")),
+            glyph_box=_box(margin.get("glyph_box")),
             nombre_source=margin.get("nombre_source"),
             crop=_box(margin.get("crop")),
             page_w=margin.get("page_w"),

@@ -38,7 +38,7 @@ BLANK_INK_FRAC = 0.001         # below this ink fraction (with no OCR content) =
 #                                a blank / show-through page -> render white
 
 
-def compute_margin(original: np.ndarray, sk, regions) -> tuple[np.ndarray, Margin]:
+def compute_margin(original: np.ndarray, sk, regions, dpi=None) -> tuple[np.ndarray, Margin]:
     """Region-based shadow removal + content box for one page.
 
     Shared by analyze_document (OCR path) and recompute_shadows_and_margins
@@ -74,6 +74,10 @@ def compute_margin(original: np.ndarray, sk, regions) -> tuple[np.ndarray, Margi
         mg.content = Box(0.0, 0.0, float(pw), float(ph))
         mg.confidence = 0.0           # -> MARGIN_NOT_FOUND via align_margins
     mg.page_w, mg.page_h = float(pw), float(ph)
+    glyphs = margin_mod.glyph_components(original, sk, dpi if dpi and dpi > 0 else 600)
+    if glyphs:
+        mg.glyph_box = Box(min(b.x0 for b in glyphs), min(b.y0 for b in glyphs),
+                           max(b.x1 for b in glyphs), max(b.y1 for b in glyphs))
     return original, mg
 
 
@@ -120,7 +124,7 @@ def _finish_page(args, sk, ocr_up) -> tuple[PageParams, np.ndarray, Margin]:
         openvino_cache_dir=openvino_cache_dir, runtime=runtime,
     )
 
-    original, mg = compute_margin(original, sk, regions)
+    original, mg = compute_margin(original, sk, regions, dpi)
 
     ocr_succeeded = use_ocr and (Flag.OCR_FAILED not in cflags)
     blank = False
@@ -791,7 +795,7 @@ def _load_and_compute_margin(args):
     from .source import load_single, orient
 
     original, _ = load_single(source_path, p.source.page_index)
-    cleaned, mg = compute_margin(orient(original, p.source), p.deskew, p.regions)
+    cleaned, mg = compute_margin(orient(original, p.source), p.deskew, p.regions, p.dpi)
     h, w = cleaned.shape[:2]
     return h, w, mg
 

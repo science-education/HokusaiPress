@@ -16,7 +16,7 @@ def test_finish_page_forwards_ocr_engine_options(monkeypatch):
     monkeypatch.setattr(
         pipeline,
         "compute_margin",
-        lambda original, skew, regions: (original, margin),
+        lambda original, skew, regions, dpi: (original, margin),
     )
 
     image = np.full((20, 20, 3), 255, np.uint8)

@@ -530,3 +530,24 @@ def test_protected_box_ignores_bleed_regions_and_plain_ink():
     p.regions = []
     p.margin.nombre_box = None
     assert _protected_box(p, dpi) == p.margin.content
+
+def test_glyph_clamp_with_low_content_confidence():
+    pages = [
+        _make_yokogaki_book_page(
+            i, nb_outer_x_mm=125.0 if i % 2 == 0 else 15.0,
+            nb_y_mm=192.0, page_number=i + 10,
+        )
+        for i in range(20)
+    ]
+    margin = pages[6].margin
+    margin.nombre_box.x0 -= _mm(2.0)
+    margin.nombre_box.x1 -= _mm(2.0)
+    margin.confidence = 0.1
+    normalize_margins(pages, output_margin_mm=5.0)
+    previous = margin.crop
+    # Simulate characters adjacent to the former right trim line.
+    margin.glyph_box = Box(previous.x1 - 8, previous.y0 + 100,
+                           previous.x1 + 3, previous.y0 + 120)
+    normalize_margins(pages, output_margin_mm=5.0)
+    assert margin.crop.x1 >= margin.glyph_box.x1 - 1e-6
+    assert abs(margin.crop.width - previous.width) < 1e-6
