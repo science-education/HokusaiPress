@@ -957,6 +957,39 @@ def normalize_margins_pass1(pages, output_margin_mm: float = 5.0) -> dict:
     }
 
 
+NOMBRE_BLEED_MM = 3.0   # regions this close to the page image edge are bleed decoration
+
+
+def _protected_box(p, dpi: float) -> Box:
+    """Box the Pass-3 translation must never clip: OCR regions + the folio.
+
+    Plain ink (tint panels, page-edge rules, chapter tabs) may be trimmed --
+    only characters/figures must survive. Regions reaching within
+    NOMBRE_BLEED_MM of the image edge are printed bleed (chapter-tab bars that
+    OCR labels as running heads) and are not protected either. Falls back to
+    the full content box when there are no usable regions.
+    """
+    m = p.margin
+    bleed = _mm_to_px(NOMBRE_BLEED_MM, dpi)
+    pw, ph = m.page_w, m.page_h
+    boxes = []
+    for r in p.regions or []:
+        b = r.box
+        if pw and ph and (
+            b.x0 < bleed or b.y0 < bleed or b.x1 > pw - bleed or b.y1 > ph - bleed
+        ):
+            continue
+        boxes.append(b)
+    if m.nombre_box is not None:
+        boxes.append(m.nombre_box)
+    if not boxes:
+        return m.content
+    return Box(
+        min(b.x0 for b in boxes), min(b.y0 for b in boxes),
+        max(b.x1 for b in boxes), max(b.y1 for b in boxes),
+    )
+
+
 def _refine_margins_with_nombre(pages, pass1: dict) -> NombreAlignReport:
     """Pass 2b + Pass 3: Book-level folio consensus + pure-translation alignment
     with outlier caps and strict no-clip clamping.
@@ -1144,6 +1177,24 @@ def _refine_margins_with_nombre(pages, pass1: dict) -> NombreAlignReport:
         if is_center and any(p80_x[par] > (4.0 if strict_geom else 6.0) for par in (0, 1)):
             return None
 
+        if is_mirror:
+            # Mirror the outer-edge distance: a printed book places the left
+            # and right folios at the same distance from their fore-edges, so
+            # use one shared distance instead of two per-parity medians (those
+            # differed by up to ~1.8 mm, inherited from the scan crop).
+            tw = float(np.median([
+                _px_to_mm(o["page"].margin.target_w,
+                          _page_dpi(o["page"], use_dpi, fallback_dpi))
+                for par in (0, 1) for o in pool_by_par[par]
+            ]))
+            dist = {
+                par: (target_x[par] if sides[par] == "left" else tw - target_x[par])
+                for par in (0, 1)
+            }
+            d = 0.5 * (dist[0] + dist[1])
+            for par in (0, 1):
+                target_x[par] = d if sides[par] == "left" else tw - d
+
         target_y = float(np.median(anc_ys))
         return {
             "mode_x": "outer" if is_mirror else "center",
@@ -1243,7 +1294,7 @@ def _refine_margins_with_nombre(pages, pass1: dict) -> NombreAlignReport:
 
             # Pass 3: Strict no-clip clamp (preserve exact Margin.content containment)
             if m.confidence >= 0.2:
-                c = m.content
+                c = _protected_box(p, dpi)
                 clamped_x0 = max(min(new_x0, c.x0), c.x1 - crop_w)
                 clamped_y0 = max(min(new_y0, c.y0), c.y1 - crop_h)
                 if abs(clamped_x0 - new_x0) > 0.5:

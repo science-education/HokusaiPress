@@ -511,3 +511,22 @@ def test_clear_unlocated_nombre_drops_stale_arabic_keeps_roman():
     roman = mk(4, "iv")
     _clear_unlocated_nombre(roman)
     assert roman.page_number == 4 and roman.nombre_text == "iv"
+
+
+def test_protected_box_ignores_bleed_regions_and_plain_ink():
+    from hokusai_press.geometry.margin import _protected_box
+
+    dpi = 254.0  # 10 px/mm
+    p = PageParams(source=SourceRef(path="x.pdf", page_index=0))
+    p.margin = Margin(content=Box(0, 0, 1000, 1500), page_w=1000, page_h=1500,
+                      nombre_box=Box(100, 1400, 140, 1430))
+    p.regions = [
+        Region(box=Box(200, 200, 800, 1300), kind=RegionKind.TEXT),
+        Region(box=Box(5, 50, 300, 80), kind=RegionKind.TEXT),  # bleed tab bar
+    ]
+    pb = _protected_box(p, dpi)
+    assert (pb.x0, pb.y0, pb.x1, pb.y1) == (100, 200, 800, 1430)
+
+    p.regions = []
+    p.margin.nombre_box = None
+    assert _protected_box(p, dpi) == p.margin.content
