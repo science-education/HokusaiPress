@@ -1366,6 +1366,23 @@ def _refine_margins_with_nombre(pages, pass1: dict) -> NombreAlignReport:
             # Pass 3: Strict no-clip clamp (preserve the protected marks)
             if m.confidence >= 0.2 or m.glyph_box is not None:
                 c = _protected_box(p, dpi)
+                # Nothing beyond the folio (toward the paper edge it sits
+                # next to) is protected: once the folio is placed, marks
+                # further out -- fore-edge tabs, rules -- may be trimmed by
+                # the paper edge, but are not whitened (render keeps the
+                # content box). This keeps the folio grid exact.
+                nb = m.nombre_box
+                if nb is not None and c is not m.content:
+                    cx0, cy0, cx1, cy1 = c.x0, c.y0, c.x1, c.y1
+                    if side == "left":
+                        cx0 = max(cx0, nb.x0)
+                    elif side == "right":
+                        cx1 = min(cx1, nb.x1)
+                    if ty_mm > 0.5 * _px_to_mm(crop_h, dpi):
+                        cy1 = min(cy1, nb.y1)
+                    else:
+                        cy0 = max(cy0, nb.y0)
+                    c = Box(cx0, cy0, cx1, cy1)
                 clamped_x0 = max(min(new_x0, c.x0), c.x1 - crop_w)
                 clamped_y0 = max(min(new_y0, c.y0), c.y1 - crop_h)
                 if abs(clamped_x0 - new_x0) > 0.5:

@@ -532,22 +532,39 @@ def test_protected_box_ignores_bleed_regions_and_plain_ink():
     assert _protected_box(p, dpi) == p.margin.content
 
 def test_glyph_clamp_with_low_content_confidence():
-    pages = [
-        _make_yokogaki_book_page(
-            i, nb_outer_x_mm=125.0 if i % 2 == 0 else 15.0,
-            nb_y_mm=192.0, page_number=i + 10,
-        )
-        for i in range(20)
-    ]
-    margin = pages[6].margin
+    def book():
+        return [
+            _make_yokogaki_book_page(
+                i, nb_outer_x_mm=125.0 if i % 2 == 0 else 15.0,
+                nb_y_mm=192.0, page_number=i + 10,
+            )
+            for i in range(20)
+        ]
+
+    # Inner side (gutter): a glyph next to the trim line is protected.
+    pages = book()
+    margin = pages[7].margin          # folio on the LEFT (outer) edge
     margin.nombre_box.x0 -= _mm(2.0)
     margin.nombre_box.x1 -= _mm(2.0)
     margin.confidence = 0.1
     normalize_margins(pages, output_margin_mm=5.0)
     previous = margin.crop
-    # Simulate characters adjacent to the former right trim line.
     margin.glyph_box = Box(previous.x1 - 8, previous.y0 + 100,
                            previous.x1 + 3, previous.y0 + 120)
     normalize_margins(pages, output_margin_mm=5.0)
     assert margin.crop.x1 >= margin.glyph_box.x1 - 1e-6
     assert abs(margin.crop.width - previous.width) < 1e-6
+
+    # Beyond the folio (toward its paper edge) nothing is protected: the
+    # folio keeps its aligned position even if a mark there gets trimmed.
+    pages = book()
+    margin = pages[6].margin          # folio on the RIGHT (outer) edge
+    margin.nombre_box.x0 -= _mm(2.0)
+    margin.nombre_box.x1 -= _mm(2.0)
+    margin.confidence = 0.1
+    normalize_margins(pages, output_margin_mm=5.0)
+    aligned = margin.crop
+    margin.glyph_box = Box(aligned.x1 - 8, aligned.y0 + 100,
+                           aligned.x1 + 3, aligned.y0 + 120)
+    normalize_margins(pages, output_margin_mm=5.0)
+    assert abs(margin.crop.x0 - aligned.x0) < 1e-6
