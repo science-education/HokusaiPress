@@ -1024,8 +1024,103 @@ def glyph_components(image: np.ndarray, deskew: Deskew, dpi: float) -> list[Box]
                             or dx <= 0.32 * em and 0.65 * em <= dy <= 1.7 * em):
                         paired.update((i, j))
         groups[col, row].append((i, cx, cy, bh, light_ink))
+    glyph_px = [candidates[i][:4] for i in paired]
+    ornament_px = _ornament_boxes(gray, sw, sh, unit, glyph_px)
     return [Box(x * w / sw, y * h / sh, (x + bw) * w / sw, (y + bh) * h / sh)
-            for i, (x, y, bw, bh, _) in enumerate(candidates) if i in paired]
+            for x, y, bw, bh in glyph_px + ornament_px]
+
+
+def _ornament_boxes(
+    gray: np.ndarray, sw: int, sh: int, unit: float,
+    glyph_px: list[tuple[int, int, int, int]],
+) -> list[tuple[int, int, int, int]]:
+    """Find ornament bands (rows/columns of >=3 small marks) near protected glyphs."""
+    if not glyph_px:
+        return []
+    orn_win = max(5, round(5.5 * unit) | 1)
+    orn_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (orn_win, orn_win))
+    orn_mask = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, orn_kernel) >= 27
+    _, _, stats, _ = cv2.connectedComponentsWithStats(orn_mask.astype(np.uint8))
+    if len(stats) <= 1:
+        return []
+    xs, ys, widths, heights, areas = stats[1:].T
+    keep = ((xs > 0) & (ys > 0) & (xs + widths < sw) & (ys + heights < sh)
+            & (widths >= 0.35 * unit) & (heights >= 0.35 * unit)
+            & (np.maximum(widths, heights) >= 1.0 * unit)
+            & (widths <= 6.0 * unit) & (heights <= 6.0 * unit)
+            & (areas >= 4) & (areas >= 0.15 * widths * heights))
+    cands = [tuple(row[:4]) for row in stats[1:][keep].tolist()]
+    if len(cands) < 3:
+        return []
+
+    accepted: set[int] = set()
+    for vertical in (False, True):
+        n = len(cands)
+        adj: list[list[int]] = [[] for _ in range(n)]
+        for i in range(n):
+            xi, yi, wi, hi = cands[i]
+            cxi, cyi = xi + wi / 2, yi + hi / 2
+            for j in range(i + 1, n):
+                xj, yj, wj, hj = cands[j]
+                cxj, cyj = xj + wj / 2, yj + hj / 2
+                if not vertical:
+                    t_max = max(hi, hj)
+                    gap = max(0.0, max(xi, xj) - min(xi + wi, xj + wj))
+                    aligned = abs(cyi - cyj) <= 0.65 * t_max and gap <= max(4.5 * unit, 2.2 * t_max)
+                else:
+                    t_max = max(wi, wj)
+                    gap = max(0.0, max(yi, yj) - min(yi + hi, yj + hj))
+                    aligned = abs(cxi - cxj) <= 0.65 * t_max and gap <= max(4.5 * unit, 2.2 * t_max)
+                if aligned:
+                    adj[i].append(j)
+                    adj[j].append(i)
+
+        seen = [False] * n
+        for start in range(n):
+            if seen[start]:
+                continue
+            comp = []
+            stack = [start]
+            seen[start] = True
+            while stack:
+                u = stack.pop()
+                comp.append(u)
+                for v in adj[u]:
+                    if not seen[v]:
+                        seen[v] = True
+                        stack.append(v)
+            if len(comp) < 3:
+                continue
+            bx0 = min(cands[k][0] for k in comp)
+            by0 = min(cands[k][1] for k in comp)
+            bx1 = max(cands[k][0] + cands[k][2] for k in comp)
+            by1 = max(cands[k][1] + cands[k][3] for k in comp)
+            bw_band, bh_band = bx1 - bx0, by1 - by0
+            if (not vertical and bw_band <= bh_band) or (vertical and bh_band <= bw_band):
+                continue
+
+            near_glyphs = 0
+            for gx, gy, gw, gh in glyph_px:
+                gx1, gy1 = gx + gw, gy + gh
+                if not vertical:
+                    if bh_band > 1.45 * gh:
+                        continue
+                    x_overlap = min(bx1, gx1) - max(bx0, gx)
+                    dy = max(0.0, max(by0, gy) - min(by1, gy1))
+                    if x_overlap >= -2.5 * gh and dy <= 1.8 * gh:
+                        near_glyphs += 1
+                else:
+                    if bw_band > 1.45 * gw:
+                        continue
+                    y_overlap = min(by1, gy1) - max(by0, gy)
+                    dx = max(0.0, max(bx0, gx) - min(bx1, gx1))
+                    if y_overlap >= -2.5 * gw and dx <= 1.8 * gw:
+                        near_glyphs += 1
+                if near_glyphs >= 2:
+                    accepted.update(comp)
+                    break
+
+    return [cands[i] for i in sorted(accepted)]
 
 
 def _protected_box(p, dpi: float) -> Box:
