@@ -948,6 +948,59 @@ def _detect_thin_roman_tokens(
     return out
 
 
+def _expand_to_word(strip, y_off, box):
+    """Grow a one-glyph box to the whole numeral on its baseline.
+
+    Wide-set Roman folios ("i i i", "i v") are often tokenized glyph by
+    glyph; the outer-edge alignment needs the full word. Extends left/right
+    across ink columns while gaps stay below ~0.7 x glyph height, then
+    re-fits the vertical extent (keeps the dots of "i").
+    """
+    x0, y0, x1, y1 = box
+    th = max(2.0, y1 - y0)
+    r0 = max(0, int(np.floor(y0 - y_off - 0.45 * th)))
+    r1 = min(strip.shape[0], int(np.ceil(y1 - y_off + 0.1 * th)))
+    c0 = max(0, int(np.floor(x0 - 4 * th)))
+    c1 = min(strip.shape[1], int(np.ceil(x1 + 4 * th)))
+    win = strip[r0:r1, c0:c1]
+    if win.size == 0 or r1 - r0 < 3:
+        return box
+    _, mask = cv2.threshold(win, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    if win.std() < 8:
+        return box
+    cols = mask.any(axis=0)
+    gap_max = max(2, int(round(0.7 * th)))
+    left = max(0, int(np.floor(x0)) - c0)
+    right = min(mask.shape[1] - 1, int(np.ceil(x1)) - c0)
+    gap = 0
+    j = left - 1
+    while j >= 0 and gap <= gap_max:
+        if cols[j]:
+            left, gap = j, 0
+        else:
+            gap += 1
+        j -= 1
+    gap = 0
+    j = right + 1
+    while j < mask.shape[1] and gap <= gap_max:
+        if cols[j]:
+            right, gap = j, 0
+        else:
+            gap += 1
+        j += 1
+    if (right - left + 1) > 6 * th:      # swallowed neighbouring text: keep as is
+        return box
+    rows = np.flatnonzero(mask[:, left:right + 1].any(axis=1))
+    if rows.size == 0:
+        return box
+    return (
+        float(min(x0, c0 + left)),
+        float(min(y0, r0 + rows[0] + y_off)),
+        float(max(x1, c0 + right + 1)),
+        float(max(y1, r0 + rows[-1] + 1 + y_off)),
+    )
+
+
 def _read_roman_front_matter(
     pages: list,
     page_tokens: list[dict],
@@ -1101,6 +1154,9 @@ def _read_roman_front_matter(
 
         if chosen_box is None:
             continue
+        strip = band_grays_cache[idx][0 if band == "top" else 1]
+        y_off = 0 if band == "top" else pt.get("bot_y0", bot_y0)
+        chosen_box = _expand_to_word(strip, y_off, chosen_box)
 
         A = pt["box_M"]
         sx, tx = float(A[0, 0]), float(A[0, 2])
