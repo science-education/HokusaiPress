@@ -568,3 +568,102 @@ def test_glyph_clamp_with_low_content_confidence():
                            aligned.x1 + 3, aligned.y0 + 120)
     normalize_margins(pages, output_margin_mm=5.0)
     assert abs(margin.crop.x0 - aligned.x0) < 1e-6
+
+def test_detect_band_tokens_tightens_sub_max_w_halftone_blob():
+    """A halftone blob narrower than max_w (e.g. 13mm, 0001 p88) must still
+    be tightened onto the dark folio digits instead of keeping the screen box."""
+    px_per_mm = 150.0 / 25.4
+    bh, bw = int(round(28 * px_per_mm)), int(round(140 * px_per_mm))
+    band = np.full((bh, bw), 255, dtype=np.uint8)
+
+    # 13mm-wide halftone screen (< 16mm max_w) with ~194 background and darker dots
+    rng = np.random.default_rng(12)
+    sx0, sx1 = int(round(3 * px_per_mm)), int(round(16 * px_per_mm))
+    sy0, sy1 = int(round(10 * px_per_mm)), int(round(14 * px_per_mm))
+    panel = rng.integers(170, 218, size=(sy1 - sy0, sx1 - sx0), dtype=np.uint8)
+    band[sy0:sy1, sx0:sx1] = panel
+
+    # Dark digits "88" on the right end of the 13mm screen
+    fx = int(round(11.5 * px_per_mm))
+    fy = int(round(13.5 * px_per_mm))
+    cv2.putText(band, "88", (fx, fy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, 45, 1, cv2.LINE_AA)
+
+    tokens = _detect_band_tokens(band, y_offset=1000, px_per_mm=px_per_mm)
+    hits = [
+        t for t in tokens
+        if t[0] >= fx - 6 and t[2] <= sx1 + 4 and (t[2] - t[0]) / px_per_mm < 6.0
+    ]
+    assert len(hits) >= 1
+
+
+def test_guided_folio_localization_roman_front_matter():
+    """Front-matter Roman numerals (including thin 'i') near the body folio
+    slot must be detected, sequence-verified as 'folio_roman', and aligned."""
+    dpi = 150.0
+    pm = dpi / 25.4
+    pw, ph = int(round(140 * pm)), int(round(210 * pm))
+
+    labels = ["i", "ii", "iii", "iv", "v"] + [str(k) for k in range(1, 13)]
+    pages: list[PageParams] = []
+    originals: list[np.ndarray] = []
+
+    for idx, label in enumerate(labels):
+        img = np.full((ph, pw, 3), 255, dtype=np.uint8)
+        body_dx = 2.5 if idx % 3 == 0 else (-2.0 if idx % 4 == 0 else 0.0)
+        body_dy = 2.0 if idx % 2 == 1 else 0.0
+        bx0 = int(round((20.0 + body_dx) * pm))
+        by0 = int(round((22.0 + body_dy) * pm))
+        bx1 = int(round(120.0 * pm))
+        lines = []
+        for k in range(18):
+            ly0 = by0 + int(round(k * 8.0 * pm))
+            ly1 = ly0 + int(round(3.0 * pm))
+            cv2.rectangle(img, (bx0, ly0), (bx1, ly1), (30, 30, 30), -1)
+            lines.append(Box(float(bx0), float(ly0), float(bx1), float(ly1)))
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale, thick = 0.55, 1
+        (tw, _), _ = cv2.getTextSize(label, font, scale, thick)
+        fy_base = int(round(196.0 * pm))
+        if idx % 2 == 0:
+            fx = int(round(14.0 * pm))
+        else:
+            fx = int(round(126.0 * pm)) - tw
+        cv2.putText(img, label, (fx, fy_base), font, scale, (35, 35, 35), thick, cv2.LINE_AA)
+
+        content = Box(
+            float(min(bx0, fx)),
+            float(by0),
+            float(max(bx1, fx + tw)),
+            float(fy_base + 4),
+        )
+        pages.append(
+            PageParams(
+                source=SourceRef(path="synth_roman.pdf", page_index=idx),
+                dpi=dpi,
+                deskew=Deskew(0.0, 1.0),
+                margin=Margin(content=content, confidence=0.95, page_w=float(pw), page_h=float(ph)),
+                regions=[Region(kind=RegionKind.TEXT, box=b, ocr_text="行") for b in lines],
+            )
+        )
+        originals.append(img)
+
+    normalize_margins_pass1(pages, output_margin_mm=5.0)
+    res = localize_folios_guided(pages, originals=originals, max_workers=2)
+    assert res["applied"] is True
+    assert res["roman_verified"] == 5
+
+    for idx in range(5):
+        p = pages[idx]
+        assert p.page_number == idx + 1
+        assert p.nombre_text == labels[idx]
+        assert p.page_number_source == "folio_roman"
+        assert p.margin.nombre_source == "folio"
+
+    normalize_margins(pages, output_margin_mm=5.0)
+    even_x0 = [(p.margin.nombre_box.x0 - p.margin.crop.x0) / pm for p in pages if p.source.page_index % 2 == 0]
+    odd_x1 = [(p.margin.nombre_box.x1 - p.margin.crop.x0) / pm for p in pages if p.source.page_index % 2 == 1]
+    all_cy = [((p.margin.nombre_box.y0 + p.margin.nombre_box.y1) / 2.0 - p.margin.crop.y0) / pm for p in pages]
+    assert max(even_x0) - min(even_x0) < 0.15
+    assert max(odd_x1) - min(odd_x1) < 0.15
+    assert max(all_cy) - min(all_cy) < 0.15
