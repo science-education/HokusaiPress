@@ -502,6 +502,7 @@ def analyze_document(
             )
             prof["folio_align"] += perf_counter() - t_folio
             if guided.get("applied"):
+                nombre_mod.infer_folio_runs(norm_pages)
                 gap_w = nombre_mod.refresh_gap_warnings(norm_pages)
                 warnings = [msg for msg in warnings if "page(s) may be missing" not in msg] + gap_w
             else:
@@ -894,6 +895,7 @@ def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
                 pages, source_path=source_path, max_workers=max_workers,
             )
             if guided.get("applied"):
+                nombre_mod.infer_folio_runs(pages)
                 nombre_mod.refresh_gap_warnings(pages)
         margin_mod.normalize_margins(pages, output_margin_mm)
     else:

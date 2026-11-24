@@ -1091,7 +1091,7 @@ def _refine_margins_with_nombre(pages, pass1: dict) -> NombreAlignReport:
         m = p.margin
         if m.nombre_box is None or m.nombre_source == "geom":
             continue
-        if p.page_number is not None:
+        if p.page_number is not None and p.page_number_source not in ("inferred", "inverted_folio"):
             offs[p.page_number - p.source.page_index] += 1
     if offs:
         dom_off, dom_cnt = offs.most_common(1)[0]
@@ -1103,6 +1103,7 @@ def _refine_margins_with_nombre(pages, pass1: dict) -> NombreAlignReport:
         for p in have
         if dom_off is not None
         and p.page_number is not None
+        and p.page_number_source not in ("inferred", "inverted_folio")
         and p.margin.nombre_box is not None
         and p.margin.nombre_source != "geom"
         and (p.page_number - p.source.page_index) == dom_off
@@ -1118,7 +1119,7 @@ def _refine_margins_with_nombre(pages, pass1: dict) -> NombreAlignReport:
         src = getattr(m, "nombre_source", None)
         if src == "geom":
             continue
-        if src is None and p.page_number is None:
+        if src is None and (p.page_number is None or p.page_number_source == "inferred"):
             continue
 
         dpi = _page_dpi(p, use_dpi, fallback_dpi)

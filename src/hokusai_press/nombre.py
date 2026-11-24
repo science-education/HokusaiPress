@@ -400,12 +400,14 @@ def _assign_supported(pages, cands, band, votes, supported, max_v) -> list[str]:
                 choice, best_sup = (kind, v, r), votes[key]
         if choice is None:
             p.page_number, p.nombre_text = None, None
+            p.page_number_source = None
             if p.margin:           # drop the unreliable geometric box (often in
                 p.margin.nombre_box = None   # the wrong band) for unread pages
                 p.margin.nombre_source = None
             continue
         kind, v, r = choice
         p.page_number, p.nombre_text = v, r.ocr_text
+        p.page_number_source = "folio" if r.source == "nombre_reader" else "ocr"
         if p.margin:
             p.margin.nombre_box = r.box
             p.margin.nombre_source = "folio" if r.source == "nombre_reader" else "ocr"
@@ -686,6 +688,7 @@ def _assign_with_position_model(
         c = chosen[i]
         if c is None:
             p.page_number, p.nombre_text = None, None
+            p.page_number_source = None
             if p.margin:
                 # Store the TRUE detected box, never a y-snapped one: margin
                 # normalization anchors the crop on this box to land the real
@@ -698,6 +701,7 @@ def _assign_with_position_model(
             continue
         kind, v, r = c
         p.page_number, p.nombre_text = v, r.ocr_text
+        p.page_number_source = "folio" if r.source == "nombre_reader" else "ocr"
         if p.margin:
             p.margin.nombre_box = r.box
             p.margin.nombre_source = "folio" if r.source == "nombre_reader" else "ocr"
@@ -705,6 +709,53 @@ def _assign_with_position_model(
 
     _clear_gap_flags(pages)
     return _gap_warnings(assigns, {p.source.page_index: p for p in pages})
+
+
+def infer_folio_runs(pages: list[PageParams]) -> dict[int, int]:
+    """Fill only holes bracketed by a supported, uninterrupted offset."""
+    ordered = sorted(pages, key=lambda p: p.source.page_index)
+    anchors = []
+    for p in ordered:
+        source = p.margin.nombre_source if p.margin else None
+        if p.page_number_source == "inferred":
+            p.page_number = p.page_number_source = None
+        if source == "manual" and p.page_number is not None:
+            p.page_number_source = "manual"
+        if (p.blank or not p.page_number or parse_roman(p.nombre_text or "")
+                or (p.page_number_source or source) not in ("folio", "manual", "inverted_folio")):
+            continue
+        idx = p.source.page_index
+        offset = p.page_number - idx
+        anchors.append((idx, offset, source == "manual" or p.page_number_source == "manual"))
+
+    runs = []
+    current = []
+    for j, (idx, offset, manual) in enumerate(anchors):
+        if not manual and 0 < j < len(anchors) - 1:
+            left, right = anchors[j-1], anchors[j+1]
+            if left[1] == right[1] != offset and right[0]-left[0] <= 12:
+                continue
+        if current and (offset != current[-1][1] or idx - current[-1][0] > 12):
+            current = []
+        if not current:
+            runs.append(current)
+        current.append((idx, offset))
+
+    by_index = {p.source.page_index: p for p in ordered}
+    inferred = {}
+    for run in runs:
+        if len(run) < 4 or len({idx % 2 for idx, _ in run}) < 2:
+            continue
+        start, offset = run[0]
+        for idx in range(start + 1, run[-1][0]):
+            p = by_index.get(idx)
+            if (p is None or p.blank or p.page_number is not None or idx + offset <= 0
+                    or parse_roman(p.nombre_text or "") or p.page_number_source == "manual"
+                    or (p.margin and p.margin.nombre_source == "manual")):
+                continue
+            p.page_number = inferred[idx] = idx + offset
+            p.page_number_source = "inferred"
+    return inferred
 
 
 def refresh_gap_warnings(pages: list[PageParams]) -> list[str]:

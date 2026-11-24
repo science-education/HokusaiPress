@@ -686,8 +686,129 @@ def _clear_unlocated_nombre(p) -> None:
         and parse_numeral(p.nombre_text) is None
     )
     if not is_roman:
-        p.page_number = None
+        p.page_number = p.page_number_source = None
         p.nombre_text = None
+
+
+def _spaced_glyphs(strip, y_off, box):
+    """Extract separated, similarly tall glyphs from a single baseline."""
+    x, y, right, bottom = map(round, box)
+    crop = strip[y-y_off:bottom-y_off, x:right]
+    if min(crop.shape) < 4:
+        return []
+    _, mask = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    edges = np.flatnonzero(np.diff(np.r_[False, mask.any(axis=0), False]))
+    if not 4 <= len(edges) <= 12:
+        return []
+    glyphs = []
+    for left, end in edges.reshape(-1, 2):
+        part = mask[:, left:end]
+        rows = np.flatnonzero(part.any(axis=1))
+        height = rows[-1] - rows[0] + 1
+        if height < 0.75 * len(mask) or end - left > 0.85 * height:
+            return []
+        # Average grayscale strokes retain details lost in the segmentation mask.
+        ink = 255 - crop[rows[0]:rows[-1]+1, left:end]
+        glyphs.append(cv2.resize(ink, (10, 24), interpolation=cv2.INTER_AREA))
+    return glyphs
+
+
+def _read_spaced_pages(records, offset, rec):
+    """Learn per-digit shapes only from independent, sequence-verified OCR."""
+    samples = {}
+    padded_widths = []
+    for p, strip, y_off, box, confirmed, _ in records:
+        if not confirmed or not (p.nombre_text or "").isascii() or not p.nombre_text.isdigit():
+            continue
+        parts = _spaced_glyphs(strip, y_off, box)
+        if len(parts) == len(p.nombre_text):
+            if p.nombre_text.startswith("0"):
+                padded_widths.append(len(parts))
+            for char, glyph in zip(p.nombre_text, parts):
+                samples.setdefault(char, []).append(glyph)
+    exemplars = {c: np.stack(items).astype(np.float32) / 255
+                 for c, items in samples.items() if len(items) >= 2}
+    if len(exemplars) < 5:
+        return 0
+    added = 0
+    for p, strip, y_off, box, confirmed, neighbors in records:
+        if confirmed or p.page_number is not None:
+            continue
+        # Join same-height fragments only when their baselines and gaps agree.
+        x, y, right, bottom = box
+        height = bottom - y
+        line = [b for b in neighbors if abs(b[1]-y) <= height*.2
+                and abs(b[3]-bottom) <= height*.2]
+        group = [box]
+        for b in sorted(line, reverse=True):
+            if 0 < group[0][0]-b[2] <= height:
+                group.insert(0, b)
+        for b in sorted(line):
+            if 0 < b[0]-group[-1][2] <= height:
+                group.append(b)
+        merged = (group[0][0], min(b[1] for b in group),
+                  group[-1][2], max(b[3] for b in group))
+        parts = _spaced_glyphs(strip, y_off, merged)
+        digits = []
+        for part in parts:
+            scores = sorted((float(np.min(np.mean(np.abs(bank - part / 255.0),
+                                                   axis=(1, 2)))), c)
+                            for c, bank in exemplars.items())
+            if scores[0][0] > .19:
+                break
+            if scores[1][0] - scores[0][0] < .012:
+                # In fixed-width padded folios, an independent single-digit
+                # OCR read can disambiguate a narrow 8 from a similar 0.
+                if padded_widths.count(len(parts)) < 4:
+                    break
+                glyph = np.pad(255 - cv2.resize(part, (15, 24)), 5, constant_values=255)
+                char, conf = rec.predict(glyph, None)
+                if char != scores[0][1] or conf < GUIDED_SEQ_CONF_FLOOR:
+                    break
+            digits.append(scores[0][1])
+        text = "".join(digits)
+        if text and len(text) == len(parts) and int(text) == p.source.page_index + offset:
+            old = p.margin.nombre_box
+            sx = old.width / (right-x)
+            sy = old.height / height
+            p.margin.nombre_box = Box(old.x0+(merged[0]-x)*sx, old.y0+(merged[1]-y)*sy,
+                                      old.x1+(merged[2]-right)*sx, old.y1+(merged[3]-bottom)*sy)
+            p.page_number, p.nombre_text, p.page_number_source = int(text), text, "folio"
+            added += 1
+    return added
+
+
+def _read_inverted_tabs(records, rec, max_v):
+    """Read central light digits on a screened tab at the agreed folio position."""
+    from collections import defaultdict
+
+    votes = defaultdict(list)
+    for p, strip, y_off, box, _, _ in records:
+        if p.page_number is not None:
+            continue
+        x, y, right, bottom = map(round, box)
+        tab = strip[y-y_off:bottom-y_off, x:right]
+        h, w = tab.shape
+        if h < 16 or w < 10 or np.median(tab) > 215:
+            continue
+        core = 255 - tab[round(.29*h):round(.72*h), round(.08*w):round(.92*w)]
+        smooth = cv2.GaussianBlur(core, (3, 3), .75)
+        lo, hi = np.percentile(smooth, (3, 75))
+        if hi - lo < 12:
+            continue
+        contrast = np.uint8(np.clip((smooth-lo)*255/(hi-lo), 0, 255))
+        text, conf = rec.predict(contrast, "otsu")
+        value = parse_numeral(text)
+        if value and value <= max_v and conf >= GUIDED_SEQ_CONF_FLOOR:
+            votes[value-p.source.page_index].append((p, text, value))
+    ranked = sorted(votes.values(), key=len, reverse=True)
+    if (not ranked or len(ranked[0]) < 6 or
+            (len(ranked) > 1 and len(ranked[0]) < 2*len(ranked[1])) or
+            len({p.source.page_index % 2 for p, _, _ in ranked[0]}) < 2):
+        return 0
+    for p, text, value in ranked[0]:
+        p.page_number, p.nombre_text, p.page_number_source = value, text, "inverted_folio"
+    return len(ranked[0])
 
 
 def localize_folios_guided(
@@ -990,6 +1111,7 @@ def localize_folios_guided(
     centers = {0: (c0["mcx"], c0["mcy"]), 1: (c1["mcx"], c1["mcy"])}
     seq_verified_n = 0
     pos_only_n = 0
+    records = []
 
     for p, pt in zip(pages, page_tokens):
         if not p.margin or p.margin.nombre_source == "manual":
@@ -1053,6 +1175,7 @@ def localize_folios_guided(
                 pos_only_n += 1
 
         if best_box is not None:
+            records.append((p, strip, y_off, best_box, verified, pt[band]))
             A = pt["box_M"]
             sx, tx = float(A[0, 0]), float(A[0, 2])
             sy, ty = float(A[1, 1]), float(A[1, 2])
@@ -1063,6 +1186,7 @@ def localize_folios_guided(
             p.margin.nombre_box = Box(ox0, oy0, ox1, oy1)
             p.margin.nombre_source = "folio"
             if verified:
+                p.page_number_source = "folio"
                 p.page_number = best_val
                 p.nombre_text = best_txt
             else:
@@ -1073,11 +1197,15 @@ def localize_folios_guided(
                     and parse_numeral(p.nombre_text) is None
                 )
                 if not is_roman:
-                    p.page_number = None
+                    p.page_number = p.page_number_source = None
                     p.nombre_text = None
         elif p.margin.nombre_source in (None, "geom"):
             _clear_unlocated_nombre(p)
 
+    extra = (_read_spaced_pages(records, dom_off, rec) if dom_off is not None
+             else _read_inverted_tabs(records, rec, max_v))
+    seq_verified_n += extra
+    pos_only_n -= extra
     return {
         "applied": True,
         "band": band,
