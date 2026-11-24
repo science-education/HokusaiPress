@@ -508,6 +508,51 @@ def _detect_band_tokens(
     max_w = 16.0 * px_per_mm
     min_area = 6
 
+    def _tighten_halftone_box(bx0: float, by0: float, bx1: float, by1: float) -> list[tuple[float, float, float, float]]:
+        """Re-threshold a token box when it sits on a halftone/screened panel.
+
+        A halftone screen whose connected blob stays below max_w/max_h skips
+        the oversized-blob branch and leaves the box bloated with dots (e.g.
+        13 mm wide around a 3.2 mm '88'). Smoothing suppresses the screen dots
+        so adaptive background thresholding tightens the box onto the digits.
+        """
+        ix0 = max(0, int(np.floor(bx0)))
+        iy0 = max(0, int(np.floor(by0 - y_offset)))
+        ix1 = min(bw, int(np.ceil(bx1)))
+        iy1 = min(bh, int(np.ceil(by1 - y_offset)))
+        if ix1 - ix0 < 4 or iy1 - iy0 < 4:
+            return [(bx0, by0, bx1, by1)]
+        roi = gray_band[iy0:iy1, ix0:ix1]
+        sm = cv2.GaussianBlur(roi, (3, 3), 0)
+        bg = float(np.percentile(sm, 75))
+        fg = float(np.percentile(sm, 5))
+        if not (140.0 <= bg <= 232.0 and (bg - float(sm.min())) >= 30.0 and (bg - fg) >= 25.0):
+            return [(bx0, by0, bx1, by1)]
+        sub_thr = bg - max(25.0, (bg - fg) * 0.45)
+        sub_mask = (sm <= sub_thr).astype(np.uint8)
+        if float(sub_mask.mean()) > 0.65:
+            return [(bx0, by0, bx1, by1)]
+        j2 = cv2.dilate(sub_mask, kernel)
+        n2, _, st2, _ = cv2.connectedComponentsWithStats(j2, connectivity=8)
+        tight: list[tuple[float, float, float, float]] = []
+        for j in range(1, n2):
+            rx, ry, rcw, rch, rarea = (int(v) for v in st2[j])
+            if rarea < min_area or rch < min_h or rch > max_h or rcw < min_w or rcw > max_w:
+                continue
+            sub = sub_mask[ry:ry + rch, rx:rx + rcw]
+            ys, xs = np.nonzero(sub)
+            if xs.size < 4:
+                continue
+            tx0 = float(ix0 + rx + int(xs.min()))
+            ty0 = float(y_offset + iy0 + ry + int(ys.min()))
+            tx1 = float(ix0 + rx + int(xs.max()) + 1)
+            ty1 = float(y_offset + iy0 + ry + int(ys.max()) + 1)
+            tw, th = tx1 - tx0, ty1 - ty0
+            if th < min_h or th > max_h or tw < min_w or tw > max_w:
+                continue
+            tight.append((tx0, ty0, tx1, ty1))
+        return tight if tight else [(bx0, by0, bx1, by1)]
+
     tokens: list[tuple[float, float, float, float]] = []
 
     def _collect_from_mask(mask: np.ndarray, ox: int, oy: int) -> None:
@@ -528,7 +573,7 @@ def _detect_band_tokens(
             tw, th = tx1 - tx0, ty1 - ty0
             if th < min_h or th > max_h or tw < min_w or tw > max_w:
                 continue
-            tokens.append((tx0, ty0, tx1, ty1))
+            tokens.extend(_tighten_halftone_box(tx0, ty0, tx1, ty1))
 
     for i in range(1, n):
         x, y, cw, ch, area = (int(v) for v in stats[i])
@@ -574,7 +619,7 @@ def _detect_band_tokens(
         tw, th = tx1 - tx0, ty1 - ty0
         if th < min_h or th > max_h or tw < min_w or tw > max_w:
             continue
-        tokens.append((tx0, ty0, tx1, ty1))
+        tokens.extend(_tighten_halftone_box(tx0, ty0, tx1, ty1))
 
     if len(tokens) > 1:
         deduped: list[tuple[float, float, float, float]] = []
@@ -809,6 +854,270 @@ def _read_inverted_tabs(records, rec, max_v):
     for p, text, value in ranked[0]:
         p.page_number, p.nombre_text, p.page_number_source = value, text, "inverted_folio"
     return len(ranked[0])
+
+
+def _to_roman(n: int) -> str:
+    """Convert a positive integer (1..3999) to lowercase canonical Roman numeral."""
+    if n <= 0 or n >= 4000:
+        return ""
+    table = (
+        (1000, "m"), (900, "cm"), (500, "d"), (400, "cd"),
+        (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
+        (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i"),
+    )
+    out: list[str] = []
+    rem = n
+    for v, sym in table:
+        while rem >= v:
+            out.append(sym)
+            rem -= v
+    return "".join(out)
+
+
+def _parse_roman_token(text: str) -> tuple[int, str, bool, bool] | None:
+    """Parse ONNX output as a lowercase Roman numeral, allowing '1'<->'i' confusion.
+
+    Returns (value, canonical_roman, is_canonical, has_explicit_roman_char) or None.
+    """
+    if not text:
+        return None
+    s = "".join(text.split()).lower()
+    if not s or len(s) > 8 or any(c not in "ivx1" for c in s):
+        return None
+    has_roman_char = any(c in "ivx" for c in s)
+    norm = s.replace("1", "i")
+    val = parse_roman(norm)
+    if val is None or val <= 0 or val > 50:
+        return None
+    canonical = _to_roman(val)
+    return val, canonical, (norm == canonical), has_roman_char
+
+
+def _detect_thin_roman_tokens(
+    strip: np.ndarray,
+    y_off: int,
+    mcx_mm: float,
+    mcy_mm: float,
+    px_per_mm: float = GUIDED_PX_PER_MM,
+) -> list[tuple[float, float, float, float]]:
+    """Detect narrow folio tokens (such as single 'i') near the consensus slot."""
+    sh, sw = strip.shape
+    cx = int(round(mcx_mm * px_per_mm))
+    cy = int(round(mcy_mm * px_per_mm)) - y_off
+    rx = int(round(14.0 * px_per_mm))
+    ry = int(round(8.0 * px_per_mm))
+    x0, x1 = max(0, cx - rx), min(sw, cx + rx)
+    y0, y1 = max(0, cy - ry), min(sh, cy + ry)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return []
+
+    thr = min(ink_threshold(strip), 215)
+    bg = float(np.percentile(strip, 90))
+    patch = strip[y0:y1, x0:x1]
+    if bg > 180.0:
+        dark = (patch <= max(float(thr), bg - 38.0)).astype(np.uint8)
+    else:
+        dark = (patch <= thr).astype(np.uint8)
+
+    kx = max(2, int(round(0.8 * px_per_mm)))
+    ky = max(2, int(round(0.6 * px_per_mm)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kx, ky))
+    joined = cv2.dilate(dark, kernel)
+    n, _, stats, _ = cv2.connectedComponentsWithStats(joined, connectivity=8)
+
+    min_h = 1.2 * px_per_mm
+    max_h = 11.5 * px_per_mm
+    min_w = 0.2 * px_per_mm
+    max_w = 16.0 * px_per_mm
+    out: list[tuple[float, float, float, float]] = []
+    for i in range(1, n):
+        bx, by, cw, ch, area = (int(v) for v in stats[i])
+        if area < 4 or ch < min_h or ch > max_h or cw < min_w or cw > max_w:
+            continue
+        sub = dark[by:by + ch, bx:bx + cw]
+        ys, xs = np.nonzero(sub)
+        if xs.size < 4:
+            continue
+        tx0 = float(x0 + bx + int(xs.min()))
+        ty0 = float(y_off + y0 + by + int(ys.min()))
+        tx1 = float(x0 + bx + int(xs.max()) + 1)
+        ty1 = float(y_off + y0 + by + int(ys.max()) + 1)
+        tw, th = tx1 - tx0, ty1 - ty0
+        if min_h <= th <= max_h and min_w <= tw <= max_w:
+            out.append((tx0, ty0, tx1, ty1))
+    return out
+
+
+def _read_roman_front_matter(
+    pages: list,
+    page_tokens: list[dict],
+    band_grays_cache: dict[int, tuple[np.ndarray, np.ndarray]],
+    band: str,
+    centers: dict[int, tuple[float, float]],
+    bot_y0: int,
+    rec: _Recognizer,
+) -> int:
+    """Detect and sequence-verify front-matter Roman folios near the body folio slot."""
+    import difflib
+    from collections import defaultdict
+
+    body_first_idx = min(
+        (
+            p.source.page_index
+            for p in pages
+            if p.page_number is not None
+            and p.page_number_source == "folio"
+            and not (
+                p.nombre_text
+                and parse_roman(p.nombre_text) == p.page_number
+                and parse_numeral(p.nombre_text) is None
+            )
+        ),
+        default=len(pages),
+    )
+    if body_first_idx <= 0:
+        return 0
+
+    cands_by_idx: dict[int, list[tuple[float, float, tuple[float, float, float, float], list[tuple[str, float]]]]] = {}
+    pages_by_idx = {p.source.page_index: (p, pt) for p, pt in zip(pages, page_tokens)}
+
+    for idx in range(body_first_idx):
+        pair = pages_by_idx.get(idx)
+        if pair is None:
+            continue
+        p, pt = pair
+        if p.blank or not p.margin or p.margin.nombre_source == "manual" or pt["box_M"] is None:
+            continue
+        if idx not in band_grays_cache:
+            continue
+
+        par = idx % 2
+        mcx, mcy = centers[par]
+        strip = band_grays_cache[idx][0 if band == "top" else 1]
+        y_off = 0 if band == "top" else pt.get("bot_y0", bot_y0)
+
+        boxes: list[tuple[float, float, float, float]] = []
+        for box in pt[band]:
+            cx_mm = (box[0] + box[2]) / 2.0 / GUIDED_PX_PER_MM
+            cy_mm = (box[1] + box[3]) / 2.0 / GUIDED_PX_PER_MM
+            if abs(cx_mm - mcx) <= 14.0 and abs(cy_mm - mcy) <= 8.0:
+                boxes.append(box)
+        for tbox in _detect_thin_roman_tokens(strip, y_off, mcx, mcy):
+            tb = Box(*tbox)
+            if not any(_iou(tb, Box(*b)) > 0.55 for b in boxes):
+                boxes.append(tbox)
+        if not boxes:
+            continue
+
+        page_cands = []
+        for box in boxes:
+            bx0, by0, bx1, by1 = box
+            th = max(1.0, by1 - by0)
+            pad_x = max(4, int(round(th * 0.45)))
+            pad_y = max(2, int(round(th * 0.35)))
+            cx0 = max(0, int(np.floor(bx0)) - pad_x)
+            cy0 = max(0, int(np.floor(by0 - y_off)) - pad_y)
+            cx1 = min(strip.shape[1], int(np.ceil(bx1)) + pad_x)
+            cy1 = min(strip.shape[0], int(np.ceil(by1 - y_off)) + pad_y)
+            crop = strip[cy0:cy1, cx0:cx1]
+            if crop.size == 0:
+                continue
+            readings = [rec.predict(crop, meth) for meth in (None, "otsu", "sauvola")]
+            cx_mm = (bx0 + bx1) / 2.0 / GUIDED_PX_PER_MM
+            cy_mm = (by0 + by1) / 2.0 / GUIDED_PX_PER_MM
+            page_cands.append((abs(cx_mm - mcx), abs(cy_mm - mcy), box, readings))
+        if page_cands:
+            cands_by_idx[idx] = page_cands
+
+    if not cands_by_idx:
+        return 0
+
+    votes: dict[int, dict[int, tuple[float, bool]]] = defaultdict(dict)
+    for idx, page_cands in cands_by_idx.items():
+        for dx, dy, _, readings in page_cands:
+            if dx > 10.0 or dy > 6.0:
+                continue
+            for txt, conf in readings:
+                if conf < 0.50:
+                    continue
+                parsed = _parse_roman_token(txt)
+                if parsed is None:
+                    continue
+                val, _, is_canon, has_rom = parsed
+                if not is_canon:
+                    continue
+                off = val - idx
+                d = dx + dy
+                prev = votes[off].get(idx)
+                if prev is None or d < prev[0] or (d == prev[0] and has_rom and not prev[1]):
+                    votes[off][idx] = (d, prev[1] or has_rom if prev else has_rom)
+
+    valid_runs = [
+        (len(pg_map), sum(1 for _, hr in pg_map.values() if hr), off, pg_map)
+        for off, pg_map in votes.items()
+        if len(pg_map) >= 3 and sum(1 for _, hr in pg_map.values() if hr) >= 2
+    ]
+    if not valid_runs:
+        return 0
+    valid_runs.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    best_cnt, _, roman_off, best_pg_map = valid_runs[0]
+    if len(valid_runs) > 1 and best_cnt == valid_runs[1][0]:
+        return 0
+
+    sup_idxs = sorted(best_pg_map.keys())
+    lo_idx = max(0, sup_idxs[0] - 2)
+    hi_idx = min(body_first_idx - 1, sup_idxs[-1] + 2)
+
+    added = 0
+    for idx in range(lo_idx, hi_idx + 1):
+        expected_v = idx + roman_off
+        if expected_v <= 0 or expected_v > 50 or idx not in cands_by_idx:
+            continue
+        exp_str = _to_roman(expected_v)
+        p, pt = pages_by_idx[idx]
+
+        exact_hits = []
+        fuzzy_hits = []
+        for dx, dy, box, readings in cands_by_idx[idx]:
+            if dx > 12.0 or dy > 6.0:
+                continue
+            for txt, conf in readings:
+                s = "".join(txt.split()).lower().replace("1", "i")
+                parsed = _parse_roman_token(txt)
+                if parsed is not None and parsed[2] and parsed[0] == expected_v and conf >= 0.45:
+                    exact_hits.append((dx + dy, -conf, box))
+                elif dx <= 5.0 and dy <= 3.0 and s and all(c in "ivx" for c in s):
+                    sim = difflib.SequenceMatcher(None, exp_str, s).ratio()
+                    if (sim >= 0.66 and conf >= 0.45) or (expected_v == 1 and s == "i" and conf >= 0.35):
+                        fuzzy_hits.append((dx + dy, -sim, -conf, box))
+
+        chosen_box = None
+        if exact_hits:
+            exact_hits.sort()
+            chosen_box = exact_hits[0][2]
+        elif fuzzy_hits:
+            fuzzy_hits.sort()
+            chosen_box = fuzzy_hits[0][3]
+
+        if chosen_box is None:
+            continue
+
+        A = pt["box_M"]
+        sx, tx = float(A[0, 0]), float(A[0, 2])
+        sy, ty = float(A[1, 1]), float(A[1, 2])
+        p.margin.nombre_box = Box(
+            (chosen_box[0] - tx) / sx,
+            (chosen_box[1] - ty) / sy,
+            (chosen_box[2] - tx) / sx,
+            (chosen_box[3] - ty) / sy,
+        )
+        p.margin.nombre_source = "folio"
+        p.page_number = expected_v
+        p.nombre_text = exp_str
+        p.page_number_source = "folio_roman"
+        added += 1
+
+    return added
 
 
 def localize_folios_guided(
@@ -1206,6 +1515,9 @@ def localize_folios_guided(
              else _read_inverted_tabs(records, rec, max_v))
     seq_verified_n += extra
     pos_only_n -= extra
+    roman_added = _read_roman_front_matter(
+        pages, page_tokens, band_grays_cache, band, centers, bot_y0, rec,
+    )
     return {
         "applied": True,
         "band": band,
@@ -1213,5 +1525,6 @@ def localize_folios_guided(
         "total_detected": seq_verified_n + pos_only_n,
         "seq_verified": seq_verified_n,
         "pos_only": pos_only_n,
+        "roman_verified": roman_added,
         "elapsed_s": round(time.perf_counter() - t0, 3),
     }
