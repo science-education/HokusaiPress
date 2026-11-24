@@ -671,6 +671,25 @@ def _extract_page_bgr_fast(pdf, page_index: int, source_path: str, p) -> np.ndar
     return orient(img, p.source)
 
 
+def _clear_unlocated_nombre(p) -> None:
+    """Drop a stale nombre on a page where the guided pass found no folio.
+
+    Only called for unverified sources (None / "geom"): their page_number /
+    nombre_text are leftovers of an earlier heuristic run and showed up as
+    one-page outliers in otherwise continuous sequences. Roman front-matter
+    numerals that agree with their text are kept.
+    """
+    p.margin.nombre_box = None
+    p.margin.nombre_source = None
+    is_roman = bool(
+        p.nombre_text and parse_roman(p.nombre_text) == p.page_number
+        and parse_numeral(p.nombre_text) is None
+    )
+    if not is_roman:
+        p.page_number = None
+        p.nombre_text = None
+
+
 def localize_folios_guided(
     pages: list,
     *,
@@ -978,8 +997,7 @@ def localize_folios_guided(
         idx = p.source.page_index
         if pt["box_M"] is None:
             if p.margin.nombre_source in (None, "geom"):
-                p.margin.nombre_box = None
-                p.margin.nombre_source = None
+                _clear_unlocated_nombre(p)
             continue
 
         par = idx % 2
@@ -994,8 +1012,7 @@ def localize_folios_guided(
 
         if not cands:
             if p.margin.nombre_source in (None, "geom"):
-                p.margin.nombre_box = None
-                p.margin.nombre_source = None
+                _clear_unlocated_nombre(p)
             continue
 
         strip = band_grays_cache[idx][0 if band == "top" else 1]
@@ -1059,8 +1076,7 @@ def localize_folios_guided(
                     p.page_number = None
                     p.nombre_text = None
         elif p.margin.nombre_source in (None, "geom"):
-            p.margin.nombre_box = None
-            p.margin.nombre_source = None
+            _clear_unlocated_nombre(p)
 
     return {
         "applied": True,

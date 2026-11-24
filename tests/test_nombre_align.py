@@ -492,3 +492,22 @@ def test_cli_no_nombre_align_option(tmp_path, monkeypatch):
     assert cli_mod.main(["remargin", src, "--out", out, "--db", db, "--no-nombre-align"]) == 0
     assert cli_mod.main(["remargin", src, "--out", out, "--db", db]) == 0
     assert seen_remargin == [False, True]
+
+
+def test_clear_unlocated_nombre_drops_stale_arabic_keeps_roman():
+    from hokusai_press.nombre_reader import _clear_unlocated_nombre
+
+    def mk(num, txt):
+        p = PageParams(source=SourceRef(path="x.pdf", page_index=0))
+        p.margin = Margin(content=Box(0, 0, 10, 10), nombre_box=Box(1, 1, 2, 2))
+        p.page_number, p.nombre_text = num, txt
+        return p
+
+    stale = mk(3, "3")
+    _clear_unlocated_nombre(stale)
+    assert stale.page_number is None and stale.nombre_text is None
+    assert stale.margin.nombre_box is None and stale.margin.nombre_source is None
+
+    roman = mk(4, "iv")
+    _clear_unlocated_nombre(roman)
+    assert roman.page_number == 4 and roman.nombre_text == "iv"
