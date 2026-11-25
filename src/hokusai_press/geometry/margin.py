@@ -23,6 +23,10 @@ edge) -- see docs/OCR_CONSOLIDATION_PLAN.md.
 
 from __future__ import annotations
 
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from typing import Optional
+
 import cv2
 import numpy as np
 
@@ -536,7 +540,12 @@ def find_content_box(img_bgr: np.ndarray, deskew: Deskew) -> Margin:
     fill = (content.width * content.height) / (w * h)
     confidence = float(np.clip(fill * 1.5, 0.0, 1.0))
     nombre = _detect_nombre(binary, content)
-    return Margin(content=content, confidence=confidence, nombre_box=nombre)
+    return Margin(
+        content=content,
+        confidence=confidence,
+        nombre_box=nombre,
+        nombre_source="geom" if nombre is not None else None,
+    )
 
 
 # Garbage rules for content_ink_box (ScanTailor-style: everything printed is
@@ -659,6 +668,8 @@ FULL_TYPE_FRAC = 0.8       # a page whose body spans >= this x the P90 is a full
 ANCHOR_TOL_IN = 0.2        # start corner within this (inch) of the consensus = aligned
 ANCHOR_TOL_FRAC = 0.03     # ... same, as a page fraction when dpi is unknown
 ANCHOR_MIN_GROUP = 3       # below this many pages a group has no consensus to test
+FRAME_MINOR_DIR_MIN = 20   # a minority-direction group needs this many pages to be a type area
+FRAME_FULL_LINE_FRAC = 0.9  # a page shows the type area only with a line this close to full length
 
 
 def _line_dir(b: Box) -> "str | None":
@@ -713,35 +724,87 @@ def _start_corner(d: str, b: Box) -> tuple:
 FULL_BLEED_FILL = 0.96     # content over this much of the sheet = the sheet is the page
 FULL_BLEED_MAX_CUT = 0.10  # ... trimmed to the page only within this much per axis
 
+# --- Pass 2 / Pass 3 nombre alignment constants (physical units: mm) ---
+NOMBRE_MIN_GROUP_PAGES = 6           # min consistent pages per parity
+NOMBRE_MIN_SEQ_SUPPORT_FRAC = 0.15   # sequential support >= max(8, 15% of pages)
+NOMBRE_MAX_GROUP_MAD_X_MM = 3.5      # max Pass-1 MAD_x for geometric-only fallback
+NOMBRE_MAX_GROUP_MAD_Y_MM = 2.5      # max Pass-1 MAD_y for geometric-only fallback
+NOMBRE_MIRROR_TOL_FRAC = 0.12        # |fx_0 + fx_1 - 1.0| <= 0.12 for outer-corner mirror
+NOMBRE_Y_PARITY_DIFF_MM = 5.0        # |y_0 - y_1| <= 5 mm across parities
+NOMBRE_INLIER_MIN_FRAC = 0.75        # min fraction within +-10mm x +-8mm of consensus
+NOMBRE_CENTER_P90_MAX_MM = 8.0       # max P90 x deviation for centered folios
 
-def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
-    """Uniform page size with the type area (版面) at one position (sets margin.crop).
+NOMBRE_ACCEPT_SEQ_X_MM = 18.0        # seq-verified folio acceptance window
+NOMBRE_ACCEPT_SEQ_Y_MM = 14.0
+NOMBRE_ACCEPT_POS_X_MM = 10.0        # position-only folio tighter acceptance window
+NOMBRE_ACCEPT_POS_Y_MM = 7.0
+NOMBRE_REL_BODY_GATE_MM = 12.0       # max deviation from consensus (nb - body) on anchored unverified pages
+NOMBRE_MAX_SHIFT_ANC_X_MM = 12.0     # max Pass-1 -> Pass-2 correction on an anchored page
+NOMBRE_MAX_SHIFT_ANC_Y_MM = 10.0
+NOMBRE_MAX_SHIFT_UNANC_X_MM = 20.0   # unanchored pages (dropped by ANCHOR_TOL) allow larger rescue
+NOMBRE_MAX_SHIFT_UNANC_Y_MM = 15.0
+NOMBRE_SIZE_MAX_RATIO = 2.5          # reject boxes >2.5x median folio height (running-head fusion)
 
-    A printed book sets the body text in the same type area on every page, and
-    the running head, page number and notes at fixed places around it. So the
-    pages are registered on the type area's start corner (the top-right of the
-    first column in tategaki, the top-left of the first line in yokogaki):
-    every page whose start corner agrees with the book's consensus position
-    (per writing direction and recto/verso) puts that corner at the same
-    output position, horizontally centred with equal left/right margins.
-    Everything printed around the type area rides along. Earlier versions
-    anchored on the page number, which a stray mark or a kanji of the running
-    head could impersonate (img20261121_0010 p128, 0012 p7): the whole page
-    was then pushed against the edge.
 
-    Pages without an agreeing start corner (cover, part title, figure page,
-    no text) keep the proportional position they had on the scanned paper.
+@dataclass
+class NombreAlignReport:
+    activated: bool = False
+    activation_mode: str = "none"    # "sequence" | "geometry" | "none"
+    reason: str = ""
+    dom_offset: Optional[int] = None
+    dom_offset_count: int = 0
+    nb_mode_x: str = "none"          # "outer" | "center"
+    side_by_parity: dict[int, str] = field(default_factory=dict)
+    target_x_mm: dict[int, float] = field(default_factory=dict)
+    target_y_mm: Optional[float] = None
+    n_adjusted: int = 0
+    n_adjusted_seq: int = 0
+    n_adjusted_pos: int = 0
+    n_rejected_outlier: int = 0
+    n_rejected_rel_body: int = 0
+    n_rejected_size: int = 0
+    n_clamped_x: int = 0
+    n_clamped_y: int = 0
 
-    Size: the type area plus the book's median paper margins (equal sides),
-    so the result looks like the printed page. A page whose content does not
-    fit is never clipped: its crop grows and the renderer scales it down
-    (flagged CONTENT_SCALED_DOWN). The exception is a page that IS the whole
-    sheet (a black chapter-title page scanned past the trim): a window of the
-    sheet with the page's shape fills the page (Margin.fill), cutting at most
-    FULL_BLEED_MAX_CUT of it, instead of shrinking it between white bands."""
+
+def _page_dpi(p, use_dpi: bool, fallback_dpi: float = 600.0) -> float:
+    return float(p.dpi) if (use_dpi and p.dpi) else fallback_dpi
+
+
+def _px_to_mm(px: float, dpi: float) -> float:
+    return px / dpi * 25.4
+
+
+def _mm_to_px(mm: float, dpi: float) -> float:
+    return mm / 25.4 * dpi
+
+
+def _crop_to_out_mm(box: Box, crop: Box, dpi: float) -> tuple[float, float, float, float]:
+    return (
+        _px_to_mm(box.x0 - crop.x0, dpi),
+        _px_to_mm(box.y0 - crop.y0, dpi),
+        _px_to_mm(box.x1 - crop.x0, dpi),
+        _px_to_mm(box.y1 - crop.y0, dpi),
+    )
+
+
+def _x_anchor(x0: float, x1: float, side: str) -> float:
+    if side == "left":
+        return x0
+    if side == "right":
+        return x1
+    return (x0 + x1) / 2.0
+
+
+def normalize_margins_pass1(pages, output_margin_mm: float = 5.0) -> dict:
+    """Pass 1: Uniform page size with the type area (版面) at one position.
+
+    Sets margin.crop, margin.target_w/h, margin.fill, and Flag.CONTENT_SCALED_DOWN.
+    Returns Pass-1 metadata for Pass 2/3 folio refinement (empty dict if no pages).
+    """
     have = [p for p in pages if p.margin and p.margin.content]
     if not have:
-        return
+        return {}
     use_dpi = all(p.dpi for p in have)
     # Match RenderSettings.target_dpi (600) when dpi is unknown so margin_px
     # and the renderer's physical page size share the same pixel-to-mm scale.
@@ -822,6 +885,20 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
             ay = (H - th_d) / 2.0
         return ax, ay
 
+    matter: set = set()
+    _nums = [p.source.page_index for p in have if p.page_number is not None]
+    num_lo, num_hi = (min(_nums), max(_nums)) if _nums else (None, None)
+
+    def frame_ok(p, d):  # does this page show the type area of direction d?
+        td = tdims.get(d)
+        if td is None or id(p) not in bodies:
+            return False
+        if d != main_dir and len(td[2]) < FRAME_MINOR_DIR_MIN:
+            return False
+        b = bodies[id(p)][1]
+        long_, ref = (b.width, td[0]) if d == "h" else (b.height, td[1])
+        return long_ / unit(p) >= FRAME_FULL_LINE_FRAC * ref
+
     for p in have:
         u = unit(p)
         tw_px, th_px = W * u, H * u
@@ -839,14 +916,25 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
         else:
             crop_w, crop_h = tw_px, th_px
         d = anchored.get(id(p))
-        if d is not None:
+        # a page inside the numbered run (from the first to the last page
+        # with a folio read or inferred) belongs to the body; only the front
+        # and back matter outside it (cover, title, colophon, advertisements)
+        # fall to (3)
+        numbered = num_lo is None or num_lo <= p.source.page_index <= num_hi
+        if d is not None and (frame_ok(p, d) or numbered):
+            # (1) the virtual type area (版面, as if every line were full)
+            # sits centred left-right at the book's top/bottom ratio
             ax, ay = anchor_out(d)
             cx, cy = _start_corner(d, bodies[id(p)][1])
             x0, y0 = cx - ax * u, cy - ay * u
             floor = 0.0
         else:
-            # proportional position on the paper (a deliberately off-centre
-            # part title stays where it was); centred without a page size
+            # proportional position on the paper; centred without a page size.
+            # An unnumbered front/back-matter page without the type area
+            # (cover, colophon, advertisement) is placed again after Pass 2 by
+            # the pages' mean correction (place_matter_pages).
+            if dom is not None and not numbered:
+                matter.add(id(p))
             fx = (c.x0 + c.width / 2) / p.margin.page_w if p.margin.page_w else 0.5
             fy = (c.y0 + c.height / 2) / p.margin.page_h if p.margin.page_h else 0.5
             x0 = c.x0 + c.width / 2 - fx * crop_w
@@ -885,6 +973,648 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
         p.flags = [f for f in p.flags if f != Flag.CONTENT_SCALED_DOWN]
         if crop_w > tw_px * 1.001 or crop_h > th_px * 1.001:
             p.flags.append(Flag.CONTENT_SCALED_DOWN)
+
+    return {
+        "have": have,
+        "anchored_ids": set(anchored.keys()),
+        "matter_ids": matter,
+        "bodies": bodies,
+        "main_dir": main_dir,
+        "use_dpi": use_dpi,
+        "fallback_dpi": fallback_dpi,
+    }
+
+
+NOMBRE_BLEED_MM = 3.0   # regions this close to the page image edge are bleed decoration
+
+
+def glyph_components(image: np.ndarray, deskew: Deskew, dpi: float) -> list[Box]:
+    """Find adjacent glyphs, including text printed over a tint or photo."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    h, w = gray.shape
+    scale = min(1.0, 150 / dpi)
+    sw, sh = max(1, round(w * scale)), max(1, round(h * scale))
+    gray = cv2.resize(gray, (sw, sh), interpolation=cv2.INTER_AREA)
+    if abs(deskew.angle_deg) > 1e-3:
+        matrix = cv2.getRotationMatrix2D((sw / 2, sh / 2), deskew.angle_deg, 1)
+        gray = cv2.warpAffine(gray, matrix, (sw, sh), borderValue=255)
+    # Average residual screen dots before measuring local contrast.
+    gray = cv2.GaussianBlur(gray, (3, 3), 0.65)
+    unit = dpi * scale / 25.4
+    # A stroke is darker (or lighter for reversed type) than both sides
+    # of its local background. Unlike a mean threshold this does not trace
+    # the perimeter of a uniformly shaded rectangular chapter tab.
+    window = max(3, round(1.6 * unit) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (window, window))
+    dark = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel) >= 27
+    light_window = max(3, round(2.2 * unit) | 1)
+    light = cv2.adaptiveThreshold(gray, 1, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                  cv2.THRESH_BINARY, light_window, -18)
+    light[gray < 195] = 0
+    candidates = []
+    for mask, reversed_type in ((dark, False), (light, True)):
+        _, _, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8))
+        xs, ys, widths, heights, areas = stats[1:].T
+        keep = ((xs > 0) & (ys > 0) & (xs + widths < sw) & (ys + heights < sh)
+                & (widths >= 0.5 * unit) & (heights >= 1.2 * unit)
+                & (widths <= 10 * unit) & (heights <= 10 * unit)
+                & (widths >= 0.16 * heights) & (widths <= 2.4 * heights)
+                & (areas >= 0.15 * widths * heights) & (areas <= 0.91 * widths * heights))
+        for x, y, bw, bh, _ in stats[1:][keep].tolist():
+            if reversed_type:
+                # A light glyph sits in a dark field. Exclude the white
+                # counters and spaces between dark strokes on ordinary paper.
+                pad = max(2, round(bh / 5))
+                patch = gray[max(0, y - pad):y + bh + pad, max(0, x - pad):x + bw + pad]
+                borders = (gray[y:y + bh, x - 1], gray[y:y + bh, x + bw],
+                           gray[y - 1, x:x + bw], gray[y + bh, x:x + bw])
+                if cv2.mean(patch)[0] > 194 or any(
+                    np.count_nonzero(edge > 225) * 2 >= edge.size for edge in borders
+                ):
+                    continue
+            candidates.append((x, y, bw, bh, reversed_type))
+    groups = defaultdict(list)
+    paired = set()
+    cell = max(1, round(18 * unit))
+    for i, (x, y, bw, bh, light_ink) in enumerate(candidates):
+        cx, cy = x + bw / 2, y + bh / 2
+        col, row = int(cx // cell), int(cy // cell)
+        for gx in range(col - 1, col + 2):
+            for gy in range(row - 1, row + 2):
+                for j, px, py, ph, other_light in groups.get((gx, gy), ()):
+                    with_light = light_ink or other_light
+                    if min(bh, ph) < (0.32 if with_light else 0.55) * max(bh, ph):
+                        continue
+                    dx, dy = abs(cx - px), abs(cy - py)
+                    em = max(bh, ph)
+                    same_baseline = with_light and abs(y + bh - (py + ph / 2)) < 0.3 * em
+                    if ((dy <= 0.32 * em or same_baseline) and 0.4 * em <= dx <= 1.7 * em
+                            or dx <= 0.32 * em and 0.65 * em <= dy <= 1.7 * em):
+                        paired.update((i, j))
+        groups[col, row].append((i, cx, cy, bh, light_ink))
+    glyph_px = [candidates[i][:4] for i in paired]
+    ornament_px = _ornament_boxes(gray, sw, sh, unit, glyph_px)
+    return [Box(x * w / sw, y * h / sh, (x + bw) * w / sw, (y + bh) * h / sh)
+            for x, y, bw, bh in glyph_px + ornament_px]
+
+
+def _ornament_boxes(
+    gray: np.ndarray, sw: int, sh: int, unit: float,
+    glyph_px: list[tuple[int, int, int, int]],
+) -> list[tuple[int, int, int, int]]:
+    """Find ornament bands (rows/columns of >=3 small marks) near protected glyphs."""
+    if not glyph_px:
+        return []
+    orn_win = max(5, round(5.5 * unit) | 1)
+    orn_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (orn_win, orn_win))
+    orn_mask = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, orn_kernel) >= 27
+    _, _, stats, _ = cv2.connectedComponentsWithStats(orn_mask.astype(np.uint8))
+    if len(stats) <= 1:
+        return []
+    xs, ys, widths, heights, areas = stats[1:].T
+    keep = ((xs > 0) & (ys > 0) & (xs + widths < sw) & (ys + heights < sh)
+            & (widths >= 0.35 * unit) & (heights >= 0.35 * unit)
+            & (np.maximum(widths, heights) >= 1.0 * unit)
+            & (widths <= 6.0 * unit) & (heights <= 6.0 * unit)
+            & (areas >= 4) & (areas >= 0.15 * widths * heights))
+    cands = [tuple(row[:4]) for row in stats[1:][keep].tolist()]
+    if len(cands) < 3:
+        return []
+
+    accepted: set[int] = set()
+    for vertical in (False, True):
+        n = len(cands)
+        adj: list[list[int]] = [[] for _ in range(n)]
+        for i in range(n):
+            xi, yi, wi, hi = cands[i]
+            cxi, cyi = xi + wi / 2, yi + hi / 2
+            for j in range(i + 1, n):
+                xj, yj, wj, hj = cands[j]
+                cxj, cyj = xj + wj / 2, yj + hj / 2
+                if not vertical:
+                    t_max = max(hi, hj)
+                    gap = max(0.0, max(xi, xj) - min(xi + wi, xj + wj))
+                    aligned = abs(cyi - cyj) <= 0.65 * t_max and gap <= max(4.5 * unit, 2.2 * t_max)
+                else:
+                    t_max = max(wi, wj)
+                    gap = max(0.0, max(yi, yj) - min(yi + hi, yj + hj))
+                    aligned = abs(cxi - cxj) <= 0.65 * t_max and gap <= max(4.5 * unit, 2.2 * t_max)
+                if aligned:
+                    adj[i].append(j)
+                    adj[j].append(i)
+
+        seen = [False] * n
+        for start in range(n):
+            if seen[start]:
+                continue
+            comp = []
+            stack = [start]
+            seen[start] = True
+            while stack:
+                u = stack.pop()
+                comp.append(u)
+                for v in adj[u]:
+                    if not seen[v]:
+                        seen[v] = True
+                        stack.append(v)
+            if len(comp) < 3:
+                continue
+            bx0 = min(cands[k][0] for k in comp)
+            by0 = min(cands[k][1] for k in comp)
+            bx1 = max(cands[k][0] + cands[k][2] for k in comp)
+            by1 = max(cands[k][1] + cands[k][3] for k in comp)
+            bw_band, bh_band = bx1 - bx0, by1 - by0
+            if (not vertical and bw_band <= bh_band) or (vertical and bh_band <= bw_band):
+                continue
+
+            near_glyphs = 0
+            for gx, gy, gw, gh in glyph_px:
+                gx1, gy1 = gx + gw, gy + gh
+                if not vertical:
+                    if bh_band > 1.45 * gh:
+                        continue
+                    x_overlap = min(bx1, gx1) - max(bx0, gx)
+                    dy = max(0.0, max(by0, gy) - min(by1, gy1))
+                    if x_overlap >= -2.5 * gh and dy <= 1.8 * gh:
+                        near_glyphs += 1
+                else:
+                    if bw_band > 1.45 * gw:
+                        continue
+                    y_overlap = min(by1, gy1) - max(by0, gy)
+                    dx = max(0.0, max(bx0, gx) - min(bx1, gx1))
+                    if y_overlap >= -2.5 * gw and dx <= 1.8 * gw:
+                        near_glyphs += 1
+                if near_glyphs >= 2:
+                    accepted.update(comp)
+                    break
+
+    return [cands[i] for i in sorted(accepted)]
+
+
+def _protected_box(p, dpi: float) -> Box:
+    """Box the Pass-3 translation must never clip: interior OCR regions, glyphs and the folio.
+
+    Plain ink (tint panels, page-edge rules, chapter tabs) may be trimmed --
+    only characters/figures must survive. Regions reaching within
+    NOMBRE_BLEED_MM of the image edge are printed bleed (chapter-tab bars that
+    OCR labels as running heads) and are not protected either. Falls back to
+    the full content box when there are no usable regions.
+    """
+    m = p.margin
+    bleed = _mm_to_px(NOMBRE_BLEED_MM, dpi)
+    pw, ph = m.page_w, m.page_h
+    boxes = []
+    for r in p.regions or []:
+        b = r.box
+        if pw and ph and (
+            b.x0 < bleed or b.y0 < bleed or b.x1 > pw - bleed or b.y1 > ph - bleed
+        ):
+            continue
+        boxes.append(b)
+    if m.nombre_box is not None:
+        boxes.append(m.nombre_box)
+    if not boxes:
+        boxes.append(m.content)
+    if m.glyph_box is not None:
+        boxes.append(m.glyph_box)
+    return Box(
+        min(b.x0 for b in boxes), min(b.y0 for b in boxes),
+        max(b.x1 for b in boxes), max(b.y1 for b in boxes),
+    )
+
+
+def _refine_margins_with_nombre(pages, pass1: dict) -> NombreAlignReport:
+    """Pass 2b + Pass 3: Book-level folio consensus + pure-translation alignment
+    with outlier caps and strict no-clip clamping.
+
+    Only trusts folios whose provenance is not shape-only ("geom"). Legacy pages
+    with nombre_source=None are only eligible when they participate in a valid
+    sequential page-number run. Full-bleed fill pages, blank pages, scaled-down
+    pages, and pages without a trusted folio stay at their Pass-1 crop.
+    """
+    report = NombreAlignReport()
+    have = [
+        p for p in pass1.get("have", [])
+        if p.margin and p.margin.content and p.margin.crop
+        and p.margin.target_w and p.margin.target_h
+    ]
+    if len(have) < 2 * NOMBRE_MIN_GROUP_PAGES:
+        report.reason = "too_few_pages"
+        return report
+
+    use_dpi = pass1["use_dpi"]
+    fallback_dpi = pass1["fallback_dpi"]
+    bodies = pass1["bodies"]
+    main_dir = pass1["main_dir"]
+    anchored_ids = pass1["anchored_ids"]
+
+    # Determine dominant sequential offset among trusted folios (never "geom")
+    offs: Counter = Counter()
+    for p in have:
+        m = p.margin
+        if m.nombre_box is None or m.nombre_source == "geom":
+            continue
+        if p.page_number is not None and p.page_number_source not in ("inferred", "inverted_folio", "folio_roman"):
+            offs[p.page_number - p.source.page_index] += 1
+    if offs:
+        dom_off, dom_cnt = offs.most_common(1)[0]
+    else:
+        dom_off, dom_cnt = None, 0
+
+    seq_ok_idx = {
+        p.source.page_index
+        for p in have
+        if dom_off is not None
+        and p.page_number is not None
+        and p.page_number_source not in ("inferred", "inverted_folio", "folio_roman")
+        and p.margin.nombre_box is not None
+        and p.margin.nombre_source != "geom"
+        and (p.page_number - p.source.page_index) == dom_off
+    }
+    report.dom_offset = dom_off
+    report.dom_offset_count = dom_cnt
+
+    obs_by_par: dict[int, list[dict]] = {0: [], 1: []}
+    for p in have:
+        m = p.margin
+        if m.nombre_box is None or p.blank or m.fill or Flag.CONTENT_SCALED_DOWN in p.flags:
+            continue
+        src = getattr(m, "nombre_source", None)
+        if src == "geom":
+            continue
+        if src is None and (p.page_number is None or p.page_number_source == "inferred"):
+            continue
+
+        dpi = _page_dpi(p, use_dpi, fallback_dpi)
+        crop = m.crop
+        tw_mm = _px_to_mm(m.target_w, dpi)
+        th_mm = _px_to_mm(m.target_h, dpi)
+        x0, y0, x1, y1 = _crop_to_out_mm(m.nombre_box, crop, dpi)
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        fx = cx / tw_mm if tw_mm > 0 else 0.5
+        fy = cy / th_mm if th_mm > 0 else 0.5
+        w_mm = x1 - x0
+        h_mm = y1 - y0
+        if w_mm <= 0.2 or h_mm <= 0.5 or w_mm > 30.0 or h_mm > 15.0:
+            continue
+
+        rel_bx = rel_by = None
+        if id(p) in bodies and bodies[id(p)][0] == main_dir:
+            bd, bb, _ = bodies[id(p)]
+            bsx, bsy = _start_corner(bd, bb)
+            nb_cx_px = (m.nombre_box.x0 + m.nombre_box.x1) / 2.0
+            nb_cy_px = (m.nombre_box.y0 + m.nombre_box.y1) / 2.0
+            rel_bx = _px_to_mm(nb_cx_px - bsx, dpi)
+            rel_by = _px_to_mm(nb_cy_px - bsy, dpi)
+
+        par = p.source.page_index % 2
+        obs_by_par[par].append({
+            "page": p,
+            "idx": p.source.page_index,
+            "source": src,
+            "is_seq": p.source.page_index in seq_ok_idx,
+            "is_anc": id(p) in anchored_ids,
+            "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+            "cx": cx, "cy": cy, "fx": fx, "fy": fy,
+            "w": w_mm, "h": h_mm,
+            "rel_bx": rel_bx, "rel_by": rel_by,
+        })
+
+    min_seq_needed = max(8, int(len(have) * NOMBRE_MIN_SEQ_SUPPORT_FRAC))
+    seq_by_par = {par: [o for o in obs_by_par[par] if o["is_seq"]] for par in (0, 1)}
+    use_seq_consensus = (
+        dom_cnt >= min_seq_needed
+        and len(seq_by_par[0]) >= NOMBRE_MIN_GROUP_PAGES
+        and len(seq_by_par[1]) >= NOMBRE_MIN_GROUP_PAGES
+    )
+
+    body_y0s, body_y1s = [], []
+    for p in have:
+        if id(p) in anchored_ids and id(p) in bodies and bodies[id(p)][0] == main_dir:
+            dpi = _page_dpi(p, use_dpi, fallback_dpi)
+            _, by0, _, by1 = _crop_to_out_mm(bodies[id(p)][1], p.margin.crop, dpi)
+            body_y0s.append(by0)
+            body_y1s.append(by1)
+    cons_body_y0 = float(np.median(body_y0s)) if body_y0s else None
+    cons_body_y1 = float(np.median(body_y1s)) if body_y1s else None
+
+    def _consensus_check(pool_by_par: dict[int, list[dict]], strict_geom: bool) -> Optional[dict]:
+        if len(pool_by_par[0]) < NOMBRE_MIN_GROUP_PAGES or len(pool_by_par[1]) < NOMBRE_MIN_GROUP_PAGES:
+            return None
+        mcy = {par: float(np.median([o["cy"] for o in pool_by_par[par]])) for par in (0, 1)}
+        mfx = {par: float(np.median([o["fx"] for o in pool_by_par[par]])) for par in (0, 1)}
+        mfy = {par: float(np.median([o["fy"] for o in pool_by_par[par]])) for par in (0, 1)}
+        if not ((mfy[0] < 0.16 and mfy[1] < 0.16) or (mfy[0] > 0.84 and mfy[1] > 0.84)):
+            return None
+        if abs(mcy[0] - mcy[1]) > NOMBRE_Y_PARITY_DIFF_MM:
+            return None
+        if cons_body_y0 is not None and cons_body_y1 is not None:
+            shared_mcy = 0.5 * (mcy[0] + mcy[1])
+            if (cons_body_y0 - 0.5) <= shared_mcy <= (cons_body_y1 + 0.5):
+                return None
+
+        is_mirror = abs((mfx[0] + mfx[1]) - 1.0) <= NOMBRE_MIRROR_TOL_FRAC and abs(mfx[0] - mfx[1]) >= 0.25
+        is_center = abs(mfx[0] - 0.5) <= 0.10 and abs(mfx[1] - 0.5) <= 0.10
+        if not (is_mirror or is_center):
+            return None
+
+        sides = {}
+        for par in (0, 1):
+            if is_mirror:
+                sides[par] = "left" if mfx[par] < 0.5 else "right"
+            else:
+                sides[par] = "center"
+
+        target_x = {}
+        mad_x = {}
+        mad_y = {}
+        p80_x = {}
+        inlier_frac = {}
+        med_w = {}
+        med_h = {}
+        rel_med = {}
+        anc_ys = []
+        for par in (0, 1):
+            sub = pool_by_par[par]
+            anc_sub = [o for o in sub if o["is_anc"]]
+            ref = anc_sub if len(anc_sub) >= NOMBRE_MIN_GROUP_PAGES else sub
+            xs = [_x_anchor(o["x0"], o["x1"], sides[par]) for o in ref]
+            ys = [o["cy"] for o in ref]
+            all_xs = [_x_anchor(o["x0"], o["x1"], sides[par]) for o in sub]
+            all_ys = [o["cy"] for o in sub]
+            tx = float(np.median(xs))
+            ty = float(np.median(ys))
+            target_x[par] = tx
+            dxs = [abs(v - tx) for v in all_xs]
+            dys = [abs(v - ty) for v in all_ys]
+            mad_x[par] = float(np.median(dxs))
+            mad_y[par] = float(np.median(dys))
+            p80_x[par] = float(np.percentile(dxs, 80))
+            p90_x_val = float(np.percentile(dxs, 90))
+            inlier_frac[par] = sum(1 for dx, dy in zip(dxs, dys) if dx <= 10.0 and dy <= 8.0) / len(sub)
+            if is_center and p90_x_val > NOMBRE_CENTER_P90_MAX_MM:
+                return None
+            med_w[par] = float(np.median([o["w"] for o in ref]))
+            med_h[par] = float(np.median([o["h"] for o in ref]))
+            anc_ys.extend(ys)
+            rxs = [o["rel_bx"] for o in ref if o["rel_bx"] is not None]
+            rys = [o["rel_by"] for o in ref if o["rel_by"] is not None]
+            rel_med[par] = (float(np.median(rxs)), float(np.median(rys))) if len(rxs) >= 5 else None
+
+        max_mad_x = NOMBRE_MAX_GROUP_MAD_X_MM if strict_geom else 6.0
+        max_mad_y = NOMBRE_MAX_GROUP_MAD_Y_MM if strict_geom else 5.0
+        if any(mad_x[par] > max_mad_x or mad_y[par] > max_mad_y for par in (0, 1)):
+            return None
+        if any(inlier_frac[par] < NOMBRE_INLIER_MIN_FRAC for par in (0, 1)):
+            return None
+        if is_center and any(p80_x[par] > (4.0 if strict_geom else 6.0) for par in (0, 1)):
+            return None
+
+        if is_mirror:
+            # Mirror the outer-edge distance: a printed book places the left
+            # and right folios at the same distance from their fore-edges, so
+            # use one shared distance instead of two per-parity medians (those
+            # differed by up to ~1.8 mm, inherited from the scan crop).
+            tw = float(np.median([
+                _px_to_mm(o["page"].margin.target_w,
+                          _page_dpi(o["page"], use_dpi, fallback_dpi))
+                for par in (0, 1) for o in pool_by_par[par]
+            ]))
+            dist = {
+                par: (target_x[par] if sides[par] == "left" else tw - target_x[par])
+                for par in (0, 1)
+            }
+            d = 0.5 * (dist[0] + dist[1])
+            for par in (0, 1):
+                target_x[par] = d if sides[par] == "left" else tw - d
+
+        target_y = float(np.median(anc_ys))
+        return {
+            "mode_x": "outer" if is_mirror else "center",
+            "sides": sides,
+            "target_x": target_x,
+            "target_y": target_y,
+            "med_w": med_w,
+            "med_h": med_h,
+            "rel_med": rel_med,
+        }
+
+    consensus = None
+    if use_seq_consensus:
+        consensus = _consensus_check(seq_by_par, strict_geom=False)
+        if consensus is not None:
+            report.activation_mode = "sequence"
+
+    if consensus is None:
+        # Geometric-only fallback (e.g. white-on-black tabs where digits aren't
+        # read by ONNX): strictly restricted to trusted "folio"/"manual" sources.
+        folio_by_par = {
+            par: [o for o in obs_by_par[par] if o["source"] in ("folio", "manual")]
+            for par in (0, 1)
+        }
+        min_geom = max(NOMBRE_MIN_GROUP_PAGES, int(len(have) * 0.15))
+        if len(folio_by_par[0]) >= min_geom and len(folio_by_par[1]) >= min_geom:
+            consensus = _consensus_check(folio_by_par, strict_geom=True)
+            if consensus is not None:
+                report.activation_mode = "geometry"
+
+    if consensus is None:
+        report.reason = "book_consensus_gate_rejected"
+        return report
+
+    report.activated = True
+    report.nb_mode_x = consensus["mode_x"]
+    report.side_by_parity = dict(consensus["sides"])
+    report.target_x_mm = {k: round(v, 3) for k, v in consensus["target_x"].items()}
+    report.target_y_mm = round(consensus["target_y"], 3)
+
+    geom_only_mode = (report.activation_mode == "geometry")
+
+    for par in (0, 1):
+        side = consensus["sides"][par]
+        tx_mm = consensus["target_x"][par]
+        ty_mm = consensus["target_y"]
+        mw = consensus["med_w"][par]
+        mh = consensus["med_h"][par]
+        rmed = consensus["rel_med"][par]
+
+        for o in obs_by_par[par]:
+            if geom_only_mode and o["source"] not in ("folio", "manual"):
+                continue
+            p = o["page"]
+            m = p.margin
+            dpi = _page_dpi(p, use_dpi, fallback_dpi)
+
+            # Gate 1: Box dimension sanity (reject running-head fusion / huge blobs)
+            if o["h"] > max(mh * NOMBRE_SIZE_MAX_RATIO, mh + 3.5) or o["w"] > max(mw * 3.5, mw + 8.0):
+                report.n_rejected_size += 1
+                continue
+
+            cur_x_mm = _x_anchor(o["x0"], o["x1"], side)
+            cur_y_mm = o["cy"]
+            dx_mm = cur_x_mm - tx_mm
+            dy_mm = cur_y_mm - ty_mm
+
+            # Gate 2: Acceptance window (tighter for non-sequence-verified folios)
+            acc_x = NOMBRE_ACCEPT_SEQ_X_MM if o["is_seq"] else NOMBRE_ACCEPT_POS_X_MM
+            acc_y = NOMBRE_ACCEPT_SEQ_Y_MM if o["is_seq"] else NOMBRE_ACCEPT_POS_Y_MM
+            if abs(dx_mm) > acc_x or abs(dy_mm) > acc_y:
+                report.n_rejected_outlier += 1
+                continue
+
+            # Gate 3: Body-relative consistency on anchored unverified pages
+            if not o["is_seq"] and o["is_anc"] and rmed is not None and o["rel_bx"] is not None:
+                drx = abs(o["rel_bx"] - rmed[0])
+                dry = abs(o["rel_by"] - rmed[1])
+                if drx > NOMBRE_REL_BODY_GATE_MM or dry > NOMBRE_REL_BODY_GATE_MM:
+                    report.n_rejected_rel_body += 1
+                    continue
+
+            # Pass 3: Max shift cap from Pass 1
+            max_sx = NOMBRE_MAX_SHIFT_ANC_X_MM if o["is_anc"] else NOMBRE_MAX_SHIFT_UNANC_X_MM
+            max_sy = NOMBRE_MAX_SHIFT_ANC_Y_MM if o["is_anc"] else NOMBRE_MAX_SHIFT_UNANC_Y_MM
+            if abs(dx_mm) > max_sx or abs(dy_mm) > max_sy:
+                report.n_rejected_outlier += 1
+                continue
+
+            # Pure translation only (crop_w and crop_h stay invariant -> no scaling)
+            shift_x_px = _mm_to_px(dx_mm, dpi)
+            shift_y_px = _mm_to_px(dy_mm, dpi)
+            crop = m.crop
+            crop_w, crop_h = crop.width, crop.height
+            new_x0 = crop.x0 + shift_x_px
+            new_y0 = crop.y0 + shift_y_px
+
+            # Pass 3: Strict no-clip clamp (preserve the protected marks)
+            if m.confidence >= 0.2 or m.glyph_box is not None:
+                c = _protected_box(p, dpi)
+                # Nothing beyond the folio (toward the paper edge it sits
+                # next to) is protected: once the folio is placed, marks
+                # further out -- fore-edge tabs, rules -- may be trimmed by
+                # the paper edge, but are not whitened (render keeps the
+                # content box). This keeps the folio grid exact.
+                nb = m.nombre_box
+                if nb is not None and c is not m.content:
+                    cx0, cy0, cx1, cy1 = c.x0, c.y0, c.x1, c.y1
+                    if side == "left":
+                        cx0 = max(cx0, nb.x0)
+                    elif side == "right":
+                        cx1 = min(cx1, nb.x1)
+                    if ty_mm > 0.5 * _px_to_mm(crop_h, dpi):
+                        cy1 = min(cy1, nb.y1)
+                    else:
+                        cy0 = max(cy0, nb.y0)
+                    c = Box(cx0, cy0, cx1, cy1)
+                clamped_x0 = max(min(new_x0, c.x0), c.x1 - crop_w)
+                clamped_y0 = max(min(new_y0, c.y0), c.y1 - crop_h)
+                if abs(clamped_x0 - new_x0) > 0.5:
+                    report.n_clamped_x += 1
+                if abs(clamped_y0 - new_y0) > 0.5:
+                    report.n_clamped_y += 1
+                new_x0, new_y0 = clamped_x0, clamped_y0
+
+            m.crop = Box(new_x0, new_y0, new_x0 + crop_w, new_y0 + crop_h)
+            report.n_adjusted += 1
+            if o["is_seq"]:
+                report.n_adjusted_seq += 1
+            else:
+                report.n_adjusted_pos += 1
+
+    return report
+
+
+def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
+    """Uniform page size with type-area registration (Pass 1) and robust
+    folio-aligned refinement (Pass 2b/3) when trusted folios are present.
+
+    Pass 1 registers pages on the type area's start corner (top-right in
+    tategaki, top-left in yokogaki) and establishes uniform target_w/h.
+    Pass 2b/3 aligns trusted folios (outer edge per parity in X, shared height
+    in Y, or center in X for centered folios) via pure translation only, gated
+    by book-level consensus, per-page outlier/size/shift caps, and a strict
+    no-clip clamp. Books without enough trusted folios stay at Pass 1.
+    Idempotent: repeated calls produce identical crops."""
+    pass1 = normalize_margins_pass1(pages, output_margin_mm=output_margin_mm)
+    if pass1:
+        _refine_margins_with_nombre(pages, pass1)
+        place_matter_pages(pages, pass1)
+
+
+MATTER_MIN_REF_PAGES = 6   # folio pages per parity needed to know the mean correction
+
+
+def place_matter_pages(pages, pass1: dict) -> int:
+    """Place unnumbered front/back matter without a type area (cover,
+    colophon, advertisements) by the correction the folio pages received.
+
+    Nothing on such a page tells where it belongs, and a scanner does not
+    translate one sheet by centimetres, so the page gets the median shift of
+    the same-parity folio pages (crop centre minus image centre). Both sides
+    of a sheet are scanned together: when the other side of the sheet is a
+    folio page its own deviation is added -- mirrored left-right (the sheet
+    is turned over) unless the book shows otherwise, same sign vertically.
+    Characters and the folio are never clipped. Returns pages placed."""
+    ids = pass1.get("matter_ids") or set()
+    if not ids:
+        return 0
+    use_dpi, fb = pass1["use_dpi"], pass1["fallback_dpi"]
+
+    def centre_off(p):
+        m = p.margin
+        dpi = _page_dpi(p, use_dpi, fb)
+        return (_px_to_mm((m.crop.x0 + m.crop.x1) / 2 - m.page_w / 2, dpi),
+                _px_to_mm((m.crop.y0 + m.crop.y1) / 2 - m.page_h / 2, dpi))
+
+    ref = {p.source.page_index: centre_off(p) for p in pages
+           if p.page_number is not None and p.margin and p.margin.crop
+           and p.margin.page_w and p.margin.page_h
+           and p.page_number_source in ("folio", "inverted_folio", "folio_roman")}
+    med = {}
+    for par in (0, 1):
+        v = [o for i, o in ref.items() if i % 2 == par]
+        if len(v) < MATTER_MIN_REF_PAGES:
+            return 0
+        med[par] = (float(np.median([o[0] for o in v])), float(np.median([o[1] for o in v])))
+    res = {i: (o[0] - med[i % 2][0], o[1] - med[i % 2][1]) for i, o in ref.items()}
+    # sheet = page indices (2k, 2k+1); measure how a sheet's two sides co-move
+    pairs = [(res[i], res[i + 1]) for i in range(0, max(res, default=0), 2)
+             if i in res and i + 1 in res]
+    sign = {0: -1.0, 1: 1.0}
+    if len(pairs) >= 10:
+        for ax in (0, 1):
+            a = np.array([q[0][ax] for q in pairs]); b = np.array([q[1][ax] for q in pairs])
+            if a.std() > 0 and b.std() > 0:
+                r = float(np.corrcoef(a, b)[0, 1])
+                sign[ax] = (1.0 if r > 0 else -1.0) if abs(r) >= 0.3 else 0.0
+            else:
+                sign[ax] = 0.0
+    else:
+        sign = {0: 0.0, 1: 0.0}
+    n = 0
+    for p in pages:
+        if id(p) not in ids or not (p.margin and p.margin.crop and p.margin.page_w and p.margin.page_h):
+            continue
+        m = p.margin
+        dpi = _page_dpi(p, use_dpi, fb)
+        par = p.source.page_index % 2
+        partner = res.get(p.source.page_index ^ 1)
+        ox, oy = med[par]
+        if partner is not None:
+            ox += sign[0] * partner[0]
+            oy += sign[1] * partner[1]
+        cw, ch = m.crop.width, m.crop.height
+        x0 = m.page_w / 2 + _mm_to_px(ox, dpi) - cw / 2
+        y0 = m.page_h / 2 + _mm_to_px(oy, dpi) - ch / 2
+        if m.confidence >= 0.2:
+            g = _protected_box(p, dpi)
+            if g.width <= cw:
+                x0 = max(min(x0, g.x0), g.x1 - cw)
+            if g.height <= ch:
+                y0 = max(min(y0, g.y0), g.y1 - ch)
+        m.crop = Box(x0, y0, x0 + cw, y0 + ch)
+        n += 1
+    return n
 
 
 MARGIN_OUTLIER_RATIO = 1.30   # content >30% larger than the median = an outlier

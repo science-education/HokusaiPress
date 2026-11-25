@@ -38,7 +38,7 @@ BLANK_INK_FRAC = 0.001         # below this ink fraction (with no OCR content) =
 #                                a blank / show-through page -> render white
 
 
-def compute_margin(original: np.ndarray, sk, regions) -> tuple[np.ndarray, Margin]:
+def compute_margin(original: np.ndarray, sk, regions, dpi=None) -> tuple[np.ndarray, Margin]:
     """Region-based shadow removal + content box for one page.
 
     Shared by analyze_document (OCR path) and recompute_shadows_and_margins
@@ -74,6 +74,10 @@ def compute_margin(original: np.ndarray, sk, regions) -> tuple[np.ndarray, Margi
         mg.content = Box(0.0, 0.0, float(pw), float(ph))
         mg.confidence = 0.0           # -> MARGIN_NOT_FOUND via align_margins
     mg.page_w, mg.page_h = float(pw), float(ph)
+    glyphs = margin_mod.glyph_components(original, sk, dpi if dpi and dpi > 0 else 600)
+    if glyphs:
+        mg.glyph_box = Box(min(b.x0 for b in glyphs), min(b.y0 for b in glyphs),
+                           max(b.x1 for b in glyphs), max(b.y1 for b in glyphs))
     return original, mg
 
 
@@ -120,7 +124,7 @@ def _finish_page(args, sk, ocr_up) -> tuple[PageParams, np.ndarray, Margin]:
         openvino_cache_dir=openvino_cache_dir, runtime=runtime,
     )
 
-    original, mg = compute_margin(original, sk, regions)
+    original, mg = compute_margin(original, sk, regions, dpi)
 
     ocr_succeeded = use_ocr and (Flag.OCR_FAILED not in cflags)
     blank = False
@@ -224,6 +228,7 @@ def analyze_document(
     max_workers: int = 4,
     keep_orientation: bool = False,
     stored_pages: "dict[int, PageParams] | list[PageParams] | None" = None,
+    align_nombre: bool = True,
 ) -> AnalyzeResult:
     from .source import load_page
 
@@ -426,7 +431,15 @@ def analyze_document(
     t = perf_counter()
     heights = [o.shape[0] for o in originals]
     widths = [o.shape[1] for o in originals]
-    if os.environ.get("HOKUSAI_DISABLE_NOMBRE_READER") != "1":
+    reader_enabled = os.environ.get("HOKUSAI_DISABLE_NOMBRE_READER") != "1"
+    will_run_guided = (
+        align_nombre
+        and reader_enabled
+        and pages is None
+        and len(doc.pages) >= 2 * nombre_reader_mod.GUIDED_MIN_GROUP_PAGES
+    )
+
+    def _run_legacy_nombre_reader() -> None:
         for params, original, h, w in zip(doc.pages, originals, heights, widths):
             if not params.margin or not params.margin.content:
                 continue
@@ -450,6 +463,9 @@ def analyze_document(
                 )
                 for c in rcands
             ]
+
+    if reader_enabled and not will_run_guided:
+        _run_legacy_nombre_reader()
     warnings = nombre_mod.resolve(doc.pages, heights, widths, total_pages=total_pages)
     from .streak import streak_warning
     w = streak_warning({p.source.page_index: getattr(p, "_streaks", [])
@@ -457,7 +473,7 @@ def analyze_document(
     if w:
         warnings.append(w)
 
-    # 6. cross-page margin consistency + nombre-anchored normalization.
+    # 6. cross-page margin consistency + 3-pass margin normalization.
     # A confirmed-blank page (rendered as pure white regardless of margin/
     # content -- see render_page_image's blank short-circuit) has nothing to
     # review: confidence=0.0 there just means "no ink to anchor on", not a
@@ -472,7 +488,32 @@ def analyze_document(
         norm_pages = [combined[idx] for idx in sorted(combined)]
     else:
         norm_pages = doc.pages
-    margin_mod.normalize_margins(norm_pages, doc.render.output_margin_mm)
+
+    if align_nombre:
+        # Pass 1: type-area margin normalization
+        margin_mod.normalize_margins_pass1(norm_pages, doc.render.output_margin_mm)
+        # Pass 2a: Pass-1-guided margin-band folio localization
+        if will_run_guided:
+            t_folio = perf_counter()
+            guided = nombre_reader_mod.localize_folios_guided(
+                norm_pages,
+                originals=originals,
+                max_workers=effective_workers,
+            )
+            prof["folio_align"] += perf_counter() - t_folio
+            if guided.get("applied"):
+                nombre_mod.infer_folio_runs(norm_pages)
+                gap_w = nombre_mod.refresh_gap_warnings(norm_pages)
+                warnings = [msg for msg in warnings if "page(s) may be missing" not in msg] + gap_w
+            else:
+                # Fallback to per-page folio reader if guided pair didn't form
+                _run_legacy_nombre_reader()
+                gap_w = nombre_mod.resolve(doc.pages, heights, widths, total_pages=total_pages)
+                warnings = [msg for msg in warnings if "page(s) may be missing" not in msg] + gap_w
+        # Pass 2b + Pass 3: folio-aligned margin refinement (idempotent)
+        margin_mod.normalize_margins(norm_pages, doc.render.output_margin_mm)
+    else:
+        margin_mod.normalize_margins_pass1(norm_pages, doc.render.output_margin_mm)
     prof["nombre+normalize"] += perf_counter() - t
 
     # 6. learned page-kind override (from accumulated review decisions)
@@ -539,6 +580,7 @@ def run(
     runtime: str | None = "paddle",
     pages: "set[int] | None" = None,
     keep_orientation: bool = False,
+    align_nombre: bool = True,
 ) -> dict:
     """Full batch run: analyze, persist params, render the PDF."""
     from . import learn
@@ -571,7 +613,8 @@ def run(
                               openvino_cache_dir=openvino_cache_dir,
                               runtime=runtime, pages=pages,
                               keep_orientation=keep_orientation,
-                              stored_pages=existing_pages)
+                              stored_pages=existing_pages,
+                              align_nombre=align_nombre)
     t = perf_counter()
     store = Store(db_path)
     try:
@@ -753,14 +796,15 @@ def _load_and_compute_margin(args):
     from .source import load_single, orient
 
     original, _ = load_single(source_path, p.source.page_index)
-    cleaned, mg = compute_margin(orient(original, p.source), p.deskew, p.regions)
+    cleaned, mg = compute_margin(orient(original, p.source), p.deskew, p.regions, p.dpi)
     h, w = cleaned.shape[:2]
     return h, w, mg
 
 
 def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
                                   output_margin_mm: float = 5.0,
-                                  max_workers: int = 1) -> int:
+                                  max_workers: int = 1,
+                                  align_nombre: bool = True) -> int:
     """Re-run shadow removal + content-box detection from STORED regions, with
     no OCR / layout re-run. Returns the number of pages.
 
@@ -772,6 +816,11 @@ def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
     rebuild() to render the result; that already recomputes ink_valley/
     shadow_bands from the (now re-cleaned) originals.
 
+    Preserves previously verified nombre_box / page_number / nombre_text so
+    compute_margin's shape-only _detect_nombre heuristic never clobbers them.
+    When align_nombre is True (default), runs Pass 1 -> Pass 2a guided folio
+    re-identification -> Pass 2b/3 margin alignment.
+
     max_workers > 1 runs load_single + compute_margin for each page on a
     thread pool: pdfium extraction is already serialized process-wide (see
     source._PDFIUM_LOCK), and compute_margin's cv2 work releases the GIL, so
@@ -782,6 +831,16 @@ def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
     if err := check_doc_conflict(store, source_path, doc_id):
         raise ValueError(err)
     pages = [r.params for r in rows]
+    prev_nombre = [
+        (
+            p.margin.nombre_box if p.margin else None,
+            p.margin.nombre_source if p.margin else None,
+            p.page_number,
+            p.nombre_text,
+        )
+        for p in pages
+    ]
+
     worker_args = [(source_path, p) for p in pages]
     if max_workers > 1 and len(worker_args) > 1:
         from concurrent.futures import ThreadPoolExecutor
@@ -792,7 +851,23 @@ def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
         results = [_load_and_compute_margin(a) for a in worker_args]
     heights: list[int] = []
     widths: list[int] = []
-    for p, (h, w, mg) in zip(pages, results):
+    has_preserved_nombre = False
+    for p, (h, w, mg), (prev_nb, prev_src, prev_pnum, prev_ntxt) in zip(
+        pages, results, prev_nombre
+    ):
+        # Bug fix: never overwrite OCR/folio/manual (or legacy verified)
+        # nombre_box / page_number / nombre_text with _detect_nombre's guess.
+        if (
+            prev_src in ("folio", "ocr", "manual")
+            or prev_pnum is not None
+            or prev_ntxt is not None
+            or (prev_nb is not None and prev_src != "geom")
+        ):
+            mg.nombre_box = prev_nb
+            mg.nombre_source = prev_src
+            p.page_number = prev_pnum
+            p.nombre_text = prev_ntxt
+            has_preserved_nombre = True
         p.margin = mg
         heights.append(h)
         widths.append(w)
@@ -801,12 +876,31 @@ def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
         p.flags = [f for f in p.flags if f not in _RECOMPUTED_MARGIN_FLAGS]
 
     from . import nombre as nombre_mod
+    from . import nombre_reader as nombre_reader_mod
 
-    nombre_mod.resolve(pages, heights, widths)
+    if not has_preserved_nombre:
+        nombre_mod.resolve(pages, heights, widths)
+    else:
+        nombre_mod.refresh_gap_warnings(pages)
+
     for p, flag in zip(pages, margin_mod.align_margins([p.margin for p in pages])):
         if flag is not None and not p.blank and flag not in p.flags:
             p.flags.append(flag)
-    margin_mod.normalize_margins(pages, output_margin_mm)
+
+    if align_nombre:
+        # Pass 1 -> Pass 2a (guided folio localization) -> Pass 2b/3
+        margin_mod.normalize_margins_pass1(pages, output_margin_mm)
+        if os.environ.get("HOKUSAI_DISABLE_NOMBRE_READER") != "1":
+            guided = nombre_reader_mod.localize_folios_guided(
+                pages, source_path=source_path, max_workers=max_workers,
+            )
+            if guided.get("applied"):
+                nombre_mod.infer_folio_runs(pages)
+                nombre_mod.refresh_gap_warnings(pages)
+        margin_mod.normalize_margins(pages, output_margin_mm)
+    else:
+        margin_mod.normalize_margins_pass1(pages, output_margin_mm)
+
     _sync_review_status(pages)
 
     for p in pages:

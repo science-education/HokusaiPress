@@ -170,6 +170,7 @@ def _run_one(payload: dict) -> dict:
         openvino_cache_dir=payload["cache"],
         runtime=payload["runtime"], pages=payload["pages"],
         keep_orientation=payload.get("keep_orientation", False),
+        align_nombre=payload.get("align_nombre", True),
     )
     summary["tpb"] = time.perf_counter() - t0
     if payload.get("image_only"):
@@ -336,6 +337,9 @@ def main(argv=None) -> int:
                        help="process only these pages, numbered as in the PDF "
                             "(1 = the first page), e.g. '10,53,237-238' "
                             "(fast for debugging)")
+    p_run.add_argument("--no-nombre-align", action="store_true",
+                       help="disable 3-pass folio-aligned margin refinement "
+                            "(use Pass-1 type-area alignment only)")
 
     p_ocr = sub.add_parser(
         "ocr", help="replace the text layer of finished PDFs (images kept as is)")
@@ -445,6 +449,9 @@ def main(argv=None) -> int:
                                  "statistics need the full book to be "
                                  "representative; only the final render is "
                                  "limited.")
+    p_remargin.add_argument("--no-nombre-align", action="store_true",
+                            help="disable 3-pass folio-aligned margin refinement "
+                                 "(use Pass-1 type-area alignment only)")
 
     args = parser.parse_args(argv)
 
@@ -521,6 +528,7 @@ def main(argv=None) -> int:
                 "runtime": args.runtime or args.paddle_engine or "paddle",
                 "pages": pages_sel,
                 "keep_orientation": args.keep_orientation,
+                "align_nombre": not args.no_nombre_align,
             }
 
         flagged_docs = 0
@@ -801,7 +809,8 @@ def main(argv=None) -> int:
                 try:
                     n = recompute_shadows_and_margins(
                         store, doc_id, src, output_margin_mm=args.output_margin_mm,
-                        max_workers=args.workers)
+                        max_workers=args.workers,
+                        align_nombre=not args.no_nombre_align)
                     summary = rebuild(doc_id, src, out, db_path=args.db,
                                       max_workers=args.workers,
                                       use_processes=args.process_pool,

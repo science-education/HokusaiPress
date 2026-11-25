@@ -398,3 +398,69 @@ def test_npu_pipelined_propagates_producer_and_consumer_errors(monkeypatch):
     with pytest.raises(RuntimeError, match="finish boom"):
         pipeline_mod._analyze_pages_npu_pipelined([1, 2, 3, 4, 5])
 
+
+def test_gray_band_glyphs_inside_bleeding_photo_survive_protection():
+    from hokusai_press.geometry.margin import _protected_box
+    from hokusai_press.model import Box, Deskew, PageParams, Region, RegionKind, SourceRef
+    from hokusai_press.pipeline import compute_margin
+
+    image = np.full((500, 400, 3), 255, np.uint8)
+    image[50:120, :150] = 145
+    for x in (16, 38, 60):
+        cv2.rectangle(image, (x, 73), (x + 14, 91), (40, 40, 40), 2)
+    regions = [Region(RegionKind.PHOTO, Box(0, 50, 150, 120)),
+               Region(RegionKind.TEXT, Box(100, 160, 350, 400))]
+    _, margin = compute_margin(image, Deskew(), regions, 150)
+    page = PageParams(SourceRef("synthetic"), dpi=150, regions=regions, margin=margin)
+    protected = _protected_box(page, page.dpi)
+    assert 0 < protected.x0 <= 15
+    assert 50 < protected.y0 <= 72
+    assert margin.glyph_box.x1 >= 76
+    assert margin.glyph_box.y1 >= 93
+    assert protected.x1 == 350
+
+def test_reversed_digit_pairs_with_dark_letter_below_tab():
+    from hokusai_press.geometry.margin import glyph_components
+
+    image = np.full((250, 240), 255, np.uint8)
+    image[30:80, 145:] = 164
+    cv2.putText(image, "1", (172, 73), cv2.FONT_HERSHEY_SIMPLEX, 1, 250, 2)
+    cv2.putText(image, "A", (171, 98), cv2.FONT_HERSHEY_SIMPLEX, 0.8, 40, 2)
+    glyphs = glyph_components(image, Deskew(), 150)
+    assert any(170 < b.x0 < 185 and b.y0 < 60 and b.y1 > 70 for b in glyphs)
+    assert any(165 < b.x0 < 180 and b.y0 > 75 and b.y1 >= 98 for b in glyphs)
+    assert all(b.x1 < 205 for b in glyphs)
+
+
+def test_solid_square_ornament_band_above_running_head_is_protected():
+    from hokusai_press.geometry.margin import _protected_box
+    from hokusai_press.model import Box, Deskew, PageParams, Region, RegionKind, SourceRef
+    from hokusai_press.pipeline import compute_margin
+
+    # 150 dpi synthetic page (~5.9 px/mm): running head text + solid square band above it,
+    # plus an isolated large square elsewhere that must NOT be protected.
+    image = np.full((400, 400, 3), 255, np.uint8)
+    # Ornament band of solid filled squares at y=30..44 (height 14 px, ~2.4 mm)
+    for x in (30, 56, 82, 108):
+        cv2.rectangle(image, (x, 30), (x + 13, 43), (20, 20, 20), -1)
+    # Running head characters below at y=60..80
+    cv2.putText(image, "CH4", (35, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (20, 20, 20), 2)
+    # Isolated large solid square far from text (y=250..310, x=280..340)
+    cv2.rectangle(image, (280, 250), (340, 310), (20, 20, 20), -1)
+
+    regions = [Region(RegionKind.TEXT, Box(35, 58, 120, 82)),
+               Region(RegionKind.TEXT, Box(60, 120, 260, 240))]
+    _, margin = compute_margin(image, Deskew(), regions, 150)
+    page = PageParams(SourceRef("synthetic"), dpi=150, regions=regions, margin=margin)
+    protected = _protected_box(page, page.dpi)
+
+    assert margin.glyph_box is not None
+    assert margin.glyph_box.y0 <= 31
+    assert margin.glyph_box.x0 <= 31
+    assert protected.y0 <= 31
+    assert protected.x0 <= 31
+    # Isolated large square must not expand glyph_box or protected_box
+    assert margin.glyph_box.x1 < 270
+    assert margin.glyph_box.y1 < 240
+    assert protected.x1 == 260
+    assert protected.y1 == 240

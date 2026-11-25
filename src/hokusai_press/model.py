@@ -119,6 +119,9 @@ class Margin:
     confidence: float = 0.0
     # nombre (page-number) anchor used to align margins across pages, if found
     nombre_box: Optional[Box] = None
+    # provenance of nombre_box: "folio" (guided / folio_digit.onnx), "ocr",
+    # "geom" (shape-only _detect_nombre), "manual" (review UI), or None (legacy)
+    nombre_source: Optional[str] = None
     # normalized output crop (deskewed coords), set by margin normalization so
     # every page in a parity group renders to the same size with the body in a
     # consistent position. Already includes the output margin. When present the
@@ -148,6 +151,8 @@ class Margin:
     # target exactly (scaled up or down a little) instead of shrunk with white
     # bands around it.
     fill: bool = False
+    # Bounds of locally dark, character-sized components in deskewed pixels.
+    glyph_box: Optional[Box] = None
 
 
 @dataclass
@@ -182,6 +187,7 @@ class PageParams:
     # OCR found no content and the page has no real ink -> render as blank white
     # (rejects show-through). Only set when OCR ran, so it never erases text.
     blank: bool = False
+    page_number_source: Optional[str] = None
 
     def needs_review(self) -> bool:
         return self.review_status == ReviewStatus.NEEDS_REVIEW
@@ -280,6 +286,8 @@ def _decode_page(d) -> PageParams:
             content=_box(margin["content"]),
             confidence=margin.get("confidence", 0.0),
             nombre_box=_box(margin.get("nombre_box")),
+            glyph_box=_box(margin.get("glyph_box")),
+            nombre_source=margin.get("nombre_source"),
             crop=_box(margin.get("crop")),
             page_w=margin.get("page_w"),
             page_h=margin.get("page_h"),
@@ -294,6 +302,8 @@ def _decode_page(d) -> PageParams:
         decided_by=None if d.get("decided_by") is None else DecidedBy(d["decided_by"]),
         nombre_text=d.get("nombre_text"),
         page_number=d.get("page_number"),
+        page_number_source=d.get("page_number_source", (margin or {}).get("nombre_source")
+                                 if d.get("page_number") is not None else None),
         blank=d.get("blank", False),
     )
 

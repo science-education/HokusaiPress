@@ -233,6 +233,8 @@ def create_app(db_path: str):
         pageno = row.params.page_number
         pageno_html = (f'　ページ番号: <b>{pageno}</b>' if pageno is not None
                        else '　ページ番号: <span style="color:#a00">未読取</span>')
+        if row.params.page_number_source == "inferred":
+            pageno_html += "（推定）"
         # cache-busting token so a reload after an edit refetches the previews
         # instead of showing the browser-cached image at the same URL
         import time
@@ -553,11 +555,12 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
             raise HTTPException(404, "page not found")
         params = row.params
         # delete = revert content to auto-detection (keeps an existing nombre)
-        _, detected = compute_margin(_load_original(params), params.deskew, params.regions)
+        _, detected = compute_margin(_load_original(params), params.deskew, params.regions, params.dpi)
         if params.margin is None:
             params.margin = detected
         else:
             params.margin.content = detected.content
+            params.margin.glyph_box = detected.glyph_box
             params.margin.confidence = detected.confidence
             params.margin.page_w = detected.page_w
             params.margin.page_h = detected.page_h
@@ -581,6 +584,7 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
         old = ([m.nombre_box.x0, m.nombre_box.y0, m.nombre_box.x1, m.nombre_box.y1]
                if m.nombre_box else None)
         m.nombre_box = Box(edit.x0, edit.y0, edit.x1, edit.y1)
+        m.nombre_source = "manual"
         store.log_decision(doc_id, page_index, edit.decided_by, "nombre",
                            old, [edit.x0, edit.y0, edit.x1, edit.y1],
                            page_features(params))
@@ -600,6 +604,7 @@ setMode(localStorage.getItem('hp_mode') || 'gray');   // restore last mode
         if params.margin is None or params.margin.nombre_box is None:
             raise HTTPException(404, "no nombre to delete")
         params.margin.nombre_box = None    # normalize falls back to centering
+        params.margin.nombre_source = None
         store.log_decision(doc_id, page_index, "human", "nombre_delete",
                            None, None, page_features(params))
         store.upsert_page(doc_id, page_index, params)
