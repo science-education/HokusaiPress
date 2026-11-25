@@ -749,10 +749,20 @@ def infer_folio_runs(pages: list[PageParams]) -> dict[int, int]:
         start, offset = run[0]
         for idx in range(start + 1, run[-1][0]):
             p = by_index.get(idx)
-            if (p is None or p.blank or p.page_number is not None or idx + offset <= 0
-                    or parse_roman(p.nombre_text or "") or p.page_number_source == "manual"
+            if p is None:
+                continue
+            # an unlocated Roman reading inside an Arabic run is a misread mark
+            # (a chapter-title page read as "i"): the run overrides it
+            stale_roman = (p.page_number is not None and p.page_number_source is None
+                           and parse_roman(p.nombre_text or "") is not None
+                           and parse_numeral(p.nombre_text or "") is None)
+            if (p.blank or (p.page_number is not None and not stale_roman) or idx + offset <= 0
+                    or (parse_roman(p.nombre_text or "") and not stale_roman)
+                    or p.page_number_source == "manual"
                     or (p.margin and p.margin.nombre_source == "manual")):
                 continue
+            if stale_roman:
+                p.nombre_text = None
             p.page_number = inferred[idx] = idx + offset
             p.page_number_source = "inferred"
     return inferred

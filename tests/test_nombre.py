@@ -293,15 +293,32 @@ def test_infer_runs_rebuilds_only_bracketed_numeric_holes():
         pages[i].page_number = i + 1
         pages[i].margin.nombre_source = "folio"
     pages[5].blank = True
+    # an unlocated Roman reading inside an Arabic run is a misread mark
+    # (img20261121_0018 p19: a chapter-title page read as "i"): overridden
     pages[6].page_number, pages[6].nombre_text = 4, "iv"
     pages[7].margin.nombre_source = "manual"
-    expected = {3: 4, 8: 9, 9: 10}
+    expected = {3: 4, 6: 7, 8: 9, 9: 10}
     assert nombre.infer_folio_runs(pages[::-1]) == expected
     assert nombre.infer_folio_runs(pages) == expected
     assert all(pages[i].margin.nombre_box is None for i in expected)
     pages[10].page_number = None
     assert nombre.infer_folio_runs(pages) == {}
     assert all(pages[i].page_number is None for i in expected)
+
+
+def test_infer_runs_keeps_located_roman_front_matter():
+    pages = [_page(i) for i in range(12)]
+    pages[0].page_number, pages[0].nombre_text = 1, "i"
+    pages[0].page_number_source = "folio_roman"
+    for i in range(2, 12, 2):
+        pages[i].page_number = i - 1
+        pages[i].margin.nombre_source = "folio"
+    for i in range(3, 12, 2):
+        pages[i].page_number = i - 1
+        pages[i].margin.nombre_source = "folio"
+    nombre.infer_folio_runs(pages)
+    assert (pages[0].page_number, pages[0].nombre_text) == (1, "i")
+
 
 def test_number_source_roundtrip_and_legacy_page():
     import json
