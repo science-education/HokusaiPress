@@ -668,6 +668,8 @@ FULL_TYPE_FRAC = 0.8       # a page whose body spans >= this x the P90 is a full
 ANCHOR_TOL_IN = 0.2        # start corner within this (inch) of the consensus = aligned
 ANCHOR_TOL_FRAC = 0.03     # ... same, as a page fraction when dpi is unknown
 ANCHOR_MIN_GROUP = 3       # below this many pages a group has no consensus to test
+FRAME_MINOR_DIR_MIN = 20   # a minority-direction group needs this many pages to be a type area
+FRAME_FULL_LINE_FRAC = 0.9  # a page shows the type area only with a line this close to full length
 
 
 def _line_dir(b: Box) -> "str | None":
@@ -883,6 +885,20 @@ def normalize_margins_pass1(pages, output_margin_mm: float = 5.0) -> dict:
             ay = (H - th_d) / 2.0
         return ax, ay
 
+    matter: set = set()
+    _nums = [p.source.page_index for p in have if p.page_number is not None]
+    num_lo, num_hi = (min(_nums), max(_nums)) if _nums else (None, None)
+
+    def frame_ok(p, d):  # does this page show the type area of direction d?
+        td = tdims.get(d)
+        if td is None or id(p) not in bodies:
+            return False
+        if d != main_dir and len(td[2]) < FRAME_MINOR_DIR_MIN:
+            return False
+        b = bodies[id(p)][1]
+        long_, ref = (b.width, td[0]) if d == "h" else (b.height, td[1])
+        return long_ / unit(p) >= FRAME_FULL_LINE_FRAC * ref
+
     for p in have:
         u = unit(p)
         tw_px, th_px = W * u, H * u
@@ -900,14 +916,25 @@ def normalize_margins_pass1(pages, output_margin_mm: float = 5.0) -> dict:
         else:
             crop_w, crop_h = tw_px, th_px
         d = anchored.get(id(p))
-        if d is not None:
+        # a page inside the numbered run (from the first to the last page
+        # with a folio read or inferred) belongs to the body; only the front
+        # and back matter outside it (cover, title, colophon, advertisements)
+        # fall to (3)
+        numbered = num_lo is None or num_lo <= p.source.page_index <= num_hi
+        if d is not None and (frame_ok(p, d) or numbered):
+            # (1) the virtual type area (版面, as if every line were full)
+            # sits centred left-right at the book's top/bottom ratio
             ax, ay = anchor_out(d)
             cx, cy = _start_corner(d, bodies[id(p)][1])
             x0, y0 = cx - ax * u, cy - ay * u
             floor = 0.0
         else:
-            # proportional position on the paper (a deliberately off-centre
-            # part title stays where it was); centred without a page size
+            # proportional position on the paper; centred without a page size.
+            # An unnumbered front/back-matter page without the type area
+            # (cover, colophon, advertisement) is placed again after Pass 2 by
+            # the pages' mean correction (place_matter_pages).
+            if dom is not None and not numbered:
+                matter.add(id(p))
             fx = (c.x0 + c.width / 2) / p.margin.page_w if p.margin.page_w else 0.5
             fy = (c.y0 + c.height / 2) / p.margin.page_h if p.margin.page_h else 0.5
             x0 = c.x0 + c.width / 2 - fx * crop_w
@@ -950,6 +977,7 @@ def normalize_margins_pass1(pages, output_margin_mm: float = 5.0) -> dict:
     return {
         "have": have,
         "anchored_ids": set(anchored.keys()),
+        "matter_ids": matter,
         "bodies": bodies,
         "main_dir": main_dir,
         "use_dpi": use_dpi,
@@ -1510,6 +1538,83 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     pass1 = normalize_margins_pass1(pages, output_margin_mm=output_margin_mm)
     if pass1:
         _refine_margins_with_nombre(pages, pass1)
+        place_matter_pages(pages, pass1)
+
+
+MATTER_MIN_REF_PAGES = 6   # folio pages per parity needed to know the mean correction
+
+
+def place_matter_pages(pages, pass1: dict) -> int:
+    """Place unnumbered front/back matter without a type area (cover,
+    colophon, advertisements) by the correction the folio pages received.
+
+    Nothing on such a page tells where it belongs, and a scanner does not
+    translate one sheet by centimetres, so the page gets the median shift of
+    the same-parity folio pages (crop centre minus image centre). Both sides
+    of a sheet are scanned together: when the other side of the sheet is a
+    folio page its own deviation is added -- mirrored left-right (the sheet
+    is turned over) unless the book shows otherwise, same sign vertically.
+    Characters and the folio are never clipped. Returns pages placed."""
+    ids = pass1.get("matter_ids") or set()
+    if not ids:
+        return 0
+    use_dpi, fb = pass1["use_dpi"], pass1["fallback_dpi"]
+
+    def centre_off(p):
+        m = p.margin
+        dpi = _page_dpi(p, use_dpi, fb)
+        return (_px_to_mm((m.crop.x0 + m.crop.x1) / 2 - m.page_w / 2, dpi),
+                _px_to_mm((m.crop.y0 + m.crop.y1) / 2 - m.page_h / 2, dpi))
+
+    ref = {p.source.page_index: centre_off(p) for p in pages
+           if p.page_number is not None and p.margin and p.margin.crop
+           and p.margin.page_w and p.margin.page_h
+           and p.page_number_source in ("folio", "inverted_folio", "folio_roman")}
+    med = {}
+    for par in (0, 1):
+        v = [o for i, o in ref.items() if i % 2 == par]
+        if len(v) < MATTER_MIN_REF_PAGES:
+            return 0
+        med[par] = (float(np.median([o[0] for o in v])), float(np.median([o[1] for o in v])))
+    res = {i: (o[0] - med[i % 2][0], o[1] - med[i % 2][1]) for i, o in ref.items()}
+    # sheet = page indices (2k, 2k+1); measure how a sheet's two sides co-move
+    pairs = [(res[i], res[i + 1]) for i in range(0, max(res, default=0), 2)
+             if i in res and i + 1 in res]
+    sign = {0: -1.0, 1: 1.0}
+    if len(pairs) >= 10:
+        for ax in (0, 1):
+            a = np.array([q[0][ax] for q in pairs]); b = np.array([q[1][ax] for q in pairs])
+            if a.std() > 0 and b.std() > 0:
+                r = float(np.corrcoef(a, b)[0, 1])
+                sign[ax] = (1.0 if r > 0 else -1.0) if abs(r) >= 0.3 else 0.0
+            else:
+                sign[ax] = 0.0
+    else:
+        sign = {0: 0.0, 1: 0.0}
+    n = 0
+    for p in pages:
+        if id(p) not in ids or not (p.margin and p.margin.crop and p.margin.page_w and p.margin.page_h):
+            continue
+        m = p.margin
+        dpi = _page_dpi(p, use_dpi, fb)
+        par = p.source.page_index % 2
+        partner = res.get(p.source.page_index ^ 1)
+        ox, oy = med[par]
+        if partner is not None:
+            ox += sign[0] * partner[0]
+            oy += sign[1] * partner[1]
+        cw, ch = m.crop.width, m.crop.height
+        x0 = m.page_w / 2 + _mm_to_px(ox, dpi) - cw / 2
+        y0 = m.page_h / 2 + _mm_to_px(oy, dpi) - ch / 2
+        if m.confidence >= 0.2:
+            g = _protected_box(p, dpi)
+            if g.width <= cw:
+                x0 = max(min(x0, g.x0), g.x1 - cw)
+            if g.height <= ch:
+                y0 = max(min(y0, g.y0), g.y1 - ch)
+        m.crop = Box(x0, y0, x0 + cw, y0 + ch)
+        n += 1
+    return n
 
 
 MARGIN_OUTLIER_RATIO = 1.30   # content >30% larger than the median = an outlier

@@ -392,3 +392,50 @@ def test_image_without_dpi_keeps_requested_margin_mm_at_render():
     assert margin_x_mm == pytest.approx(5.0, abs=0.2)
     assert margin_y_mm == pytest.approx(5.0, abs=0.2)
 
+
+
+def _crop_page(idx, cx_off, cy_off, number=None, src=None, regions=()):
+    # dpi 254: 1 px = 0.1 mm; a 1000 x 1500 sheet, a 900 x 1400 crop
+    p = _numbered_page(idx, Box(100, 100, 900, 1400), 1000, 1500, None, dpi=254)
+    x0, y0 = 500 + cx_off - 450, 750 + cy_off - 700
+    p.margin.crop = Box(x0, y0, x0 + 900, y0 + 1400)
+    p.page_number, p.page_number_source = number, src
+    p.regions = list(regions)
+    return p
+
+
+def test_matter_page_gets_the_parity_correction_and_its_sheets_other_side():
+    from hokusai_press.geometry.margin import place_matter_pages
+    base = {0: (40.0, 5.0), 1: (-40.0, 5.0)}
+    pages = []
+    for i in range(1, 25):
+        k = i // 2                                   # sheet (2k, 2k+1)
+        rx, ry = ((k % 3) - 1) * 6.0, ((k % 3) - 1) * 4.0
+        sx = rx if i % 2 == 0 else -rx               # turned over: mirrored
+        pages.append(_crop_page(i, base[i % 2][0] + sx, base[i % 2][1] + ry, i, "folio"))
+    cover = _crop_page(0, 300.0, 300.0)              # wherever Pass 1 put it
+    colophon = _crop_page(25, -300.0, 0.0)
+    pages = [cover] + pages + [colophon]
+    pass1 = {"matter_ids": {id(cover), id(colophon)}, "use_dpi": True, "fallback_dpi": 600.0}
+    assert place_matter_pages(pages, pass1) == 2
+
+    def off(p):
+        return ((p.margin.crop.x0 + p.margin.crop.x1) / 2 - 500,
+                (p.margin.crop.y0 + p.margin.crop.y1) / 2 - 750)
+    # cover: page 1 (other side) deviates by (+6, -4) from its parity median
+    assert abs(off(cover)[0] - (40.0 - 6.0)) < 0.5
+    assert abs(off(cover)[1] - (5.0 - 4.0)) < 0.5
+    # colophon: page 24 (sheet 12, k%3=0) deviates by (-6, -4)
+    assert abs(off(colophon)[0] - (-40.0 + 6.0)) < 0.5
+    assert abs(off(colophon)[1] - (5.0 - 4.0)) < 0.5
+
+
+def test_matter_page_never_clips_characters():
+    from hokusai_press.geometry.margin import place_matter_pages
+    pages = [_crop_page(i, (60.0 if i % 2 == 0 else -60.0), 0.0, i, "folio") for i in range(1, 25)]
+    # a colophon whose text runs to x=960, 4 mm from the sheet edge (the crop
+    # at the odd-parity correction -60 would end at 890 and clip it)
+    col = _crop_page(25, 0.0, 0.0, regions=[_text(Box(600, 1200, 960, 1300))])
+    pages.append(col)
+    place_matter_pages(pages, {"matter_ids": {id(col)}, "use_dpi": True, "fallback_dpi": 600.0})
+    assert col.margin.crop.x1 >= 960
