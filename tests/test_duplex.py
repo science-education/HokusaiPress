@@ -160,17 +160,17 @@ def test_skew_pair_scoring_ignores_scanner_streak():
     pairing = determine_duplex_pairing(pages)
     assert pairing.known
 
-    # Create synthetic front (tilted +5 deg, deskewed at -5 -> text horizontal when rotated -5)
-    # and back (tilted -5 deg, deskewed at +5, PLUS a strong vertical scanner streak at 0 deg!)
+    # Create synthetic front (tilted so deskew -5.0 restores horizontal)
+    # and back (tilted opposite so deskew +5.0 restores horizontal, PLUS vertical streak!)
     h, w = 1000, 700
     base = np.full((h, w, 3), 255, dtype=np.uint8)
     for y in range(150, 850, 40):
         cv2.line(base, (100, y), (600, y), (0, 0, 0), 3)
 
-    M_front = cv2.getRotationMatrix2D((w / 2, h / 2), -5.0, 1.0)
+    M_front = cv2.getRotationMatrix2D((w / 2, h / 2), 5.0, 1.0)
     img_front = cv2.warpAffine(base, M_front, (w, h), borderValue=(255, 255, 255))
 
-    M_back = cv2.getRotationMatrix2D((w / 2, h / 2), 5.0, 1.0)
+    M_back = cv2.getRotationMatrix2D((w / 2, h / 2), -5.0, 1.0)
     img_back = cv2.warpAffine(base, M_back, (w, h), borderValue=(255, 255, 255))
     # Draw full-length vertical scanner streak on back image
     img_back[:, 348:354] = 140
@@ -183,6 +183,58 @@ def test_skew_pair_scoring_ignores_scanner_streak():
     assert len(changes) == 1
     assert changes[0]["page_index"] == 1
     assert abs(pages[1].deskew.angle_deg - 5.0) < 0.01
+    assert changes[0]["res_diff"] >= 0.3
+    assert abs(changes[0]["res_cand"]) <= 0.6
+
+
+def test_skew_does_not_corrupt_good_page_when_partner_is_wrong():
+    import cv2
+
+    pages = _make_duplex_book(n_pages=24, parity=0)
+    pairing = determine_duplex_pairing(pages)
+    assert pairing.known
+
+    h, w = 1000, 700
+    # Page 0: genuinely straight horizontal text (angle_deg = 0.0)
+    img_good = np.full((h, w, 3), 255, dtype=np.uint8)
+    for y in range(150, 850, 40):
+        cv2.line(img_good, (100, y), (600, y), (0, 0, 0), 3)
+
+    # Page 1: genuinely straight text too, but mis-estimated at +1.5 deg
+    # (e.g., sparse text / figure fooled find_skew). Its sharpness at 0.0 is
+    # higher than at +1.5, OR if it were truly tilted +1.5 deg, page 0's own
+    # score at -1.5 deg is much lower than at 0.0 deg -> page 0 must NOT change!
+    M_tilt = cv2.getRotationMatrix2D((w / 2, h / 2), -1.5, 1.0)
+    img_tilted = cv2.warpAffine(img_good, M_tilt, (w, h), borderValue=(255, 255, 255))
+
+    pages[0].deskew = Deskew(angle_deg=0.0, confidence=8.0)
+    pages[1].deskew = Deskew(angle_deg=1.5, confidence=1.0)
+
+    imgs = {0: img_good, 1: img_tilted}
+    changes = apply_duplex_skew_exceptions(pages, pairing, lambda idx: imgs[idx])
+    # Page 0 stays at 0.0 deg (never tilted to -1.5 deg)
+    assert pages[0].deskew.angle_deg == 0.0
+    assert all(c["page_index"] != 0 for c in changes)
+
+
+def test_skew_unmeasurable_sparse_page_is_not_changed():
+    pages = _make_duplex_book(n_pages=24, parity=0)
+    pairing = determine_duplex_pairing(pages)
+    assert pairing.known
+
+    h, w = 1000, 700
+    img_sparse = np.full((h, w, 3), 255, dtype=np.uint8)
+    # Tiny 3-character mark: too sparse to measure skew reliably
+    img_sparse[100:130, 100:115] = 0
+    img_back = np.full((h, w, 3), 255, dtype=np.uint8)
+
+    pages[0].deskew = Deskew(angle_deg=2.5, confidence=1.0)
+    pages[1].deskew = Deskew(angle_deg=-0.1, confidence=5.0)
+
+    imgs = {0: img_sparse, 1: img_back}
+    changes = apply_duplex_skew_exceptions(pages, pairing, lambda idx: imgs[idx])
+    assert pages[0].deskew.angle_deg == 2.5
+    assert changes == []
 
 
 def test_blank_insertion_preserves_dimensions_and_text_layer(tmp_path):

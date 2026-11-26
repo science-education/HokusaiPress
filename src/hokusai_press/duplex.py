@@ -19,6 +19,8 @@ ARABIC_FOLIO_SOURCES = frozenset({"folio", "inverted_folio"})
 MIN_DUPLEX_PAIRS = 10
 MIN_DUPLEX_CORR_X = -0.5
 SKEW_PAIR_DIFF_DEG = 0.5
+SKEW_INDEP_MIN_DIFF_DEG = 0.3
+SKEW_INDEP_MAX_RESIDUAL_DEG = 0.6
 
 
 @dataclass
@@ -304,13 +306,193 @@ def rotate_page_geometry(p: PageParams, delta_deg: float, w: int, h: int) -> Non
             p.margin.glyph_box = _rotate_box(p.margin.glyph_box, delta_deg, cx, cy)
 
 
+def _fit_line_angle_robust(xs: np.ndarray, ys: np.ndarray, vertical: bool) -> Optional[float]:
+    """Fit a Huber line to boundary points and return residual skew angle in degrees."""
+    if len(xs) < 6:
+        return None
+    pts = np.column_stack([xs, ys]).astype(np.float32)
+    vx, vy, _, _ = cv2.fitLine(pts, cv2.DIST_HUBER, 0, 0.01, 0.01)
+    vx, vy = float(vx[0]), float(vy[0])
+    if vertical:
+        if vy < 0:
+            vx, vy = -vx, -vy
+        ang = float(np.degrees(np.arctan2(-vx, vy)))
+    else:
+        if vx < 0:
+            vx, vy = -vx, -vy
+        ang = float(np.degrees(np.arctan2(vy, vx)))
+    return ang if abs(ang) <= 12.0 else None
+
+
+def measure_residual_skew_independent(
+    img_bgr: np.ndarray,
+    angle_deg: float,
+    rotate: int = 0,
+) -> Optional[float]:
+    """Measure residual skew (deg) after rotating by ``angle_deg``, independent of projection sharpness.
+
+    Combines boundary line fits of smeared text columns (tategaki) and rows (yokogaki)
+    with Hough line segments on thin ruled lines/borders (after masking out thick
+    solid/photo regions and scanner streaks). Returns ``None`` if too few lines exist.
+    """
+    from .geometry.deskew import _rotate
+
+    b, _ = _binary_without_streaks(img_bgr, rotate)
+    if float(b.sum()) < 150.0:
+        return None
+
+    b_rot = _rotate(b, angle_deg)
+    bh, bw = b_rot.shape
+    u8 = (b_rot > 0).astype(np.uint8) * 255
+
+    # 1. Ruled lines / borders via HoughLinesP on thin components (masking out thick photo/solid blobs)
+    thick = cv2.erode(u8, np.ones((9, 9), np.uint8))
+    thick_mask = cv2.dilate(thick, np.ones((17, 17), np.uint8))
+    thin_u8 = cv2.bitwise_and(u8, cv2.bitwise_not(thick_mask))
+    min_len = max(120, int(min(bh, bw) * 0.14))
+    lines = cv2.HoughLinesP(
+        thin_u8, 1, np.pi / 1800.0, threshold=90, minLineLength=min_len, maxLineGap=3
+    )
+    hough_angs: list[float] = []
+    hough_weights: list[float] = []
+    if lines is not None:
+        for x1, y1, x2, y2 in lines[:, 0]:
+            dx, dy = float(x2 - x1), float(y2 - y1)
+            length = float(np.hypot(dx, dy))
+            if length < min_len:
+                continue
+            if abs(dx) >= abs(dy):
+                if dx < 0:
+                    dx, dy = -dx, -dy
+                ang = float(np.degrees(np.arctan2(dy, dx)))
+            else:
+                if dy < 0:
+                    dx, dy = -dx, -dy
+                ang = float(np.degrees(np.arctan2(-dx, dy)))
+            if abs(ang) <= 10.0:
+                hough_angs.append(ang)
+                hough_weights.append(length)
+
+    # 2. Text column (tategaki) and row (yokogaki) boundary fits
+    n_lbl, labels, stats, _ = cv2.connectedComponentsWithStats(u8)
+    cw_arr = stats[:, cv2.CC_STAT_WIDTH]
+    ch_arr = stats[:, cv2.CC_STAT_HEIGHT]
+    area_arr = stats[:, cv2.CC_STAT_AREA]
+    valid = (
+        (area_arr >= 6)
+        & (cw_arr <= bw * 0.25)
+        & (ch_arr <= bh * 0.25)
+        & ((cw_arr >= 2) | (ch_arr >= 2))
+    )
+    valid[0] = False
+    char_count = int(valid.sum())
+    keep_lut = np.zeros(n_lbl, dtype=np.uint8)
+    keep_lut[valid] = 255
+    clean = keep_lut[labels]
+
+    col_angs: list[float] = []
+    col_weights: list[float] = []
+    row_angs: list[float] = []
+    row_weights: list[float] = []
+    if char_count >= 10:
+        k_v = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 25))
+        v_smear = cv2.dilate(clean, k_v)
+        nv, lv, sv, _ = cv2.connectedComponentsWithStats(v_smear)
+        min_col_h = max(120, int(bh * 0.10))
+        for k in range(1, nv):
+            cw, ch = sv[k, cv2.CC_STAT_WIDTH], sv[k, cv2.CC_STAT_HEIGHT]
+            if ch < min_col_h or cw > 90 or cw < 5:
+                continue
+            x0, y0 = sv[k, cv2.CC_STAT_LEFT], sv[k, cv2.CC_STAT_TOP]
+            sub = np.where(lv[y0:y0 + ch, x0:x0 + cw] == k, clean[y0:y0 + ch, x0:x0 + cw], 0)
+            lx, ly, rx, ry = [], [], [], []
+            for yy in range(0, ch, 8):
+                band = sub[yy:min(ch, yy + 8), :]
+                xs_on = np.flatnonzero(band.any(axis=0))
+                if xs_on.size > 0:
+                    ymid = float(yy + band.shape[0] / 2.0)
+                    lx.append(float(xs_on[0]))
+                    ly.append(ymid)
+                    rx.append(float(xs_on[-1]))
+                    ry.append(ymid)
+            a_l = _fit_line_angle_robust(np.array(lx), np.array(ly), vertical=True)
+            a_r = _fit_line_angle_robust(np.array(rx), np.array(ry), vertical=True)
+            if a_l is not None and a_r is not None and abs(a_l - a_r) <= 2.2:
+                col_angs.append((a_l + a_r) / 2.0)
+                col_weights.append(float(ch))
+
+        k_h = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 3))
+        h_smear = cv2.dilate(clean, k_h)
+        nh, lh, sh, _ = cv2.connectedComponentsWithStats(h_smear)
+        min_row_w = max(120, int(bw * 0.10))
+        for k in range(1, nh):
+            cw, ch = sh[k, cv2.CC_STAT_WIDTH], sh[k, cv2.CC_STAT_HEIGHT]
+            if cw < min_row_w or ch > 90 or ch < 5:
+                continue
+            x0, y0 = sh[k, cv2.CC_STAT_LEFT], sh[k, cv2.CC_STAT_TOP]
+            sub = np.where(lh[y0:y0 + ch, x0:x0 + cw] == k, clean[y0:y0 + ch, x0:x0 + cw], 0)
+            tx, ty, bx, by = [], [], [], []
+            for xx in range(0, cw, 8):
+                band = sub[:, xx:min(cw, xx + 8)]
+                ys_on = np.flatnonzero(band.any(axis=1))
+                if ys_on.size > 0:
+                    xmid = float(xx + band.shape[1] / 2.0)
+                    tx.append(xmid)
+                    ty.append(float(ys_on[0]))
+                    bx.append(xmid)
+                    by.append(float(ys_on[-1]))
+            a_t = _fit_line_angle_robust(np.array(tx), np.array(ty), vertical=False)
+            a_b = _fit_line_angle_robust(np.array(bx), np.array(by), vertical=False)
+            if a_t is not None and a_b is not None and abs(a_t - a_b) <= 2.2:
+                row_angs.append((a_t + a_b) / 2.0)
+                row_weights.append(float(cw))
+
+    all_angs: list[float] = []
+    all_weights: list[float] = []
+    col_len = sum(col_weights)
+    row_len = sum(row_weights)
+    if col_angs and col_len >= row_len * 0.8:
+        all_angs.extend(col_angs)
+        all_weights.extend(col_weights)
+    elif row_angs and row_len > col_len * 0.8:
+        all_angs.extend(row_angs)
+        all_weights.extend(row_weights)
+
+    if len(hough_angs) >= 2:
+        if len(hough_angs) > 80:
+            top_idx = np.argsort(hough_weights)[-80:]
+            hough_angs = [hough_angs[idx] for idx in top_idx]
+            hough_weights = [hough_weights[idx] for idx in top_idx]
+        all_angs.extend(hough_angs)
+        all_weights.extend([w * 1.2 for w in hough_weights])
+
+    strong_single = len(all_angs) == 1 and all_weights[0] >= 180.0
+    if len(all_angs) < 2 and not strong_single:
+        return None
+
+    order = np.argsort(all_angs)
+    s_ang = np.array(all_angs)[order]
+    s_w = np.array(all_weights)[order]
+    cdf = np.cumsum(s_w) / s_w.sum()
+    return round(float(s_ang[np.searchsorted(cdf, 0.5)]), 3)
+
+
 def apply_duplex_skew_exceptions(
     pages: list[PageParams],
     pairing: DuplexPairing,
     load_image_fn: Callable[[int], np.ndarray],
     threshold_deg: float = SKEW_PAIR_DIFF_DEG,
+    min_diff_deg: float = SKEW_INDEP_MIN_DIFF_DEG,
+    max_residual_deg: float = SKEW_INDEP_MAX_RESIDUAL_DEG,
 ) -> list[dict]:
-    """Part C: re-score skew on pairs where |theta_a + theta_b| > threshold_deg."""
+    """Part C: evaluate discrepant pairs (|theta_a + theta_b| > threshold_deg) using
+    the independent residual skew metric.
+
+    Each page is updated independently only when both its current angle and the
+    partner-mirrored angle are measurable, the partner-mirrored angle reduces
+    |residual| by at least ``min_diff_deg``, and the resulting |residual| is
+    within ``max_residual_deg``.
+    """
     if not pairing.known:
         return []
     changes: list[dict] = []
@@ -331,23 +513,32 @@ def apply_duplex_skew_exceptions(
         img_b = load_image_fn(pb.source.page_index)
         rot_a = pa.source.rotate if pa.source else 0
         rot_b = pb.source.rotate if pb.source else 0
-        c1, c2, raw_a, raw_b = score_skew_pair(img_a, rot_a, ang_a, img_b, rot_b, ang_b)
-        new_a, new_b = (ang_a, -ang_a) if c1 >= c2 else (-ang_b, ang_b)
 
-        for p, img, old_ang, new_ang in ((pa, img_a, ang_a, new_a), (pb, img_b, ang_b, new_b)):
-            if abs(new_ang - old_ang) > 1e-3:
-                h, w = img.shape[:2]
-                conf = p.deskew.confidence if p.deskew else 0.0
-                p.deskew = Deskew(angle_deg=round(float(new_ang), 3), confidence=conf)
-                rotate_page_geometry(p, new_ang - old_ang, w, h)
-                changes.append({
-                    "page_index": p.source.page_index,
-                    "partner_index": pb.source.page_index if p is pa else pa.source.page_index,
-                    "old_angle": old_ang,
-                    "new_angle": round(float(new_ang), 3),
-                    "score_combo1": round(c1, 4),
-                    "score_combo2": round(c2, 4),
-                })
+        for p, partner_p, img, rot, old_ang, cand_ang in (
+            (pa, pb, img_a, rot_a, ang_a, -ang_b),
+            (pb, pa, img_b, rot_b, ang_b, -ang_a),
+        ):
+            res_curr = measure_residual_skew_independent(img, old_ang, rot)
+            res_cand = measure_residual_skew_independent(img, cand_ang, rot)
+            if res_curr is None or res_cand is None:
+                continue
+            diff = abs(res_curr) - abs(res_cand)
+            if diff >= min_diff_deg and abs(res_cand) <= max_residual_deg:
+                new_ang = cand_ang
+                if abs(new_ang - old_ang) > 1e-3:
+                    h, w = img.shape[:2]
+                    conf = p.deskew.confidence if p.deskew else 0.0
+                    p.deskew = Deskew(angle_deg=round(float(new_ang), 3), confidence=conf)
+                    rotate_page_geometry(p, new_ang - old_ang, w, h)
+                    changes.append({
+                        "page_index": p.source.page_index,
+                        "partner_index": partner_p.source.page_index,
+                        "old_angle": old_ang,
+                        "new_angle": round(float(new_ang), 3),
+                        "res_curr": res_curr,
+                        "res_cand": res_cand,
+                        "res_diff": round(float(diff), 3),
+                    })
     return changes
 
 
