@@ -176,12 +176,27 @@ def apply_duplex_translation_exceptions(
     lo, hi = min(folio_indices), max(folio_indices)
     result["applied"] = True
 
+    trusted_cws = [
+        pages[k].margin.content.width
+        for k in range(len(pages))
+        if pairing.trusted[k] and pages[k].margin and pages[k].margin.content
+    ]
+    trusted_chs = [
+        pages[k].margin.content.height
+        for k in range(len(pages))
+        if pairing.trusted[k] and pages[k].margin and pages[k].margin.content
+    ]
+    med_cw = float(np.median(trusted_cws)) if trusted_cws else 0.0
+    med_ch = float(np.median(trusted_chs)) if trusted_chs else 0.0
+
     for i in range(lo, hi + 1):
         p = pages[i]
         m = p.margin
         if p.blank or not (m and m.crop and m.page_w and m.page_h):
             continue
         if m.fill or Flag.CONTENT_SCALED_DOWN in p.flags:
+            continue
+        if getattr(m, "bg_tint_frac", 0.0) >= 0.45:
             continue
         if not folio_not_found(p):
             continue
@@ -204,6 +219,17 @@ def apply_duplex_translation_exceptions(
         x0 = m.page_w / 2.0 + ox_p * px_per_mm - cw / 2.0
         y0 = m.page_h / 2.0 + oy_p * px_per_mm - ch / 2.0
         cand_partner = Box(x0, y0, x0 + cw, y0 + ch)
+
+        # Skip non-body layout pages (chapter title / plate pages with small
+        # off-type-area content where Pass 1 placed them independently).
+        if (
+            med_cw > 0 and med_ch > 0 and m.content is not None
+            and m.content.width < 0.35 * med_cw
+            and m.content.height < 0.75 * med_ch
+            and sum(1 for r in (p.regions or []) if r.ocr_text) <= 5
+            and max(abs(cand_partner.x0 - base_crop.x0), abs(cand_partner.y0 - base_crop.y0)) > 20.0 * px_per_mm
+        ):
+            continue
         if not _clips_interior_ocr_text(p, cand_partner, dpi):
             m.crop = cand_partner
             result["partner"].append(i)

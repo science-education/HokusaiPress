@@ -268,3 +268,82 @@ def test_blank_insertion_preserves_dimensions_and_text_layer(tmp_path):
         assert "本文テキスト" in "".join(pdf[2].get_textpage().get_text_range().split())
     finally:
         pdf.close()
+
+
+def test_duplex_translation_skips_tinted_chapter_page():
+    pages = _make_duplex_book(n_pages=30, parity=0)
+    p4 = pages[4]
+    p4.page_number = 5
+    p4.page_number_source = "inferred"
+    p4.margin.nombre_box = None
+    p4.margin.nombre_source = None
+    p4.margin.bg_tint_frac = 0.90
+    p4.margin.content = Box(1270, 100, 1620, 1500)
+    base_crop = Box(580, -470, 2180, 1930)
+    p4.margin.crop = Box(base_crop.x0, base_crop.y0, base_crop.x1, base_crop.y1)
+    p4.regions = [Region(kind=RegionKind.TEXT, box=Box(1420, 100, 1530, 1400), ocr_text="第Ⅳ章")]
+
+    pairing = determine_duplex_pairing(pages)
+    assert pairing.known
+    res = apply_duplex_translation_exceptions(pages, pairing)
+    assert 4 not in res["partner"]
+    assert 4 not in res["median"]
+    assert pages[4].margin.crop == base_crop
+
+
+def test_predicted_folio_protects_ink_from_margin_fill():
+    import cv2
+    from hokusai_press.geometry.margin import detect_predicted_folio_box, protect_edge_folio
+    from hokusai_press.model import RenderSettings
+    from hokusai_press.render import render_page_image
+
+    pages = _make_duplex_book(n_pages=10, parity=0)
+    # Reliable even-indexed pages have nombre_box at (100, 2800, 140, 2830) relative to (200, 300) crop
+    for k in range(0, 10, 2):
+        pages[k].margin.crop = Box(200, 300, 1800, 2700)
+        pages[k].margin.nombre_box = Box(300, 2600, 340, 2630)
+        pages[k].margin.nombre_source = "folio"
+
+    # Target page 4: folio_not_found, content excludes folio at (305, 2605, 338, 2627)
+    p4 = pages[4]
+    p4.page_number = None
+    p4.page_number_source = None
+    p4.margin.crop = Box(200, 300, 1800, 2700)
+    p4.margin.nombre_box = None
+    p4.margin.nombre_source = None
+    p4.margin.content = Box(400, 350, 1750, 2650)
+
+    img = np.full((3000, 2000, 3), 255, dtype=np.uint8)
+    cv2.putText(img, "13", (305, 2625), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (20, 20, 20), 2)
+
+    ef = detect_predicted_folio_box(img, pages, 4, dpi=300.0)
+    assert ef is not None
+    protect_edge_folio(p4, ef)
+    assert p4.margin.edge_folio_box is not None
+
+    out, _, _, _ = render_page_image(img, p4, RenderSettings(target_dpi=300))
+    # Folio pixels inside output coordinates (around x=105..140, y=2300..2330) must NOT be whitened
+    patch = out[2295:2335, 100:145]
+    assert patch.min() < 100
+
+
+def test_predicted_folio_noop_when_no_ink():
+    from hokusai_press.geometry.margin import detect_predicted_folio_box
+
+    pages = _make_duplex_book(n_pages=10, parity=0)
+    for k in range(0, 10, 2):
+        pages[k].margin.crop = Box(200, 300, 1800, 2700)
+        pages[k].margin.nombre_box = Box(300, 2600, 340, 2630)
+        pages[k].margin.nombre_source = "folio"
+
+    p4 = pages[4]
+    p4.page_number = None
+    p4.page_number_source = None
+    p4.margin.nombre_box = None
+    p4.margin.nombre_source = None
+    p4.margin.content = Box(400, 350, 1750, 2650)
+
+    blank_img = np.full((3000, 2000, 3), 255, dtype=np.uint8)
+    ef = detect_predicted_folio_box(blank_img, pages, 4, dpi=300.0)
+    assert ef is None
+    assert p4.margin.edge_folio_box is None

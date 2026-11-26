@@ -1272,6 +1272,119 @@ def detect_edge_folio_box(image: np.ndarray, p, dpi: float) -> Optional[Box]:
     )
 
 
+def detect_predicted_folio_box(
+    image: np.ndarray,
+    pages,
+    idx: int,
+    dpi: float,
+) -> Optional[Box]:
+    """Predict folio position from same-parity trusted pages and protect local digit ink.
+
+    Only runs on ``folio_not_found(p)`` pages. Maps the median output-space
+    ``nombre_box`` offset of same-parity trusted pages back into this page's
+    deskewed coordinates, then searches a small local ROI (+-5mm X, +-4mm Y)
+    at full resolution for isolated digit-sized strokes. Returns a Box only
+    when such ink exists outside ``m.content`` (so margin-fill would otherwise
+    whiten it away); returns None when no digit ink is found.
+    """
+    p = pages[idx]
+    m = p.margin
+    if m is None or m.crop is None or p.blank or not folio_not_found(p):
+        return None
+
+    par = idx % 2
+    pts = []
+    for k, pk in enumerate(pages):
+        if k % 2 != par or pk.blank or folio_not_found(pk):
+            continue
+        mk = pk.margin
+        if not (mk and mk.crop and mk.nombre_box and mk.nombre_source != "geom"):
+            continue
+        nb, cr = mk.nombre_box, mk.crop
+        pts.append((nb.x0 - cr.x0, nb.y0 - cr.y0, nb.x1 - cr.x0, nb.y1 - cr.y0))
+    if len(pts) < 3:
+        return None
+
+    med = np.median(pts, axis=0)
+    pred = Box(
+        m.crop.x0 + float(med[0]),
+        m.crop.y0 + float(med[1]),
+        m.crop.x0 + float(med[2]),
+        m.crop.y0 + float(med[3]),
+    )
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    h, w = gray.shape
+    if p.deskew and abs(p.deskew.angle_deg) > 1e-3:
+        matrix = cv2.getRotationMatrix2D((w / 2, h / 2), p.deskew.angle_deg, 1)
+        gray = cv2.warpAffine(gray, matrix, (w, h), borderValue=255)
+
+    unit = dpi / 25.4
+    pad_x, pad_y = 5.0 * unit, 4.0 * unit
+    edge = 1.5 * unit
+    rx0 = max(int(edge), int(np.floor(pred.x0 - pad_x)))
+    ry0 = max(int(edge), int(np.floor(pred.y0 - pad_y)))
+    rx1 = min(int(w - edge), int(np.ceil(pred.x1 + pad_x)))
+    ry1 = min(int(h - edge), int(np.ceil(pred.y1 + pad_y)))
+    if rx1 - rx0 < 4 or ry1 - ry0 < 4:
+        return None
+
+    roi = gray[ry0:ry1, rx0:rx1]
+    if roi.min() >= 150:
+        return None
+    _, mask = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    _, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+
+    ct = m.content
+    glyphs: list[tuple[int, int, int, int]] = []
+    for x, y, bw, bh, area in stats[1:].tolist():
+        if not (
+            1.2 * unit <= bh <= 5.0 * unit
+            and 0.14 * bh <= bw <= 2.5 * bh
+            and 0.14 * bw * bh <= area <= 0.90 * bw * bh
+        ):
+            continue
+        if bw > 1.3 * bh:
+            inset = max(1, bw // 4)
+            core = mask[y:y + bh, x + inset:x + bw - inset]
+            if np.count_nonzero(core, axis=0).min() > 0.4 * bh:
+                continue
+        py0, py1 = max(0, y - 1), min(roi.shape[0], y + bh + 1)
+        px0, px1 = max(0, x - 1), min(roi.shape[1], x + bw + 1)
+        patch = roi[py0:py1, px0:px1]
+        if patch.min() < 150 and np.median(patch[[0, -1], :]) > 190:
+            gx0, gy0, gx1, gy1 = rx0 + x, ry0 + y, rx0 + x + bw, ry0 + y + bh
+            if (
+                gx1 >= pred.x0 - 2.5 * unit
+                and gx0 <= pred.x1 + 2.5 * unit
+                and gy1 >= pred.y0 - 2.5 * unit
+                and gy0 <= pred.y1 + 2.5 * unit
+            ):
+                glyphs.append((gx0, gy0, gx1, gy1))
+
+    if not glyphs:
+        return None
+
+    # Only protect when at least one detected digit stroke lies outside content
+    # (otherwise margin-fill already preserves it).
+    if ct is not None:
+        out_ct = [
+            g for g in glyphs
+            if (g[0] < ct.x0 - 0.5 or g[2] > ct.x1 + 0.5
+                or g[1] < ct.y0 - 0.5 or g[3] > ct.y1 + 0.5)
+        ]
+        if not out_ct:
+            return None
+        glyphs = out_ct
+
+    return Box(
+        float(min(g[0] for g in glyphs) - 1),
+        float(min(g[1] for g in glyphs) - 1),
+        float(max(g[2] for g in glyphs) + 1),
+        float(max(g[3] for g in glyphs) + 1),
+    )
+
+
 def protect_edge_folio(p, ef: Box) -> bool:
     """Protect an edge/corner folio by pure translation of crop (never scaling)."""
     m = p.margin

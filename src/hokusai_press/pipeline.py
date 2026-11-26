@@ -74,6 +74,9 @@ def compute_margin(original: np.ndarray, sk, regions, dpi=None) -> tuple[np.ndar
         mg.content = Box(0.0, 0.0, float(pw), float(ph))
         mg.confidence = 0.0           # -> MARGIN_NOT_FOUND via align_margins
     mg.page_w, mg.page_h = float(pw), float(ph)
+    import cv2
+    gray = cv2.cvtColor(original, cv2.COLOR_BGR2GRAY) if original.ndim == 3 else original
+    mg.bg_tint_frac = round(float(np.mean((gray >= 100) & (gray <= 245))), 4)
     glyphs = margin_mod.glyph_components(original, sk, dpi if dpi and dpi > 0 else 600)
     if glyphs:
         mg.glyph_box = Box(min(b.x0 for b in glyphs), min(b.y0 for b in glyphs),
@@ -853,7 +856,7 @@ def _apply_edge_folio_protection(pages: list[PageParams],
     outer band and translate crop (never scale) + record edge_folio_box."""
     from .source import load_single, orient
 
-    for p in pages:
+    for idx, p in enumerate(pages):
         if p.blank or not (p.margin and p.margin.crop):
             continue
         if not margin_mod.folio_not_found(p):
@@ -869,8 +872,17 @@ def _apply_edge_folio_protection(pages: list[PageParams],
             continue
         dpi = p.dpi if p.dpi and p.dpi > 0 else 600.0
         ef = margin_mod.detect_edge_folio_box(img, p, dpi)
-        if ef is not None:
+        pf = margin_mod.detect_predicted_folio_box(img, pages, idx, dpi)
+        if ef is not None and pf is not None:
+            combined = margin_mod.Box(
+                min(ef.x0, pf.x0), min(ef.y0, pf.y0),
+                max(ef.x1, pf.x1), max(ef.y1, pf.y1),
+            )
+            margin_mod.protect_edge_folio(p, combined)
+        elif ef is not None:
             margin_mod.protect_edge_folio(p, ef)
+        elif pf is not None:
+            margin_mod.protect_edge_folio(p, pf)
 
 
 def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
