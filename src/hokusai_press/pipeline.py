@@ -514,6 +514,10 @@ def analyze_document(
         margin_mod.normalize_margins(norm_pages, doc.render.output_margin_mm)
     else:
         margin_mod.normalize_margins_pass1(norm_pages, doc.render.output_margin_mm)
+    _apply_edge_folio_protection(
+        norm_pages,
+        originals_by_idx={p.source.page_index: img for p, img in zip(doc.pages, originals)},
+    )
     prof["nombre+normalize"] += perf_counter() - t
 
     # 6. learned page-kind override (from accumulated review decisions)
@@ -801,6 +805,33 @@ def _load_and_compute_margin(args):
     return h, w, mg
 
 
+def _apply_edge_folio_protection(pages: list[PageParams],
+                                 source_path: Optional[str] = None,
+                                 originals_by_idx: Optional[dict[int, np.ndarray]] = None) -> None:
+    """Fallback: for pages where normal folio search missed the folio, scan the
+    outer band and translate crop (never scale) + record edge_folio_box."""
+    from .source import load_single, orient
+
+    for p in pages:
+        if p.blank or not (p.margin and p.margin.crop):
+            continue
+        if not margin_mod.folio_not_found(p):
+            continue
+        if originals_by_idx is not None:
+            img = originals_by_idx.get(p.source.page_index)
+            if img is None:
+                continue
+        elif source_path is not None:
+            img, _ = load_single(source_path, p.source.page_index)
+            img = orient(img, p.source)
+        else:
+            continue
+        dpi = p.dpi if p.dpi and p.dpi > 0 else 600.0
+        ef = margin_mod.detect_edge_folio_box(img, p, dpi)
+        if ef is not None:
+            margin_mod.protect_edge_folio(p, ef)
+
+
 def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
                                   output_margin_mm: float = 5.0,
                                   max_workers: int = 1,
@@ -900,6 +931,7 @@ def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
         margin_mod.normalize_margins(pages, output_margin_mm)
     else:
         margin_mod.normalize_margins_pass1(pages, output_margin_mm)
+    _apply_edge_folio_protection(pages, source_path=source_path)
 
     _sync_review_status(pages)
 

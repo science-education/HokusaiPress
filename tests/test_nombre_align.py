@@ -667,3 +667,108 @@ def test_guided_folio_localization_roman_front_matter():
     assert max(even_x0) - min(even_x0) < 0.15
     assert max(odd_x1) - min(odd_x1) < 0.15
     assert max(all_cy) - min(all_cy) < 0.15
+
+
+def test_inset_folio_protects_outside_ocr_text():
+    """Bug 1: When a folio is inset relative to a body text line, the OCR text
+    line outside the folio must not be clipped by the Pass-3 clamp."""
+    pages = [
+        _make_yokogaki_book_page(
+            i, nb_outer_x_mm=125.0 if i % 2 == 0 else 15.0,
+            nb_y_mm=192.0, page_number=i + 10,
+        )
+        for i in range(20)
+    ]
+    page = pages[7]  # folio on LEFT (outer) edge
+    m = page.margin
+    m.nombre_box.x0 += _mm(4.0)
+    m.nombre_box.x1 += _mm(4.0)
+    # Body text line extending further left than the inset folio (but outside bleed)
+    line_box = Box(_mm(6.0), _mm(50.0), _mm(120.0), _mm(55.0))
+    page.regions.append(Region(RegionKind.TEXT, line_box, ocr_text="本文の行頭"))
+    m.content = Box(min(m.content.x0, line_box.x0), min(m.content.y0, line_box.y0),
+                    max(m.content.x1, line_box.x1), max(m.content.y1, line_box.y1))
+    normalize_margins(pages, output_margin_mm=5.0)
+    assert m.crop.x0 <= line_box.x0 + 1e-6
+    assert m.target_w == pytest.approx(pages[0].margin.target_w)
+
+
+def test_bleed_chapter_tab_not_protected_by_inset_folio():
+    """A chapter tab in the NOMBRE_BLEED_MM edge band (without OCR text) must
+    still be trimmable and must not trigger the Bug-1 exception."""
+    pages = [
+        _make_yokogaki_book_page(
+            i, nb_outer_x_mm=125.0 if i % 2 == 0 else 15.0,
+            nb_y_mm=192.0, page_number=i + 10,
+        )
+        for i in range(20)
+    ]
+    page = pages[6]  # folio on RIGHT (outer) edge
+    m = page.margin
+    m.nombre_box.x0 -= _mm(4.0)
+    m.nombre_box.x1 -= _mm(4.0)
+    tab_box = Box(_mm(128.0), _mm(40.0), _mm(139.0), _mm(60.0))
+    page.regions.append(Region(RegionKind.TEXT, tab_box, ocr_text=None))
+    m.content = Box(min(m.content.x0, tab_box.x0), min(m.content.y0, tab_box.y0),
+                    max(m.content.x1, tab_box.x1), max(m.content.y1, tab_box.y1))
+    normalize_margins(pages, output_margin_mm=5.0)
+    assert m.crop.x1 < tab_box.x1 - _mm(2.0)
+
+
+def test_edge_folio_detected_only_when_folio_not_found():
+    """Bug 2: Corner folio in the outer band is detected and protected by pure
+    translation + render white-fill only when normal search missed the folio."""
+    from hokusai_press.geometry.margin import detect_edge_folio_box, protect_edge_folio
+    from hokusai_press.model import RenderSettings
+    from hokusai_press.render import compose_box_transform, render_page_image
+
+    dpi = 150.0
+    img = np.full((690, 500, 3), 255, np.uint8)
+    cv2.putText(img, "9", (468, 672), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2)
+
+    # Normal page with valid page_number: edge folio search must NOT run
+    found_page = PageParams(
+        SourceRef(path="scan.pdf", page_index=0),
+        dpi=dpi,
+        page_number=9,
+        page_number_source="folio",
+        margin=Margin(Box(50, 40, 450, 610), 1.0, crop=Box(0, 0, 500, 640), page_w=500, page_h=690),
+    )
+    assert detect_edge_folio_box(img, found_page, dpi) is None
+
+    # Page where normal search missed the folio (page_number=None)
+    missed_page = PageParams(
+        SourceRef(path="scan.pdf", page_index=1),
+        dpi=dpi,
+        page_number=None,
+        margin=Margin(Box(50, 40, 450, 610), 1.0, crop=Box(0, 0, 500, 640), page_w=500, page_h=690),
+    )
+    ef = detect_edge_folio_box(img, missed_page, dpi)
+    assert ef is not None
+    assert protect_edge_folio(missed_page, ef) is True
+    assert missed_page.margin.crop.y1 >= ef.y1 - 1e-6
+    assert missed_page.margin.crop.height == pytest.approx(640.0)
+
+    settings = RenderSettings(target_dpi=dpi)
+    result, *_ = render_page_image(img, missed_page, settings)
+    matrix, _, _ = compose_box_transform(img.shape, missed_page, settings)
+    y, x = np.where(img[650:, 460:, 0] == 0)
+    xy = np.column_stack((x + 460, y + 650)) @ matrix[:, :2].T + matrix[:, 2]
+    xx, yy = np.rint(xy).astype(int).T
+    assert (result[yy, xx, 0] < 160).mean() > 0.90
+
+
+def test_normal_folio_page_crop_unchanged():
+    """Pages with normal folios and no clipped OCR text keep identical crops."""
+    pages = [
+        _make_yokogaki_book_page(
+            i, nb_outer_x_mm=125.0 if i % 2 == 0 else 15.0,
+            nb_y_mm=192.0, page_number=i + 10,
+        )
+        for i in range(20)
+    ]
+    normalize_margins(pages, output_margin_mm=5.0)
+    crops_before = [p.margin.crop for p in pages]
+    normalize_margins(pages, output_margin_mm=5.0)
+    for p, cb in zip(pages, crops_before):
+        assert p.margin.crop == cb

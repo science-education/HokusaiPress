@@ -253,6 +253,11 @@ def render_page_image(
             pad = 0.6 * nb.height        # enough for an underline/overline/rule
             fb = Box(min(fb.x0, nb.x0 - pad), min(fb.y0, nb.y0 - pad),
                      max(fb.x1, nb.x1 + pad), max(fb.y1, nb.y1 + pad))
+        ef = params.margin.edge_folio_box
+        if ef is not None:
+            pad_ef = 0.6 * ef.height
+            fb = Box(min(fb.x0, ef.x0 - pad_ef), min(fb.y0, ef.y0 - pad_ef),
+                     max(fb.x1, ef.x1 + pad_ef), max(fb.y1, ef.y1 + pad_ef))
         b = _map_box(fb, box_M)
         x0 = max(0, min(ow, int(round(b.x0))))
         y0 = max(0, min(oh, int(round(b.y0))))

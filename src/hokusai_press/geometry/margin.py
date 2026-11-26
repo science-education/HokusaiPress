@@ -1151,6 +1151,165 @@ def _ornament_boxes(
     return [cands[i] for i in sorted(accepted)]
 
 
+def _is_false_nombre(p) -> bool:
+    """True when nombre_box sits inside a figure or a multi-char body text line."""
+    m = p.margin
+    nb = m.nombre_box if m else None
+    if nb is None:
+        return False
+    for r in p.regions or []:
+        if nb.x0 >= r.box.x0 - 2 and nb.x1 <= r.box.x1 + 2 and nb.y0 >= r.box.y0 - 2 and nb.y1 <= r.box.y1 + 2:
+            if r.kind == RegionKind.FIGURE:
+                return True
+            if r.kind == RegionKind.TEXT and len((r.ocr_text or "").strip()) >= 5:
+                return True
+    return False
+
+
+def folio_not_found(p) -> bool:
+    """True when normal folio search did not find a valid page number on this page."""
+    return (
+        p.page_number is None
+        or p.page_number_source == "inferred"
+        or _is_false_nombre(p)
+    )
+
+
+def _folio_band_glyphs(gray: np.ndarray, unit: float) -> list[tuple[int, int, int, int]]:
+    """Find isolated dark digit-shaped strokes in the top/bottom folio bands."""
+    sh, sw = gray.shape
+    glyph_px = []
+    band = max(1, round(sh * NOMBRE_BAND_FRAC))
+    for y0 in (0, sh - band):
+        strip = gray[y0:y0 + band]
+        _, mask = cv2.threshold(strip, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+        _, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+        for x, y, bw, bh, area in stats[1:].tolist():
+            if not (0 < x and x + bw < sw and 0 < y and y + bh < band
+                    and 1.2 * unit <= bh <= 5 * unit and 0.16 * bh <= bw <= 3 * bh
+                    and 0.14 * bw * bh <= area <= 0.90 * bw * bh):
+                continue
+            if bw > 1.3 * bh:
+                inset = max(1, bw // 4)
+                core = mask[y:y + bh, x + inset:x + bw - inset]
+                if np.count_nonzero(core, axis=0).min() > 0.4 * bh:
+                    continue
+            patch = strip[y - 1:y + bh + 1, x - 1:x + bw + 1]
+            if patch.min() < 150 and np.median(patch[[0, -1], :]) > 200:
+                glyph_px.append((x, y0 + y, bw, bh))
+    return glyph_px
+
+
+def detect_edge_folio_box(image: np.ndarray, p, dpi: float) -> Optional[Box]:
+    """Fallback: find an edge/corner folio missed by normal folio search.
+
+    Only runs on pages where normal search failed (folio_not_found(p)).
+    Returns a bounding Box only when a digit-like stroke outside existing
+    regions extends outside the current crop or content box.
+    """
+    m = p.margin
+    if m is None or m.crop is None or p.blank or not folio_not_found(p):
+        return None
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    h, w = gray.shape
+    scale = min(1.0, 150 / dpi)
+    sw, sh = max(1, round(w * scale)), max(1, round(h * scale))
+    gray = cv2.resize(gray, (sw, sh), interpolation=cv2.INTER_AREA)
+    if abs(p.deskew.angle_deg) > 1e-3:
+        matrix = cv2.getRotationMatrix2D((sw / 2, sh / 2), p.deskew.angle_deg, 1)
+        gray = cv2.warpAffine(gray, matrix, (sw, sh), borderValue=255)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0.65)
+    unit = dpi * scale / 25.4
+    raw = _folio_band_glyphs(gray, unit)
+    if not raw:
+        return None
+
+    c = m.crop
+    content = m.content
+    edge = _mm_to_px(1.5, dpi)
+    sx, sy = w / sw, h / sh
+    cands = []
+    for x, y, bw, bh in raw:
+        bx0, by0, bx1, by1 = x * sx, y * sy, (x + bw) * sx, (y + bh) * sy
+        if bx0 < edge or by0 < edge or bx1 > w - edge or by1 > h - edge:
+            continue
+        if any(r.box.x0 - 2 <= bx0 and bx1 <= r.box.x1 + 2
+               and r.box.y0 - 2 <= by0 and by1 <= r.box.y1 + 2
+               for r in (p.regions or [])):
+            continue
+        out_crop = (bx0 < c.x0 - 0.5 or bx1 > c.x1 + 0.5
+                    or by0 < c.y0 - 0.5 or by1 > c.y1 + 0.5)
+        out_content = content is not None and (
+            bx0 < content.x0 - 0.5 or bx1 > content.x1 + 0.5
+            or by0 < content.y0 - 0.5 or by1 > content.y1 + 0.5
+        )
+        if out_crop or out_content:
+            cands.append((bx0, by0, bx1, by1, out_crop))
+    if not cands:
+        return None
+
+    # Keep only the band (top vs bottom) and side cluster that needs protection.
+    top = [b for b in cands if (b[1] + b[3]) / 2 < h / 2]
+    bot = [b for b in cands if (b[1] + b[3]) / 2 >= h / 2]
+    if top and bot:
+        top_oc = sum(1 for b in top if b[4])
+        bot_oc = sum(1 for b in bot if b[4])
+        cands = bot if bot_oc >= top_oc else top
+
+    if max(b[2] for b in cands) - min(b[0] for b in cands) > _mm_to_px(25.0, dpi):
+        left = [b for b in cands if (b[0] + b[2]) / 2 < w / 2]
+        right = [b for b in cands if (b[0] + b[2]) / 2 >= w / 2]
+        if left and right:
+            left_oc = sum(1 for b in left if b[4])
+            right_oc = sum(1 for b in right if b[4])
+            cands = left if left_oc > right_oc else right
+
+    return Box(
+        min(b[0] for b in cands) - sx,
+        min(b[1] for b in cands) - sy,
+        max(b[2] for b in cands) + sx,
+        max(b[3] for b in cands) + sy,
+    )
+
+
+def protect_edge_folio(p, ef: Box) -> bool:
+    """Protect an edge/corner folio by pure translation of crop (never scaling)."""
+    m = p.margin
+    if m is None or m.crop is None:
+        return False
+    m.edge_folio_box = ef
+    c = m.crop
+    cw, ch = c.width, c.height
+    if (ef.x0 >= c.x0 - 0.5 and ef.x1 <= c.x1 + 0.5
+            and ef.y0 >= c.y0 - 0.5 and ef.y1 <= c.y1 + 0.5):
+        return False
+    if ef.width > cw or ef.height > ch:
+        return False
+    x0 = max(min(c.x0, ef.x0), ef.x1 - cw)
+    y0 = max(min(c.y0, ef.y0), ef.y1 - ch)
+    m.crop = Box(x0, y0, x0 + cw, y0 + ch)
+    return True
+
+
+def _clips_interior_ocr_text(p, crop: Box, dpi: float) -> bool:
+    """True if crop clips any OCR text region outside the NOMBRE_BLEED_MM edge band."""
+    m = p.margin
+    bleed = _mm_to_px(NOMBRE_BLEED_MM, dpi)
+    pw, ph = m.page_w, m.page_h
+    for r in p.regions or []:
+        if not r.ocr_text:
+            continue
+        b = r.box
+        if pw and ph and (
+            b.x0 < bleed or b.y0 < bleed or b.x1 > pw - bleed or b.y1 > ph - bleed
+        ):
+            continue
+        if (b.x0 < crop.x0 - 0.5 or b.x1 > crop.x1 + 0.5
+                or b.y0 < crop.y0 - 0.5 or b.y1 > crop.y1 + 0.5):
+            return True
+    return False
+
+
 def _protected_box(p, dpi: float) -> Box:
     """Box the Pass-3 translation must never clip: interior OCR regions, glyphs and the folio.
 
@@ -1488,7 +1647,8 @@ def _refine_margins_with_nombre(pages, pass1: dict) -> NombreAlignReport:
 
             # Pass 3: Strict no-clip clamp (preserve the protected marks)
             if m.confidence >= 0.2 or m.glyph_box is not None:
-                c = _protected_box(p, dpi)
+                c_full = _protected_box(p, dpi)
+                c = c_full
                 # Nothing beyond the folio (toward the paper edge it sits
                 # next to) is protected: once the folio is placed, marks
                 # further out -- fore-edge tabs, rules -- may be trimmed by
@@ -1508,6 +1668,12 @@ def _refine_margins_with_nombre(pages, pass1: dict) -> NombreAlignReport:
                     c = Box(cx0, cy0, cx1, cy1)
                 clamped_x0 = max(min(new_x0, c.x0), c.x1 - crop_w)
                 clamped_y0 = max(min(new_y0, c.y0), c.y1 - crop_h)
+                base_crop = Box(clamped_x0, clamped_y0, clamped_x0 + crop_w, clamped_y0 + crop_h)
+                if c is not c_full and _clips_interior_ocr_text(p, base_crop, dpi):
+                    # Exception: folio sits inside the text block (e.g. inset folio),
+                    # so the relaxation clipped real OCR text; re-clamp to protect it.
+                    clamped_x0 = max(min(new_x0, c_full.x0), c_full.x1 - crop_w)
+                    clamped_y0 = max(min(new_y0, c_full.y0), c_full.y1 - crop_h)
                 if abs(clamped_x0 - new_x0) > 0.5:
                     report.n_clamped_x += 1
                 if abs(clamped_y0 - new_y0) > 0.5:
@@ -1515,6 +1681,8 @@ def _refine_margins_with_nombre(pages, pass1: dict) -> NombreAlignReport:
                 new_x0, new_y0 = clamped_x0, clamped_y0
 
             m.crop = Box(new_x0, new_y0, new_x0 + crop_w, new_y0 + crop_h)
+            if m.edge_folio_box is not None:
+                protect_edge_folio(p, m.edge_folio_box)
             report.n_adjusted += 1
             if o["is_seq"]:
                 report.n_adjusted_seq += 1
