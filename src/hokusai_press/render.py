@@ -520,11 +520,18 @@ def build_pdf(
 
         Executor = ProcessPoolExecutor if use_processes else ThreadPoolExecutor
         with Executor(max_workers=max_workers) as ex:
-            for encoded in ex.map(_render_and_encode_page, worker_args):
-                builder.add_encoded_page(encoded)
+            encoded_pages = list(ex.map(_render_and_encode_page, worker_args))
     else:
-        for args in worker_args:
-            builder.add_encoded_page(_render_and_encode_page(args))
+        encoded_pages = [_render_and_encode_page(args) for args in worker_args]
+    insert_set = set(getattr(document, "blank_insert_before", None) or [])
+    blank_encoded = None
+    for params, encoded in zip(document.pages, encoded_pages):
+        if params.source.page_index in insert_set:
+            if blank_encoded is None:
+                white = np.full((encoded["h"], encoded["w"], 3), 255, dtype=np.uint8)
+                blank_encoded = builder.encode_page(white, [], [], "bw", [], [])
+            builder.add_encoded_page(blank_encoded)
+        builder.add_encoded_page(encoded)
     builder.save(out_path, source_path=document.source_path or None)
     _set_physical_page_size(out_path, document.render.target_dpi)
     return out_path

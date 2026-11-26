@@ -1707,6 +1707,8 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     if pass1:
         _refine_margins_with_nombre(pages, pass1)
         place_matter_pages(pages, pass1)
+        from ..duplex import apply_duplex_translation_exceptions
+        apply_duplex_translation_exceptions(pages)
 
 
 MATTER_MIN_REF_PAGES = 6   # folio pages per parity needed to know the mean correction

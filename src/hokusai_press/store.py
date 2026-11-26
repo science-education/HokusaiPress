@@ -115,6 +115,12 @@ CREATE TABLE IF NOT EXISTS bucket_profile (
     updated_at REAL NOT NULL,
     PRIMARY KEY (scanner, fmt, genre, writing, binding, param_name)
 );
+
+CREATE TABLE IF NOT EXISTS doc_meta (
+    doc_id     TEXT PRIMARY KEY,
+    meta_json  TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 
@@ -244,6 +250,25 @@ class Store:
                 "SELECT DISTINCT doc_id FROM pages ORDER BY doc_id"
             ).fetchall()
         return [r["doc_id"] for r in rows]
+
+    def get_doc_meta(self, doc_id: str) -> dict:
+        """Return document-level metadata dict (empty dict if absent)."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT meta_json FROM doc_meta WHERE doc_id=?", (doc_id,)
+            ).fetchone()
+        return json.loads(row["meta_json"]) if row else {}
+
+    def set_doc_meta(self, doc_id: str, meta: dict) -> None:
+        """Persist document-level metadata dict."""
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO doc_meta(doc_id, meta_json, updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(doc_id) DO UPDATE SET meta_json=excluded.meta_json, "
+                "updated_at=excluded.updated_at",
+                (doc_id, json.dumps(meta, ensure_ascii=False), time.time()),
+            )
+            self.conn.commit()
 
     def log_decision(
         self,

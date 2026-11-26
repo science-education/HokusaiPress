@@ -237,6 +237,9 @@ class Document:
     source_path: str
     pages: list[PageParams] = field(default_factory=list)
     render: RenderSettings = field(default_factory=RenderSettings)
+    # 0-based page_index values before which a blank page is inserted on render
+    # (for duplex spread alignment when a front-matter blank was skipped).
+    blank_insert_before: list[int] = field(default_factory=list)
 
     # --- serialization: the whole document state is a single JSON blob ---
     def to_json(self) -> str:
@@ -316,6 +319,7 @@ def _decode_document(d) -> Document:
         source_path=d["source_path"],
         pages=[_decode_page(p) for p in d.get("pages", [])],
         render=RenderSettings(**d.get("render", {})),
+        blank_insert_before=list(d.get("blank_insert_before", [])),
     )
 
 
