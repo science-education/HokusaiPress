@@ -157,6 +157,8 @@ class Margin:
     edge_folio_box: Optional[Box] = None
     # Fraction of gray pixels in [100, 245] (screened/solid tint background).
     bg_tint_frac: float = 0.0
+    # True when the whole sheet has a uniform tinted/halftone/solid background.
+    tinted: bool = False
 
 
 @dataclass
@@ -303,6 +305,7 @@ def _decode_page(d) -> PageParams:
             target_h=margin.get("target_h"),
             fill=margin.get("fill", False),
             bg_tint_frac=float(margin.get("bg_tint_frac", 0.0) or 0.0),
+            tinted=bool(margin.get("tinted", False)),
         ),
         regions=[_decode_region(r) for r in d.get("regions", [])],
         page_kind=PageKind(d.get("page_kind", "auto")),

@@ -484,6 +484,10 @@ def analyze_document(
     for params, flag in zip(doc.pages, margin_mod.align_margins(margins)):
         if flag is not None and not params.blank:
             params.flags.append(flag)
+    tint_stats = [margin_mod.compute_page_tint_stats(img) for img in originals]
+    for params, is_tinted in zip(doc.pages, margin_mod.detect_tinted_pages(doc.pages, tint_stats)):
+        if params.margin is not None:
+            params.margin.tinted = is_tinted
     if pages is not None and stored_map is not None:
         combined = dict(stored_map)
         for params in doc.pages:
@@ -844,9 +848,11 @@ def _load_and_compute_margin(args):
     from .source import load_single, orient
 
     original, _ = load_single(source_path, p.source.page_index)
-    cleaned, mg = compute_margin(orient(original, p.source), p.deskew, p.regions, p.dpi)
+    oriented = orient(original, p.source)
+    tint_stats = margin_mod.compute_page_tint_stats(oriented)
+    cleaned, mg = compute_margin(oriented, p.deskew, p.regions, p.dpi)
     h, w = cleaned.shape[:2]
-    return h, w, mg
+    return h, w, mg, tint_stats
 
 
 def _apply_edge_folio_protection(pages: list[PageParams],
@@ -857,7 +863,7 @@ def _apply_edge_folio_protection(pages: list[PageParams],
     from .source import load_single, orient
 
     for idx, p in enumerate(pages):
-        if p.blank or not (p.margin and p.margin.crop):
+        if p.blank or not (p.margin and p.margin.crop) or getattr(p.margin, "tinted", False):
             continue
         if not margin_mod.folio_not_found(p):
             continue
@@ -935,8 +941,9 @@ def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
         results = [_load_and_compute_margin(a) for a in worker_args]
     heights: list[int] = []
     widths: list[int] = []
+    tint_stats = []
     has_preserved_nombre = False
-    for p, (h, w, mg), (prev_nb, prev_src, prev_pnum, prev_ntxt) in zip(
+    for p, (h, w, mg, ts), (prev_nb, prev_src, prev_pnum, prev_ntxt) in zip(
         pages, results, prev_nombre
     ):
         # Bug fix: never overwrite OCR/folio/manual (or legacy verified)
@@ -955,6 +962,11 @@ def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
         p.margin = mg
         heights.append(h)
         widths.append(w)
+        tint_stats.append(ts)
+
+    for p, is_tinted in zip(pages, margin_mod.detect_tinted_pages(pages, tint_stats)):
+        if p.margin is not None:
+            p.margin.tinted = is_tinted
 
     for p in pages:
         p.flags = [f for f in p.flags if f not in _RECOMPUTED_MARGIN_FLAGS]
@@ -1005,7 +1017,10 @@ def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
             changed_idxs = {c["page_index"] for c in skew_changes}
             for p in pages:
                 if p.source.page_index in changed_idxs:
-                    _, p.margin = _load_and_compute_margin((source_path, p))[1:]
+                    was_tinted = bool(p.margin and p.margin.tinted)
+                    _, p.margin = _load_and_compute_margin((source_path, p))[1:3]
+                    if p.margin is not None:
+                        p.margin.tinted = was_tinted
             if align_nombre:
                 margin_mod.normalize_margins(pages, output_margin_mm)
             else:

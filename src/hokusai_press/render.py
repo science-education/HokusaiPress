@@ -225,7 +225,8 @@ def render_page_image(
     # production run path the original is already region-cleaned (no-op here); on
     # the rebuild path the original is freshly loaded, so this is where it applies.
     keep_page = getattr(settings, "margin_mode", "normalize") == "none"
-    if keep_page:
+    tinted = bool(params.margin and getattr(params.margin, "tinted", False))
+    if keep_page or tinted:
         clean = original_bgr          # no shadow removal: the page as scanned
     else:
         clean = remove_region_shadows(original_bgr, params.regions)
@@ -239,7 +240,7 @@ def render_page_image(
     # paper, a thin dark edge line outside the content). Text/figures/photos are
     # inside the content box, so nothing real is touched. ScanTailor's "fill
     # margins", and the right tool for uniform-illumination ADF scans.
-    if params.margin and params.margin.content and not keep_page:
+    if params.margin and params.margin.content and not keep_page and not tinted:
         ow, oh = out_size
         # The fill region is the content box UNIONED with the nombre box grown
         # by a fraction of its own height. The page-number's OCR box bounds the
@@ -290,6 +291,9 @@ def render_page_image(
                 "text": r.ocr_text,
                 "direction": "h" if b.width >= b.height else "v",
             })
+
+    if tinted:
+        photo_boxes = [(0.0, 0.0, float(ow), float(oh), None)]
 
     if params.page_kind in (PageKind.GRAY, PageKind.COLOR):
         mode = params.page_kind.value   # whole-page forced encoding
@@ -433,7 +437,8 @@ def render_output_preview(
         binary[y0i:y1i, x0i:x1i] = 255
         valid_photos.append((x0i, y0i, x1i, y1i, tone))
 
-    vecfills = _figure_vecfills(out, params, settings, original_bgr.shape)
+    tinted = bool(params.margin and getattr(params.margin, "tinted", False))
+    vecfills = [] if tinted else _figure_vecfills(out, params, settings, original_bgr.shape)
     apply_vector_fills_to_bilevel(binary, out, vecfills)
     if getattr(settings, "despeckle", True):
         binary = _despeckle_bilevel(binary)
@@ -469,11 +474,12 @@ def _render_and_encode_page(args) -> dict:
     the highest-value parallel target in the whole pipeline."""
     params, original, settings, encoder = args
     out_bgr, lines, mode, photo_boxes = render_page_image(original, params, settings)
-    vecfills = _figure_vecfills(out_bgr, params, settings, original.shape)
+    tinted = bool(params.margin and getattr(params.margin, "tinted", False))
+    vecfills = [] if tinted else _figure_vecfills(out_bgr, params, settings, original.shape)
     text_boxes = [tuple(line["box"]) for line in lines]
     tint_zones = (
         _raster_tint_zones(out_bgr, vecfills, text_boxes)
-        if settings.tint_overlay else []
+        if (settings.tint_overlay and not tinted) else []
     )
     return encoder.encode_page(out_bgr, lines, photo_boxes, mode, vecfills, tint_zones)
 

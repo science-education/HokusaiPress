@@ -724,6 +724,71 @@ def _start_corner(d: str, b: Box) -> tuple:
 FULL_BLEED_FILL = 0.96     # content over this much of the sheet = the sheet is the page
 FULL_BLEED_MAX_CUT = 0.10  # ... trimmed to the page only within this much per axis
 
+# --- Full-page tinted / halftone background page detection ---
+TINTED_EDGE_TRIM_FRAC = 0.06
+TINTED_BLUR_PX = 15
+TINTED_TILE_PX = 32
+TINTED_DARK_DELTA = 10.0
+TINTED_DARK_FRAC_MIN = 0.90
+TINTED_FLAT_TOL = 12.0
+TINTED_FLAT_SD_MAX = 10.0
+
+
+def compute_page_tint_stats(image_bgr: np.ndarray) -> tuple[float, float, np.ndarray]:
+    """Return (median_level, flatness_sd, tile_medians) inside the sheet margins.
+
+    Blurs with a 15px box filter to average out halftone dots, then takes
+    medians over 32x32 non-overlapping tiles inside the outer 6% trim.
+    """
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY) if image_bgr.ndim == 3 else image_bgr
+    h, w = gray.shape[:2]
+    y0, y1 = int(h * TINTED_EDGE_TRIM_FRAC), int(h * (1.0 - TINTED_EDGE_TRIM_FRAC))
+    x0, x1 = int(w * TINTED_EDGE_TRIM_FRAC), int(w * (1.0 - TINTED_EDGE_TRIM_FRAC))
+    core = gray[y0:y1, x0:x1] if (y1 > y0 and x1 > x0) else gray
+    blurred = cv2.blur(core, (TINTED_BLUR_PX, TINTED_BLUR_PX))
+    t = TINTED_TILE_PX
+    ny = blurred.shape[0] // t
+    nx = blurred.shape[1] // t
+    if ny <= 0 or nx <= 0:
+        lvl = float(np.median(blurred)) if blurred.size else 255.0
+        return lvl, 0.0, np.empty(0, dtype=np.float32)
+    tiles = (
+        blurred[:ny * t, :nx * t]
+        .reshape(ny, t, nx, t)
+        .transpose(0, 2, 1, 3)
+        .reshape(ny * nx, t * t)
+    )
+    tm = np.median(tiles, axis=1).astype(np.float32)
+    lvl = float(np.median(tm))
+    near = tm[np.abs(tm - lvl) <= TINTED_FLAT_TOL]
+    flat_sd = float(np.std(near)) if near.size else 0.0
+    return lvl, flat_sd, tm
+
+
+def detect_tinted_pages(
+    pages,
+    tile_stats: list[tuple[float, float, np.ndarray]],
+) -> list[bool]:
+    """Classify each page as full-sheet tinted relative to the book's paper tone."""
+    non_blank_lvls = [
+        lvl for p, (lvl, _, tm) in zip(pages, tile_stats)
+        if not p.blank and tm.size > 0
+    ]
+    book_lvl = float(np.median(non_blank_lvls)) if non_blank_lvls else 255.0
+    out: list[bool] = []
+    for p, (lvl, flat_sd, tm) in zip(pages, tile_stats):
+        if p.blank or tm.size == 0:
+            out.append(False)
+            continue
+        dark_frac = float((tm < book_lvl - TINTED_DARK_DELTA).mean())
+        is_tinted = (
+            lvl <= book_lvl - TINTED_DARK_DELTA
+            and dark_frac >= TINTED_DARK_FRAC_MIN
+            and flat_sd <= TINTED_FLAT_SD_MAX
+        )
+        out.append(is_tinted)
+    return out
+
 # --- Pass 2 / Pass 3 nombre alignment constants (physical units: mm) ---
 NOMBRE_MIN_GROUP_PAGES = 6           # min consistent pages per parity
 NOMBRE_MIN_SEQ_SUPPORT_FRAC = 0.15   # sequential support >= max(8, 15% of pages)
@@ -941,6 +1006,30 @@ def normalize_margins_pass1(pages, output_margin_mm: float = 5.0) -> dict:
             y0 = c.y0 + c.height / 2 - fy * crop_h
             floor = margin_px
         p.margin.fill = False
+        if getattr(p.margin, "tinted", False) and p.margin.page_w and p.margin.page_h:
+            # Full-sheet tinted page: treat the entire sheet as content and
+            # route to full-bleed trim when aspect/scale matches target size.
+            c_sheet = Box(0.0, 0.0, p.margin.page_w, p.margin.page_h)
+            s = min(c_sheet.width / tw_px, c_sheet.height / th_px)
+            fw, fh = tw_px * s, th_px * s
+            if abs(s - 1.0) <= FULL_BLEED_MAX_CUT and max(c_sheet.width / fw, c_sheet.height / fh) <= 1.0 + FULL_BLEED_MAX_CUT:
+                x0 = c_sheet.x0 + (c_sheet.width - fw) / 2.0
+                y0 = c_sheet.y0 + (c_sheet.height - fh) / 2.0
+                p.margin.crop = Box(x0, y0, x0 + fw, y0 + fh)
+                p.margin.target_w, p.margin.target_h = tw_px, th_px
+                p.margin.fill = True
+                p.flags = [f for f in p.flags if f != Flag.CONTENT_SCALED_DOWN]
+                continue
+            cw_t = max(tw_px, c_sheet.width)
+            ch_t = max(th_px, c_sheet.height)
+            x0 = c_sheet.x0 + (c_sheet.width - cw_t) / 2.0
+            y0 = c_sheet.y0 + (c_sheet.height - ch_t) / 2.0
+            p.margin.crop = Box(x0, y0, x0 + cw_t, y0 + ch_t)
+            p.margin.target_w, p.margin.target_h = tw_px, th_px
+            p.flags = [f for f in p.flags if f != Flag.CONTENT_SCALED_DOWN]
+            if cw_t > tw_px * 1.001 or ch_t > th_px * 1.001:
+                p.flags.append(Flag.CONTENT_SCALED_DOWN)
+            continue
         if p.margin.confidence >= 0.2 and p.margin.page_w and p.margin.page_h and (
                 crop_w > tw_px * 1.001 or crop_h > th_px * 1.001) and (
                 c.width >= FULL_BLEED_FILL * p.margin.page_w
@@ -1716,6 +1805,8 @@ def _refine_margins_with_nombre(pages, pass1: dict) -> NombreAlignReport:
                 continue
             p = o["page"]
             m = p.margin
+            if getattr(m, "tinted", False):
+                continue
             dpi = _page_dpi(p, use_dpi, fallback_dpi)
 
             # Gate 1: Box dimension sanity (reject running-head fusion / huge blobs)

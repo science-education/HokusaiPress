@@ -194,7 +194,7 @@ def apply_duplex_translation_exceptions(
         m = p.margin
         if p.blank or not (m and m.crop and m.page_w and m.page_h):
             continue
-        if m.fill or Flag.CONTENT_SCALED_DOWN in p.flags:
+        if m.fill or getattr(m, "tinted", False) or Flag.CONTENT_SCALED_DOWN in p.flags:
             continue
         if getattr(m, "bg_tint_frac", 0.0) >= 0.45:
             continue
