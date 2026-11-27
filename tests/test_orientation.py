@@ -189,3 +189,143 @@ def test_a8_partial_pages_crops_bed_and_rotates_via_pdf_sizes_and_db(tmp_path, m
     finally:
         st.close()
 
+
+def test_find_paper_by_book_size_and_region_rotation():
+    """Oversized landscape scan with a dark portrait sheet in the center ->
+    find_paper_by_book_size finds the portrait window, and
+    choose_rotation_from_regions picks 180 for an upside-down tategaki page."""
+    from hokusai_press.model import Box, Region, RegionKind
+    from hokusai_press.source import find_paper_by_book_size
+
+    w, h = 1050, 620
+    rng = np.random.default_rng(7)
+    img = np.full((h, w), 124, np.float32) + rng.normal(0, 0.7, (h, w))
+    # Dark portrait sheet in center [350:700], matching book size ~350x620
+    img[:, 350:700] = 74 + rng.normal(0, 4.0, (h, 350))
+    img[:, :10] = 255
+    img[:, -10:] = 255
+    img[:10, :] = 255
+    img[-10:, :] = 255
+    u8 = np.clip(img, 0, 255).astype(np.uint8)
+
+    box = find_paper_by_book_size(u8, 350.0, 620.0)
+    assert box is not None
+    x0, y0, x1, y1 = box
+    assert abs(x0 - 350) <= 15 and abs(x1 - 700) <= 15
+    assert y0 == 0.0 and y1 == float(h)
+    assert (x1 - x0) < (y1 - y0)
+
+    # Simulate upside-down tategaki columns inside [350..700, 0..620]
+    # Upright columns in new frame (350x620): flush at top (y=40), some end short,
+    # paragraph starts indented one char (y=65).
+    raw_cols = []
+    for k, (yc0, yc1) in enumerate([(40, 560), (40, 300), (65, 560), (40, 560),
+                                    (40, 420), (65, 560), (40, 560), (40, 220)]):
+        xc1 = 310 - 32 * k
+        xc0 = xc1 - 18
+        # In 180-rotated raw sheet [350..700, 0..620]:
+        xr0, xr1 = 700.0 - xc1, 700.0 - xc0
+        yr0, yr1 = 620.0 - yc1, 620.0 - yc0
+        raw_cols.append((xr0, yr0, xr1, yr1))
+
+    # Map those boxes into a wrong old detection: paper=[0, 100, 1050, 520], rotate=270
+    old_paper = [0.0, 100.0, 1050.0, 520.0]
+    M_raw_to_old = orientation.box_transform_matrix(
+        (float(w), float(h)), None, 0, 0.0, old_paper, 270, 0.0,
+    )
+    old_regions = []
+    for xr0, yr0, xr1, yr1 in raw_cols:
+        bx0, by0, bx1, by1 = orientation.map_box_coords((xr0, yr0, xr1, yr1), M_raw_to_old)
+        old_regions.append(Region(kind=RegionKind.TEXT, box=Box(bx0, by0, bx1, by1), ocr_text="あいう"))
+
+    rot, scores = orientation.choose_rotation_from_regions(
+        old_regions, (float(w), float(h)), old_paper, 270, 0.0, box, candidates=(0, 180),
+    )
+    assert rot == 180
+    assert scores[180][0] > scores[0][0]
+
+
+def test_remargin_fixes_oversized_wrong_paper_and_preserves_good_pages(tmp_path):
+    """recompute_shadows_and_margins fixes an oversized page whose paper/rotate
+    failed, remaps its regions without OCR, and leaves normal & already-good
+    paper-cropped pages untouched."""
+    from hokusai_press import pipeline
+    from hokusai_press.model import Box, Margin, PageParams, Region, RegionKind, SourceRef
+    from hokusai_press.store import Store
+
+    # 3 normal portrait pages (240x380) + 1 good bed scan (720x380, sheet at 240..480)
+    # + 1 bad bed scan (720x380, dark sheet at 240..480)
+    good_bed = np.full((380, 720, 3), 124, dtype=np.uint8)
+    good_bed[:, 240:480] = 70
+    good_bed[60:300, 280:440] = 240
+    good_bed[:6] = good_bed[-6:] = 255
+    good_bed[:, :6] = good_bed[:, -6:] = 255
+
+    bad_bed = good_bed.copy()
+
+    pdf_path = _make_pdf_from_arrays(
+        tmp_path / "book6.pdf",
+        [_bars_img(380, 240), _bars_img(380, 240), _bars_img(380, 240), good_bed, bad_bed],
+    )
+    db_path = str(tmp_path / "book6.db")
+    st = Store(db_path)
+    try:
+        for i in range(3):
+            p = PageParams(
+                source=SourceRef(path=pdf_path, page_index=i),
+                dpi=300.0,
+                margin=Margin(content=Box(16, 24, 186, 356), page_w=240.0, page_h=380.0),
+                regions=[Region(kind=RegionKind.TEXT, box=Box(16, 24, 186, 356), ocr_text="本文")],
+            )
+            st.upsert_page("book6.pdf", i, p)
+
+        # Page 3: already-correct paper crop
+        good_paper = [240.0, 0.0, 480.0, 380.0]
+        p3 = PageParams(
+            source=SourceRef(path=pdf_path, page_index=3, paper=list(good_paper), rotate=0),
+            dpi=300.0,
+            margin=Margin(content=Box(40, 60, 200, 300), page_w=240.0, page_h=380.0),
+            regions=[Region(kind=RegionKind.TEXT, box=Box(40, 60, 200, 300), ocr_text="章扉")],
+        )
+        st.upsert_page("book6.pdf", 3, p3)
+
+        # Page 4: bad paper=[0, 60, 720, 320], rotate=270, upside-down tategaki regions
+        bad_paper = [0.0, 60.0, 720.0, 320.0]
+        M_raw_to_old = orientation.box_transform_matrix(
+            (720.0, 380.0), None, 0, 0.0, bad_paper, 270, 0.0,
+        )
+        regs = []
+        for k, (yc0, yc1) in enumerate([(30, 340), (30, 180), (48, 340), (30, 340),
+                                        (30, 240), (48, 340), (30, 340), (30, 140)]):
+            xc1 = 210 - 20 * k
+            xc0 = xc1 - 12
+            xr0, xr1 = 480.0 - xc1, 480.0 - xc0
+            yr0, yr1 = 380.0 - yc1, 380.0 - yc0
+            bx0, by0, bx1, by1 = orientation.map_box_coords((xr0, yr0, xr1, yr1), M_raw_to_old)
+            regs.append(Region(kind=RegionKind.TEXT, box=Box(bx0, by0, bx1, by1), ocr_text="あいう"))
+
+        p4 = PageParams(
+            source=SourceRef(path=pdf_path, page_index=4, paper=list(bad_paper), rotate=270),
+            dpi=300.0,
+            margin=Margin(content=Box(0, 240, 260, 480), page_w=260.0, page_h=720.0),
+            regions=regs,
+        )
+        st.upsert_page("book6.pdf", 4, p4)
+
+        pipeline.recompute_shadows_and_margins(st, "book6.pdf", pdf_path)
+
+        got3 = st.get_page("book6.pdf", 3).params
+        assert got3.source.paper == good_paper
+        assert got3.source.rotate == 0
+
+        got4 = st.get_page("book6.pdf", 4).params
+        assert got4.source.paper is not None
+        assert abs(got4.source.paper[0] - 240.0) <= 15
+        assert abs(got4.source.paper[2] - 480.0) <= 15
+        assert got4.source.rotate == 180
+        assert got4.margin.page_w < got4.margin.page_h
+        # Remapped regions lie inside the upright sheet and start near top (y~30)
+        assert min(r.box.y0 for r in got4.regions) < 40
+    finally:
+        st.close()
+

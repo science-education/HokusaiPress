@@ -240,6 +240,73 @@ def _encode_gray_flate_page_pdf(gray: np.ndarray) -> bytes:
     return buf.getvalue()
 
 
+def encode_masked_image_pdf(
+    img_bgr: np.ndarray,
+    alpha_u8: np.ndarray,
+    color_mode: str,
+    jpeg_quality: int = 85,
+) -> bytes:
+    """Single-page PDF containing a JPEG image with an 8-bit FlateDecode SMask."""
+    import pikepdf
+
+    if img_bgr.ndim not in (2, 3) or img_bgr.dtype != np.uint8:
+        raise ValueError("img_bgr must be uint8 2D or 3D")
+    if alpha_u8.ndim != 2 or alpha_u8.dtype != np.uint8:
+        raise ValueError("alpha_u8 must be HxW uint8")
+    h, w = img_bgr.shape[:2]
+    if alpha_u8.shape != (h, w):
+        raise ValueError("alpha_u8 shape must match img_bgr")
+
+    if color_mode == "gray":
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) if img_bgr.ndim == 3 else img_bgr
+        ok, jpg = cv2.imencode(".jpg", gray, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+        colorspace = "/DeviceGray"
+    elif color_mode == "color":
+        if img_bgr.ndim != 3:
+            raise UnsupportedCodecError("Color mode requested but image is not 3-channel BGR")
+        ok, jpg = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+        colorspace = "/DeviceRGB"
+    else:
+        raise UnsupportedCodecError(f"Unsupported color mode for masked JPEG: {color_mode}")
+
+    if not ok:
+        raise RuntimeError("JPEG encoding failed")
+
+    pdf = pikepdf.new()
+    smask = pikepdf.Stream(
+        pdf,
+        zlib.compress(np.ascontiguousarray(alpha_u8).tobytes()),
+        Filter=pikepdf.Name("/FlateDecode"),
+        Type=pikepdf.Name("/XObject"),
+        Subtype=pikepdf.Name("/Image"),
+        Width=w,
+        Height=h,
+        ColorSpace=pikepdf.Name("/DeviceGray"),
+        BitsPerComponent=8,
+    )
+    image = pikepdf.Stream(
+        pdf,
+        jpg.tobytes(),
+        Filter=pikepdf.Name("/DCTDecode"),
+        Type=pikepdf.Name("/XObject"),
+        Subtype=pikepdf.Name("/Image"),
+        Width=w,
+        Height=h,
+        ColorSpace=pikepdf.Name(colorspace),
+        BitsPerComponent=8,
+        SMask=pdf.make_indirect(smask),
+    )
+    content = pikepdf.Stream(pdf, f"q {w} 0 0 {h} 0 0 cm /Im0 Do Q".encode())
+    page = pdf.add_blank_page(page_size=(w, h))
+    page.obj.Resources = pikepdf.Dictionary(
+        XObject=pikepdf.Dictionary(Im0=pdf.make_indirect(image))
+    )
+    page.obj.Contents = pdf.make_indirect(content)
+    buf = BytesIO()
+    pdf.save(buf)
+    return buf.getvalue()
+
+
 def discover_font(font_path: str | None = None) -> str:
     """Discover a valid Japanese TrueType/OpenType font file."""
     if font_path:

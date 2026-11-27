@@ -153,6 +153,12 @@ class Margin:
     fill: bool = False
     # Bounds of locally dark, character-sized components in deskewed pixels.
     glyph_box: Optional[Box] = None
+    # Edge/corner folio box detected as fallback when normal folio search missed it.
+    edge_folio_box: Optional[Box] = None
+    # Fraction of gray pixels in [100, 245] (screened/solid tint background).
+    bg_tint_frac: float = 0.0
+    # True when the whole sheet has a uniform tinted/halftone/solid background.
+    tinted: bool = False
 
 
 @dataclass
@@ -235,6 +241,9 @@ class Document:
     source_path: str
     pages: list[PageParams] = field(default_factory=list)
     render: RenderSettings = field(default_factory=RenderSettings)
+    # 0-based page_index values before which a blank page is inserted on render
+    # (for duplex spread alignment when a front-matter blank was skipped).
+    blank_insert_before: list[int] = field(default_factory=list)
 
     # --- serialization: the whole document state is a single JSON blob ---
     def to_json(self) -> str:
@@ -287,6 +296,7 @@ def _decode_page(d) -> PageParams:
             confidence=margin.get("confidence", 0.0),
             nombre_box=_box(margin.get("nombre_box")),
             glyph_box=_box(margin.get("glyph_box")),
+            edge_folio_box=_box(margin.get("edge_folio_box")),
             nombre_source=margin.get("nombre_source"),
             crop=_box(margin.get("crop")),
             page_w=margin.get("page_w"),
@@ -294,6 +304,8 @@ def _decode_page(d) -> PageParams:
             target_w=margin.get("target_w"),
             target_h=margin.get("target_h"),
             fill=margin.get("fill", False),
+            bg_tint_frac=float(margin.get("bg_tint_frac", 0.0) or 0.0),
+            tinted=bool(margin.get("tinted", False)),
         ),
         regions=[_decode_region(r) for r in d.get("regions", [])],
         page_kind=PageKind(d.get("page_kind", "auto")),
@@ -313,6 +325,7 @@ def _decode_document(d) -> Document:
         source_path=d["source_path"],
         pages=[_decode_page(p) for p in d.get("pages", [])],
         render=RenderSettings(**d.get("render", {})),
+        blank_insert_before=list(d.get("blank_insert_before", [])),
     )
 
 

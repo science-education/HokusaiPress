@@ -179,14 +179,17 @@ class MrcPageBuilder:
     def add_page(self, out_bgr: np.ndarray, lines: list,
                  photo_boxes_px: list, mode: str,
                  vector_fills: list | None = None,
-                 tint_zones: list | None = None) -> None:
+                 tint_zones: list | None = None,
+                 tone_alpha: np.ndarray | None = None) -> None:
         self._pages.append(self.encode_page(
-            out_bgr, lines, photo_boxes_px, mode, vector_fills, tint_zones))
+            out_bgr, lines, photo_boxes_px, mode, vector_fills, tint_zones,
+            tone_alpha=tone_alpha))
 
     def encode_page(self, out_bgr: np.ndarray, lines: list,
                     photo_boxes_px: list, mode: str,
                     vector_fills: list | None = None,
-                    tint_zones: list | None = None) -> dict:
+                    tint_zones: list | None = None,
+                    tone_alpha: np.ndarray | None = None) -> dict:
         """Pure per-page encode (G4/JPEG/posterize): reads only this call's
         arguments plus read-only config set in __init__ (self.compress/scale/
         tint_scale/jpeg_quality/ink_valley, never mutated after construction).
@@ -196,6 +199,7 @@ class MrcPageBuilder:
         codecs release the GIL), making this the highest-value parallel
         target, well ahead of margin/render."""
         from .pdf_export import encode_page_pdf
+        from .pdf_export.backend import encode_masked_image_pdf
 
         from .render import binarize_bw
 
@@ -204,6 +208,7 @@ class MrcPageBuilder:
         tint_zones = tint_zones or []
         tint_overlays: list[dict] = []
         vector_tint_fills: list[dict] = []
+        tone_overlays: list[dict] = []
 
         if mode in ("gray", "color"):
             base_pdf = encode_page_pdf(out_bgr, mode, self.compress)
@@ -392,6 +397,29 @@ class MrcPageBuilder:
                     "posterize": poster_stats,
                 })
             apply_vector_fills_to_bilevel(binary, out_bgr, vector_fills)
+            if tone_alpha is not None:
+                active_mask = tone_alpha > 0
+                if np.any(active_mask):
+                    ys, xs = np.nonzero(active_mask)
+                    tx0, ty0 = int(xs.min()), int(ys.min())
+                    tx1, ty1 = int(xs.max()) + 1, int(ys.max()) + 1
+                    ds_w = max(3, int(round((tx1 - tx0) * self.scale)))
+                    ds_h = max(3, int(round((ty1 - ty0) * self.scale)))
+                    binary[ty0:ty1, tx0:tx1][active_mask[ty0:ty1, tx0:tx1]] = 255
+                    crop = out_bgr[ty0:ty1, tx0:tx1]
+                    alpha_crop = tone_alpha[ty0:ty1, tx0:tx1]
+                    ds_crop = cv2.resize(crop, (ds_w, ds_h), interpolation=cv2.INTER_AREA)
+                    ds_alpha = np.clip(
+                        np.rint(255.0 * cv2.resize(alpha_crop, (ds_w, ds_h), interpolation=cv2.INTER_LINEAR)),
+                        0, 255,
+                    ).astype(np.uint8)
+                    from .tone_restore import has_significant_color
+
+                    cmode = "color" if has_significant_color(out_bgr, active_mask) else "gray"
+                    tone_overlays.append({
+                        "pdf": encode_masked_image_pdf(ds_crop, ds_alpha, cmode, self.jpeg_quality),
+                        "rect": (tx0, h - ty1, tx1, h - ty0),
+                    })
             binary = _despeckle_bilevel(binary)
             base_pdf = encode_page_pdf(binary, "bw", self.compress)
 
@@ -399,6 +427,7 @@ class MrcPageBuilder:
             "base": base_pdf,
             "overlays": overlays,
             "tint_overlays": tint_overlays,
+            "tone_overlays": tone_overlays,
             "vector_tint_fills": vector_tint_fills,
             "vector_fills": vector_fills,
             "w": w,
@@ -449,6 +478,15 @@ class MrcPageBuilder:
                     _add_vector_tint_fills(out, dest, page["vector_tint_fills"], page["h"])
                 if page["vector_fills"]:
                     _add_vector_fills(out, dest, page["vector_fills"], page["h"])
+                for j, tov in enumerate(page.get("tone_overlays") or []):
+                    tovpdf = pikepdf.open(BytesIO(tov["pdf"]))
+                    sources.append(tovpdf)
+                    _add_overlay_named(
+                        dest,
+                        tovpdf.pages[0],
+                        pikepdf.Rectangle(*tov["rect"]),
+                        f"/HPTone{i}_{j}",
+                    )
                 _add_overlay_named(dest, text_pdf.pages[i], None, f"/HPText{i}")
             from .model import ensure_parent_dir
 

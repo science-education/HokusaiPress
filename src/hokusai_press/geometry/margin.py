@@ -724,6 +724,71 @@ def _start_corner(d: str, b: Box) -> tuple:
 FULL_BLEED_FILL = 0.96     # content over this much of the sheet = the sheet is the page
 FULL_BLEED_MAX_CUT = 0.10  # ... trimmed to the page only within this much per axis
 
+# --- Full-page tinted / halftone background page detection ---
+TINTED_EDGE_TRIM_FRAC = 0.06
+TINTED_BLUR_PX = 15
+TINTED_TILE_PX = 32
+TINTED_DARK_DELTA = 10.0
+TINTED_DARK_FRAC_MIN = 0.90
+TINTED_FLAT_TOL = 12.0
+TINTED_FLAT_SD_MAX = 10.0
+
+
+def compute_page_tint_stats(image_bgr: np.ndarray) -> tuple[float, float, np.ndarray]:
+    """Return (median_level, flatness_sd, tile_medians) inside the sheet margins.
+
+    Blurs with a 15px box filter to average out halftone dots, then takes
+    medians over 32x32 non-overlapping tiles inside the outer 6% trim.
+    """
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY) if image_bgr.ndim == 3 else image_bgr
+    h, w = gray.shape[:2]
+    y0, y1 = int(h * TINTED_EDGE_TRIM_FRAC), int(h * (1.0 - TINTED_EDGE_TRIM_FRAC))
+    x0, x1 = int(w * TINTED_EDGE_TRIM_FRAC), int(w * (1.0 - TINTED_EDGE_TRIM_FRAC))
+    core = gray[y0:y1, x0:x1] if (y1 > y0 and x1 > x0) else gray
+    blurred = cv2.blur(core, (TINTED_BLUR_PX, TINTED_BLUR_PX))
+    t = TINTED_TILE_PX
+    ny = blurred.shape[0] // t
+    nx = blurred.shape[1] // t
+    if ny <= 0 or nx <= 0:
+        lvl = float(np.median(blurred)) if blurred.size else 255.0
+        return lvl, 0.0, np.empty(0, dtype=np.float32)
+    tiles = (
+        blurred[:ny * t, :nx * t]
+        .reshape(ny, t, nx, t)
+        .transpose(0, 2, 1, 3)
+        .reshape(ny * nx, t * t)
+    )
+    tm = np.median(tiles, axis=1).astype(np.float32)
+    lvl = float(np.median(tm))
+    near = tm[np.abs(tm - lvl) <= TINTED_FLAT_TOL]
+    flat_sd = float(np.std(near)) if near.size else 0.0
+    return lvl, flat_sd, tm
+
+
+def detect_tinted_pages(
+    pages,
+    tile_stats: list[tuple[float, float, np.ndarray]],
+) -> list[bool]:
+    """Classify each page as full-sheet tinted relative to the book's paper tone."""
+    non_blank_lvls = [
+        lvl for p, (lvl, _, tm) in zip(pages, tile_stats)
+        if not p.blank and tm.size > 0
+    ]
+    book_lvl = float(np.median(non_blank_lvls)) if non_blank_lvls else 255.0
+    out: list[bool] = []
+    for p, (lvl, flat_sd, tm) in zip(pages, tile_stats):
+        if p.blank or tm.size == 0:
+            out.append(False)
+            continue
+        dark_frac = float((tm < book_lvl - TINTED_DARK_DELTA).mean())
+        is_tinted = (
+            lvl <= book_lvl - TINTED_DARK_DELTA
+            and dark_frac >= TINTED_DARK_FRAC_MIN
+            and flat_sd <= TINTED_FLAT_SD_MAX
+        )
+        out.append(is_tinted)
+    return out
+
 # --- Pass 2 / Pass 3 nombre alignment constants (physical units: mm) ---
 NOMBRE_MIN_GROUP_PAGES = 6           # min consistent pages per parity
 NOMBRE_MIN_SEQ_SUPPORT_FRAC = 0.15   # sequential support >= max(8, 15% of pages)
@@ -941,6 +1006,30 @@ def normalize_margins_pass1(pages, output_margin_mm: float = 5.0) -> dict:
             y0 = c.y0 + c.height / 2 - fy * crop_h
             floor = margin_px
         p.margin.fill = False
+        if getattr(p.margin, "tinted", False) and p.margin.page_w and p.margin.page_h:
+            # Full-sheet tinted page: treat the entire sheet as content and
+            # route to full-bleed trim when aspect/scale matches target size.
+            c_sheet = Box(0.0, 0.0, p.margin.page_w, p.margin.page_h)
+            s = min(c_sheet.width / tw_px, c_sheet.height / th_px)
+            fw, fh = tw_px * s, th_px * s
+            if abs(s - 1.0) <= FULL_BLEED_MAX_CUT and max(c_sheet.width / fw, c_sheet.height / fh) <= 1.0 + FULL_BLEED_MAX_CUT:
+                x0 = c_sheet.x0 + (c_sheet.width - fw) / 2.0
+                y0 = c_sheet.y0 + (c_sheet.height - fh) / 2.0
+                p.margin.crop = Box(x0, y0, x0 + fw, y0 + fh)
+                p.margin.target_w, p.margin.target_h = tw_px, th_px
+                p.margin.fill = True
+                p.flags = [f for f in p.flags if f != Flag.CONTENT_SCALED_DOWN]
+                continue
+            cw_t = max(tw_px, c_sheet.width)
+            ch_t = max(th_px, c_sheet.height)
+            x0 = c_sheet.x0 + (c_sheet.width - cw_t) / 2.0
+            y0 = c_sheet.y0 + (c_sheet.height - ch_t) / 2.0
+            p.margin.crop = Box(x0, y0, x0 + cw_t, y0 + ch_t)
+            p.margin.target_w, p.margin.target_h = tw_px, th_px
+            p.flags = [f for f in p.flags if f != Flag.CONTENT_SCALED_DOWN]
+            if cw_t > tw_px * 1.001 or ch_t > th_px * 1.001:
+                p.flags.append(Flag.CONTENT_SCALED_DOWN)
+            continue
         if p.margin.confidence >= 0.2 and p.margin.page_w and p.margin.page_h and (
                 crop_w > tw_px * 1.001 or crop_h > th_px * 1.001) and (
                 c.width >= FULL_BLEED_FILL * p.margin.page_w
@@ -1149,6 +1238,278 @@ def _ornament_boxes(
                     break
 
     return [cands[i] for i in sorted(accepted)]
+
+
+def _is_false_nombre(p) -> bool:
+    """True when nombre_box sits inside a figure or a multi-char body text line."""
+    m = p.margin
+    nb = m.nombre_box if m else None
+    if nb is None:
+        return False
+    for r in p.regions or []:
+        if nb.x0 >= r.box.x0 - 2 and nb.x1 <= r.box.x1 + 2 and nb.y0 >= r.box.y0 - 2 and nb.y1 <= r.box.y1 + 2:
+            if r.kind == RegionKind.FIGURE:
+                return True
+            if r.kind == RegionKind.TEXT and len((r.ocr_text or "").strip()) >= 5:
+                return True
+    return False
+
+
+def folio_not_found(p) -> bool:
+    """True when normal folio search did not find a valid page number on this page."""
+    return (
+        p.page_number is None
+        or p.page_number_source == "inferred"
+        or _is_false_nombre(p)
+    )
+
+
+def _folio_band_glyphs(gray: np.ndarray, unit: float) -> list[tuple[int, int, int, int]]:
+    """Find isolated dark digit-shaped strokes in the top/bottom folio bands."""
+    sh, sw = gray.shape
+    glyph_px = []
+    band = max(1, round(sh * NOMBRE_BAND_FRAC))
+    for y0 in (0, sh - band):
+        strip = gray[y0:y0 + band]
+        _, mask = cv2.threshold(strip, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+        _, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+        for x, y, bw, bh, area in stats[1:].tolist():
+            if not (0 < x and x + bw < sw and 0 < y and y + bh < band
+                    and 1.2 * unit <= bh <= 5 * unit and 0.16 * bh <= bw <= 3 * bh
+                    and 0.14 * bw * bh <= area <= 0.90 * bw * bh):
+                continue
+            if bw > 1.3 * bh:
+                inset = max(1, bw // 4)
+                core = mask[y:y + bh, x + inset:x + bw - inset]
+                if np.count_nonzero(core, axis=0).min() > 0.4 * bh:
+                    continue
+            patch = strip[y - 1:y + bh + 1, x - 1:x + bw + 1]
+            if patch.min() < 150 and np.median(patch[[0, -1], :]) > 200:
+                glyph_px.append((x, y0 + y, bw, bh))
+    return glyph_px
+
+
+def detect_edge_folio_box(image: np.ndarray, p, dpi: float) -> Optional[Box]:
+    """Fallback: find an edge/corner folio missed by normal folio search.
+
+    Only runs on pages where normal search failed (folio_not_found(p)).
+    Returns a bounding Box only when a digit-like stroke outside existing
+    regions extends outside the current crop or content box.
+    """
+    m = p.margin
+    if m is None or m.crop is None or p.blank or not folio_not_found(p):
+        return None
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    h, w = gray.shape
+    scale = min(1.0, 150 / dpi)
+    sw, sh = max(1, round(w * scale)), max(1, round(h * scale))
+    gray = cv2.resize(gray, (sw, sh), interpolation=cv2.INTER_AREA)
+    if abs(p.deskew.angle_deg) > 1e-3:
+        matrix = cv2.getRotationMatrix2D((sw / 2, sh / 2), p.deskew.angle_deg, 1)
+        gray = cv2.warpAffine(gray, matrix, (sw, sh), borderValue=255)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0.65)
+    unit = dpi * scale / 25.4
+    raw = _folio_band_glyphs(gray, unit)
+    if not raw:
+        return None
+
+    c = m.crop
+    content = m.content
+    edge = _mm_to_px(1.5, dpi)
+    sx, sy = w / sw, h / sh
+    cands = []
+    for x, y, bw, bh in raw:
+        bx0, by0, bx1, by1 = x * sx, y * sy, (x + bw) * sx, (y + bh) * sy
+        if bx0 < edge or by0 < edge or bx1 > w - edge or by1 > h - edge:
+            continue
+        if any(r.box.x0 - 2 <= bx0 and bx1 <= r.box.x1 + 2
+               and r.box.y0 - 2 <= by0 and by1 <= r.box.y1 + 2
+               for r in (p.regions or [])):
+            continue
+        out_crop = (bx0 < c.x0 - 0.5 or bx1 > c.x1 + 0.5
+                    or by0 < c.y0 - 0.5 or by1 > c.y1 + 0.5)
+        out_content = content is not None and (
+            bx0 < content.x0 - 0.5 or bx1 > content.x1 + 0.5
+            or by0 < content.y0 - 0.5 or by1 > content.y1 + 0.5
+        )
+        if out_crop or out_content:
+            cands.append((bx0, by0, bx1, by1, out_crop))
+    if not cands:
+        return None
+
+    # Keep only the band (top vs bottom) and side cluster that needs protection.
+    top = [b for b in cands if (b[1] + b[3]) / 2 < h / 2]
+    bot = [b for b in cands if (b[1] + b[3]) / 2 >= h / 2]
+    if top and bot:
+        top_oc = sum(1 for b in top if b[4])
+        bot_oc = sum(1 for b in bot if b[4])
+        cands = bot if bot_oc >= top_oc else top
+
+    if max(b[2] for b in cands) - min(b[0] for b in cands) > _mm_to_px(25.0, dpi):
+        left = [b for b in cands if (b[0] + b[2]) / 2 < w / 2]
+        right = [b for b in cands if (b[0] + b[2]) / 2 >= w / 2]
+        if left and right:
+            left_oc = sum(1 for b in left if b[4])
+            right_oc = sum(1 for b in right if b[4])
+            cands = left if left_oc > right_oc else right
+
+    return Box(
+        min(b[0] for b in cands) - sx,
+        min(b[1] for b in cands) - sy,
+        max(b[2] for b in cands) + sx,
+        max(b[3] for b in cands) + sy,
+    )
+
+
+def detect_predicted_folio_box(
+    image: np.ndarray,
+    pages,
+    idx: int,
+    dpi: float,
+) -> Optional[Box]:
+    """Predict folio position from same-parity trusted pages and protect local digit ink.
+
+    Only runs on ``folio_not_found(p)`` pages. Maps the median output-space
+    ``nombre_box`` offset of same-parity trusted pages back into this page's
+    deskewed coordinates, then searches a small local ROI (+-5mm X, +-4mm Y)
+    at full resolution for isolated digit-sized strokes. Returns a Box only
+    when such ink exists outside ``m.content`` (so margin-fill would otherwise
+    whiten it away); returns None when no digit ink is found.
+    """
+    p = pages[idx]
+    m = p.margin
+    if m is None or m.crop is None or p.blank or not folio_not_found(p):
+        return None
+
+    par = idx % 2
+    pts = []
+    for k, pk in enumerate(pages):
+        if k % 2 != par or pk.blank or folio_not_found(pk):
+            continue
+        mk = pk.margin
+        if not (mk and mk.crop and mk.nombre_box and mk.nombre_source != "geom"):
+            continue
+        nb, cr = mk.nombre_box, mk.crop
+        pts.append((nb.x0 - cr.x0, nb.y0 - cr.y0, nb.x1 - cr.x0, nb.y1 - cr.y0))
+    if len(pts) < 3:
+        return None
+
+    med = np.median(pts, axis=0)
+    pred = Box(
+        m.crop.x0 + float(med[0]),
+        m.crop.y0 + float(med[1]),
+        m.crop.x0 + float(med[2]),
+        m.crop.y0 + float(med[3]),
+    )
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    h, w = gray.shape
+    if p.deskew and abs(p.deskew.angle_deg) > 1e-3:
+        matrix = cv2.getRotationMatrix2D((w / 2, h / 2), p.deskew.angle_deg, 1)
+        gray = cv2.warpAffine(gray, matrix, (w, h), borderValue=255)
+
+    unit = dpi / 25.4
+    pad_x, pad_y = 5.0 * unit, 4.0 * unit
+    edge = 1.5 * unit
+    rx0 = max(int(edge), int(np.floor(pred.x0 - pad_x)))
+    ry0 = max(int(edge), int(np.floor(pred.y0 - pad_y)))
+    rx1 = min(int(w - edge), int(np.ceil(pred.x1 + pad_x)))
+    ry1 = min(int(h - edge), int(np.ceil(pred.y1 + pad_y)))
+    if rx1 - rx0 < 4 or ry1 - ry0 < 4:
+        return None
+
+    roi = gray[ry0:ry1, rx0:rx1]
+    if roi.min() >= 150:
+        return None
+    _, mask = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    _, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+
+    ct = m.content
+    glyphs: list[tuple[int, int, int, int]] = []
+    for x, y, bw, bh, area in stats[1:].tolist():
+        if not (
+            1.2 * unit <= bh <= 5.0 * unit
+            and 0.14 * bh <= bw <= 2.5 * bh
+            and 0.14 * bw * bh <= area <= 0.90 * bw * bh
+        ):
+            continue
+        if bw > 1.3 * bh:
+            inset = max(1, bw // 4)
+            core = mask[y:y + bh, x + inset:x + bw - inset]
+            if np.count_nonzero(core, axis=0).min() > 0.4 * bh:
+                continue
+        py0, py1 = max(0, y - 1), min(roi.shape[0], y + bh + 1)
+        px0, px1 = max(0, x - 1), min(roi.shape[1], x + bw + 1)
+        patch = roi[py0:py1, px0:px1]
+        if patch.min() < 150 and np.median(patch[[0, -1], :]) > 190:
+            gx0, gy0, gx1, gy1 = rx0 + x, ry0 + y, rx0 + x + bw, ry0 + y + bh
+            if (
+                gx1 >= pred.x0 - 2.5 * unit
+                and gx0 <= pred.x1 + 2.5 * unit
+                and gy1 >= pred.y0 - 2.5 * unit
+                and gy0 <= pred.y1 + 2.5 * unit
+            ):
+                glyphs.append((gx0, gy0, gx1, gy1))
+
+    if not glyphs:
+        return None
+
+    # Only protect when at least one detected digit stroke lies outside content
+    # (otherwise margin-fill already preserves it).
+    if ct is not None:
+        out_ct = [
+            g for g in glyphs
+            if (g[0] < ct.x0 - 0.5 or g[2] > ct.x1 + 0.5
+                or g[1] < ct.y0 - 0.5 or g[3] > ct.y1 + 0.5)
+        ]
+        if not out_ct:
+            return None
+        glyphs = out_ct
+
+    return Box(
+        float(min(g[0] for g in glyphs) - 1),
+        float(min(g[1] for g in glyphs) - 1),
+        float(max(g[2] for g in glyphs) + 1),
+        float(max(g[3] for g in glyphs) + 1),
+    )
+
+
+def protect_edge_folio(p, ef: Box) -> bool:
+    """Protect an edge/corner folio by pure translation of crop (never scaling)."""
+    m = p.margin
+    if m is None or m.crop is None:
+        return False
+    m.edge_folio_box = ef
+    c = m.crop
+    cw, ch = c.width, c.height
+    if (ef.x0 >= c.x0 - 0.5 and ef.x1 <= c.x1 + 0.5
+            and ef.y0 >= c.y0 - 0.5 and ef.y1 <= c.y1 + 0.5):
+        return False
+    if ef.width > cw or ef.height > ch:
+        return False
+    x0 = max(min(c.x0, ef.x0), ef.x1 - cw)
+    y0 = max(min(c.y0, ef.y0), ef.y1 - ch)
+    m.crop = Box(x0, y0, x0 + cw, y0 + ch)
+    return True
+
+
+def _clips_interior_ocr_text(p, crop: Box, dpi: float) -> bool:
+    """True if crop clips any OCR text region outside the NOMBRE_BLEED_MM edge band."""
+    m = p.margin
+    bleed = _mm_to_px(NOMBRE_BLEED_MM, dpi)
+    pw, ph = m.page_w, m.page_h
+    for r in p.regions or []:
+        if not r.ocr_text:
+            continue
+        b = r.box
+        if pw and ph and (
+            b.x0 < bleed or b.y0 < bleed or b.x1 > pw - bleed or b.y1 > ph - bleed
+        ):
+            continue
+        if (b.x0 < crop.x0 - 0.5 or b.x1 > crop.x1 + 0.5
+                or b.y0 < crop.y0 - 0.5 or b.y1 > crop.y1 + 0.5):
+            return True
+    return False
 
 
 def _protected_box(p, dpi: float) -> Box:
@@ -1444,6 +1805,8 @@ def _refine_margins_with_nombre(pages, pass1: dict) -> NombreAlignReport:
                 continue
             p = o["page"]
             m = p.margin
+            if getattr(m, "tinted", False):
+                continue
             dpi = _page_dpi(p, use_dpi, fallback_dpi)
 
             # Gate 1: Box dimension sanity (reject running-head fusion / huge blobs)
@@ -1488,7 +1851,8 @@ def _refine_margins_with_nombre(pages, pass1: dict) -> NombreAlignReport:
 
             # Pass 3: Strict no-clip clamp (preserve the protected marks)
             if m.confidence >= 0.2 or m.glyph_box is not None:
-                c = _protected_box(p, dpi)
+                c_full = _protected_box(p, dpi)
+                c = c_full
                 # Nothing beyond the folio (toward the paper edge it sits
                 # next to) is protected: once the folio is placed, marks
                 # further out -- fore-edge tabs, rules -- may be trimmed by
@@ -1508,6 +1872,12 @@ def _refine_margins_with_nombre(pages, pass1: dict) -> NombreAlignReport:
                     c = Box(cx0, cy0, cx1, cy1)
                 clamped_x0 = max(min(new_x0, c.x0), c.x1 - crop_w)
                 clamped_y0 = max(min(new_y0, c.y0), c.y1 - crop_h)
+                base_crop = Box(clamped_x0, clamped_y0, clamped_x0 + crop_w, clamped_y0 + crop_h)
+                if c is not c_full and _clips_interior_ocr_text(p, base_crop, dpi):
+                    # Exception: folio sits inside the text block (e.g. inset folio),
+                    # so the relaxation clipped real OCR text; re-clamp to protect it.
+                    clamped_x0 = max(min(new_x0, c_full.x0), c_full.x1 - crop_w)
+                    clamped_y0 = max(min(new_y0, c_full.y0), c_full.y1 - crop_h)
                 if abs(clamped_x0 - new_x0) > 0.5:
                     report.n_clamped_x += 1
                 if abs(clamped_y0 - new_y0) > 0.5:
@@ -1515,6 +1885,8 @@ def _refine_margins_with_nombre(pages, pass1: dict) -> NombreAlignReport:
                 new_x0, new_y0 = clamped_x0, clamped_y0
 
             m.crop = Box(new_x0, new_y0, new_x0 + crop_w, new_y0 + crop_h)
+            if m.edge_folio_box is not None:
+                protect_edge_folio(p, m.edge_folio_box)
             report.n_adjusted += 1
             if o["is_seq"]:
                 report.n_adjusted_seq += 1
@@ -1539,6 +1911,8 @@ def normalize_margins(pages, output_margin_mm: float = 5.0) -> None:
     if pass1:
         _refine_margins_with_nombre(pages, pass1)
         place_matter_pages(pages, pass1)
+        from ..duplex import apply_duplex_translation_exceptions
+        apply_duplex_translation_exceptions(pages)
 
 
 MATTER_MIN_REF_PAGES = 6   # folio pages per parity needed to know the mean correction
