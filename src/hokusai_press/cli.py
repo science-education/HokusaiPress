@@ -453,6 +453,55 @@ def main(argv=None) -> int:
                             help="disable 3-pass folio-aligned margin refinement "
                                  "(use Pass-1 type-area alignment only)")
 
+    p_cover = sub.add_parser(
+        "cover",
+        help="fetch a book cover (openBD / hanmoto.com / Google Books), upscale "
+             "without margins, and prepend cover + blank verso page to PDFs")
+    p_cover.add_argument("source", nargs="+",
+                         help="PDF file(s), folder(s) (all *.pdf), or glob")
+    p_cover.add_argument("--out", required=True,
+                         help="output PDF path, or a folder (saves <source><suffix>.pdf)")
+    p_cover.add_argument("--suffix", default="",
+                         help="append this to output names in a folder")
+    p_cover.add_argument("--db", default=None,
+                         help="optional hokusai.db for image-only PDFs without a text layer")
+    p_cover.add_argument("--isbn", default=None,
+                         help="override ISBN instead of extracting from the PDF")
+    p_cover.add_argument("--cover-image", default=None,
+                         help="use a local cover image file instead of fetching online")
+    p_cover.add_argument("--sources", default="openbd,hanmoto,google",
+                         help="comma-separated cover lookup order "
+                              "(default: openbd,hanmoto,google)")
+    p_cover.add_argument("--cache-dir", default=None,
+                         help="cache downloaded cover images by ISBN in this folder")
+    p_cover.add_argument("--upscale", default="auto",
+                         choices=["auto", "onnx", "lanczos", "none"],
+                         help="upscale mode when fetched cover is smaller than body DPI "
+                              "(default: auto)")
+    p_cover.add_argument("--upscale-model", default=None,
+                         help="optional ONNX super-resolution model path for upscale=auto/onnx")
+    p_cover.add_argument("--target-dpi", type=int, default=300,
+                         help="target effective DPI relative to body height (default: 300)")
+    p_cover.add_argument("--jpeg-quality", type=int, default=94,
+                         help="JPEG quality for embedded cover page (default: 94)")
+    p_cover.add_argument("--no-blank-back", action="store_true",
+                         help="do not insert a blank verso page after the cover")
+    p_cover.add_argument("--replace-cover", action="store_true",
+                         help="replace existing page 1 instead of prepending")
+    p_cover.add_argument("--force", action="store_true",
+                         help="insert even if /HokusaiPressCover metadata is already set")
+    p_cover.add_argument("--skip-existing", action="store_true",
+                         help="skip sources whose output PDF already exists")
+    p_cover.add_argument("--dry-run", action="store_true",
+                         help="resolve ISBN and fetch cover without writing output PDFs")
+    p_cover.add_argument("--ocr-fallback", action="store_true",
+                         help="OCR tail/head pages if PDF text layer and DB have no text")
+    p_cover.add_argument("--ocr-engine", default=DEFAULT_OCR_ENGINE)
+    p_cover.add_argument("--device", default="auto")
+    p_cover.add_argument("--model-dir", default="models")
+    p_cover.add_argument("--openvino-cache-dir", default=None)
+    p_cover.add_argument("--runtime", default=None)
+
     args = parser.parse_args(argv)
 
     if args.command == "run":
@@ -842,6 +891,128 @@ def main(argv=None) -> int:
         print(f"[OK] trained page-kind model -> {args.out} "
               f"(classes: {model['counts']})")
         return 0
+
+    if args.command == "cover":
+        import cv2
+
+        from .cover import (
+            extract_isbn,
+            fetch_cover_image,
+            insert_cover_pages,
+            isbn10_to_13,
+        )
+
+        sources = _expand_sources(args.source)
+        if not sources:
+            print("no input files matched")
+            return 1
+        if len(sources) > 1 and not _is_folder_out(args.out):
+            print("error: --out must be a folder when processing multiple inputs")
+            return 1
+        if len(sources) > 1 and args.isbn:
+            print("error: --isbn cannot be used with multiple input files")
+            return 1
+        if not args.dry_run:
+            planned = [
+                (src, _resolve_out(args.out, src, args.suffix, mkdir=False))
+                for src in sources
+            ]
+            if err := _check_output_collisions(sources, planned):
+                print(err)
+                return 1
+
+        fetch_sources = tuple(
+            s.strip() for s in args.sources.split(",") if s.strip()
+        )
+        local_cover = None
+        if args.cover_image:
+            local_cover = cv2.imread(args.cover_image, cv2.IMREAD_COLOR)
+            if local_cover is None:
+                print(f"error: failed to read cover image: {args.cover_image}")
+                return 1
+
+        ocr_engine = None
+        if args.ocr_fallback:
+            from .ocr import get_ocr_engine
+
+            ocr_engine = get_ocr_engine(
+                args.ocr_engine, args.model_dir, args.device,
+                args.openvino_cache_dir, args.runtime,
+            )
+
+        failed = 0
+        for src in sources:
+            dst = _resolve_out(args.out, src, args.suffix, mkdir=not args.dry_run)
+            if not args.dry_run and args.skip_existing and os.path.exists(dst):
+                print(f"[skip] {os.path.basename(src)}: output exists")
+                continue
+            try:
+                if local_cover is not None:
+                    cover_bgr = local_cover
+                    isbn13 = isbn10_to_13(args.isbn) if args.isbn else None
+                    cover_src = "local"
+                else:
+                    if args.isbn:
+                        isbn13 = isbn10_to_13(args.isbn)
+                        isbn_note = "cli"
+                    else:
+                        isbn13, isbn_note = extract_isbn(
+                            src, db_path=args.db, ocr_engine=ocr_engine,
+                        )
+                    if not isbn13:
+                        print(f"[skip] {os.path.basename(src)}: {isbn_note}")
+                        failed += 1
+                        continue
+                    fetched = fetch_cover_image(
+                        isbn13,
+                        sources=fetch_sources,
+                        cache_dir=args.cache_dir,
+                        throttle_sec=0.3,
+                    )
+                    if fetched is None:
+                        print(f"[skip] {os.path.basename(src)}: no cover found for ISBN {isbn13}")
+                        failed += 1
+                        continue
+                    cover_bgr = fetched.image_bgr
+                    cover_src = fetched.source
+
+                if args.dry_run:
+                    h, w = cover_bgr.shape[:2]
+                    print(
+                        f"[dry-run] {os.path.basename(src)}: ISBN={isbn13 or '-'} "
+                        f"source={cover_src} size={w}x{h} -> {dst}",
+                        flush=True,
+                    )
+                    continue
+
+                res = insert_cover_pages(
+                    src,
+                    dst,
+                    cover_bgr,
+                    isbn=isbn13,
+                    source_name=cover_src,
+                    blank_back=not args.no_blank_back,
+                    replace_cover=args.replace_cover,
+                    force=args.force,
+                    upscale_mode=args.upscale,
+                    upscale_model=args.upscale_model,
+                    target_dpi=args.target_dpi,
+                    jpeg_quality=args.jpeg_quality,
+                )
+                if res.skipped:
+                    print(f"[skip] {os.path.basename(src)}: {res.note}", flush=True)
+                else:
+                    print(
+                        f"[OK] {os.path.basename(src)}: ISBN={res.isbn or '-'} "
+                        f"src={res.source} upscale={res.upscale_method} "
+                        f"({res.cover_size_px[0]}x{res.cover_size_px[1]} -> "
+                        f"{res.cover_box_pt[0]:.1f}x{res.cover_box_pt[1]:.1f}pt) -> {dst}",
+                        flush=True,
+                    )
+            except Exception as e:
+                failed += 1
+                print(f"[FAIL] {os.path.basename(src)}: {e}", flush=True)
+        return 1 if failed else 0
 
     return 1
 
