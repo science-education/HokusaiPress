@@ -276,7 +276,9 @@ def analyze_document(
     # stored. Both are recorded in SourceRef (paper, rotate) so every later
     # load (rebuild, remargin, review UI) sees the same page.
     from . import orientation as orient_mod
-    from .source import find_paper, orient, pdf_page_sizes
+    from .source import (
+        find_paper, find_paper_by_book_size, orient, pdf_page_sizes,
+    )
 
     page_sizes = pdf_page_sizes(path) if pages is not None else []
     total_pages: int | None = (
@@ -324,30 +326,62 @@ def analyze_document(
             dominant_landscape = sum(is_landscape) * 2 > len(loaded)
 
         if dominant_landscape is not None:
+            book_pt = _book_median_pt(page_sizes, loaded, dominant_landscape)
             fixed = []
             engine = None
             for (s, o, w, d), landscape in zip(loaded, is_landscape):
+                raw_h, raw_w = o.shape[:2]
+                exp_wh = _expected_px(book_pt, d)
+                box = None
+                used_size_fallback = False
                 if landscape != dominant_landscape:
                     box = find_paper(o)
                     if box is not None:
-                        s.paper = box
                         pw, ph = box[2] - box[0], box[3] - box[1]
-                        landscape = pw > ph
-                    if landscape != dominant_landscape and not keep_orientation:
-                        if use_ocr:
-                            if engine is None:
-                                from .ocr import get_ocr_engine
+                        cw, ch = (ph, pw) if ((pw > ph) != dominant_landscape) else (pw, ph)
+                    else:
+                        cw, ch = (raw_h, raw_w)
+                else:
+                    cw, ch = float(raw_w), float(raw_h)
 
-                                engine = get_ocr_engine(
-                                    ocr_engine, model_dir=model_dir, device=device,
-                                    openvino_cache_dir=openvino_cache_dir,
-                                    runtime=runtime, layout_engine=layout_engine,
-                                    text_engine=text_engine)
-                            s.rotate, _ = orient_mod.choose_rotation(
-                                orient(w, s, s.ocr_scale), engine)
-                        else:
-                            s.rotate = 90       # no OCR to tell: flagged for review
+                if exp_wh is not None:
+                    exp_w, exp_h = exp_wh
+                    if box is None:
+                        cur_w, cur_h = float(raw_w), float(raw_h)
+                    else:
+                        pw, ph = box[2] - box[0], box[3] - box[1]
+                        cur_w, cur_h = (pw, ph) if ((pw > ph) == (exp_w > exp_h)) else (ph, pw)
+                    if _needs_paper_size_fallback(raw_w, raw_h, cur_w, cur_h, exp_w, exp_h):
+                        fb = find_paper_by_book_size(o, exp_w, exp_h)
+                        if fb is not None:
+                            box = fb
+                            used_size_fallback = True
+
+                if box is not None:
+                    s.paper = box
+                    pw, ph = box[2] - box[0], box[3] - box[1]
+                    landscape = pw > ph
+
+                if (landscape != dominant_landscape or used_size_fallback) and not keep_orientation:
+                    cands = (0, 180) if landscape == dominant_landscape else (90, 270)
+                    if use_ocr:
+                        if engine is None:
+                            from .ocr import get_ocr_engine
+
+                            engine = get_ocr_engine(
+                                ocr_engine, model_dir=model_dir, device=device,
+                                openvino_cache_dir=openvino_cache_dir,
+                                runtime=runtime, layout_engine=layout_engine,
+                                text_engine=text_engine)
+                        s.rotate, _ = orient_mod.choose_rotation(
+                            orient(w, s, s.ocr_scale), engine, candidates=cands)
+                    else:
+                        s.rotate = cands[0]
+                    if s.rotate:
                         reoriented.add(s.page_index)
+                    o = orient(o, s)
+                    w = orient(w, s, s.ocr_scale)
+                elif box is not None:
                     o = orient(o, s)
                     w = orient(w, s, s.ocr_scale)
                 fixed.append((s, o, w, d))
@@ -891,6 +925,156 @@ def _apply_edge_folio_protection(pages: list[PageParams],
             margin_mod.protect_edge_folio(p, pf)
 
 
+def _book_median_pt(page_sizes, loaded, dominant_landscape: bool) -> tuple[float, float] | None:
+    """Median (w_pt, h_pt) of normal pages matching `dominant_landscape`."""
+    import statistics
+
+    pts = [
+        (float(pw), float(ph)) for pw, ph in page_sizes
+        if (pw > ph) == dominant_landscape and pw > 0 and ph > 0
+    ]
+    if len(pts) >= 3:
+        return statistics.median(p[0] for p in pts), statistics.median(p[1] for p in pts)
+    px_pts = [
+        (o.shape[1] * 72.0 / d, o.shape[0] * 72.0 / d)
+        for (_s, o, _w, d) in loaded
+        if (o.shape[1] > o.shape[0]) == dominant_landscape and d and d > 0
+    ]
+    if len(px_pts) >= 3:
+        return statistics.median(p[0] for p in px_pts), statistics.median(p[1] for p in px_pts)
+    return None
+
+
+def _expected_px(book_pt: tuple[float, float] | None, dpi: float | None) -> tuple[float, float] | None:
+    if book_pt is None or not dpi or dpi <= 0:
+        return None
+    return book_pt[0] * dpi / 72.0, book_pt[1] * dpi / 72.0
+
+
+def _needs_paper_size_fallback(
+    raw_w: float, raw_h: float,
+    cur_w: float, cur_h: float,
+    exp_w: float, exp_h: float,
+) -> bool:
+    """True only when the raw scan is clearly larger than a normal book page
+    AND the current paper/orientation dimensions do not match the book."""
+    if exp_w <= 0 or exp_h <= 0:
+        return False
+    if raw_w * raw_h < 1.5 * exp_w * exp_h or max(raw_w / exp_w, raw_h / exp_h) < 1.4:
+        return False
+    if (cur_w > cur_h) != (exp_w > exp_h):
+        return True
+    return not (0.70 <= cur_w / exp_w <= 1.35 and 0.70 <= cur_h / exp_h <= 1.35)
+
+
+def _fix_oversized_paper_pages(pages: list[PageParams], source_path: str) -> None:
+    """Exception for remargin: re-detect paper & upright orientation (and remap
+    stored OCR regions without re-running OCR) on oversized scans whose paper
+    detection failed or yielded a wrong-aspect/wrong-size sheet."""
+    import statistics
+    from . import orientation as orient_mod
+    from .model import SourceRef
+    from .source import find_paper_by_book_size, load_single, orient, pdf_page_sizes
+
+    normal = [
+        p for p in pages
+        if not p.blank and (p.source.paper is None)
+        and p.margin and p.margin.page_w and p.margin.page_h
+    ]
+    if len(normal) < 3:
+        return
+    dpis = [p.dpi for p in normal if p.dpi and p.dpi > 0]
+    med_dpi = statistics.median(dpis) if dpis else None
+    if med_dpi is not None:
+        pts = [
+            (p.margin.page_w * 72.0 / (p.dpi or med_dpi),
+             p.margin.page_h * 72.0 / (p.dpi or med_dpi))
+            for p in normal
+        ]
+        book_w_pt = statistics.median(x[0] for x in pts)
+        book_h_pt = statistics.median(x[1] for x in pts)
+    else:
+        book_w_px = statistics.median(p.margin.page_w for p in normal)
+        book_h_px = statistics.median(p.margin.page_h for p in normal)
+        book_w_pt = book_h_pt = None
+
+    pdf_sizes = pdf_page_sizes(source_path)
+    for p in pages:
+        if not (p.margin and p.margin.page_w and p.margin.page_h):
+            continue
+        cur_w, cur_h = float(p.margin.page_w), float(p.margin.page_h)
+        if med_dpi is not None and book_w_pt is not None:
+            dpi_p = p.dpi if (p.dpi and p.dpi > 0) else med_dpi
+            exp_w = book_w_pt * dpi_p / 72.0
+            exp_h = book_h_pt * dpi_p / 72.0
+        else:
+            exp_w, exp_h = book_w_px, book_h_px
+
+        # Fast pre-filter using PDF page size when available
+        idx = p.source.page_index
+        if pdf_sizes and idx < len(pdf_sizes) and book_w_pt is not None:
+            rw_pt, rh_pt = pdf_sizes[idx]
+            if rw_pt * rh_pt < 1.4 * book_w_pt * book_h_pt:
+                continue
+
+        raw_img, _ = load_single(source_path, idx)
+        raw_h, raw_w = raw_img.shape[:2]
+        if not _needs_paper_size_fallback(raw_w, raw_h, cur_w, cur_h, exp_w, exp_h):
+            continue
+
+        new_paper = find_paper_by_book_size(raw_img, exp_w, exp_h)
+        if new_paper is None:
+            continue
+        pw = new_paper[2] - new_paper[0]
+        ph = new_paper[3] - new_paper[1]
+        same_orient = (pw > ph) == (exp_w > exp_h)
+        cands = (0, 180) if same_orient else (90, 270)
+        if p.regions:
+            new_rot, _ = orient_mod.choose_rotation_from_regions(
+                p.regions, (float(raw_w), float(raw_h)),
+                p.source.paper, int(p.source.rotate or 0),
+                float(p.deskew.angle_deg if p.deskew else 0.0),
+                new_paper, candidates=cands,
+            )
+        else:
+            new_rot = cands[0]
+
+        new_ref = SourceRef(
+            path=p.source.path, page_index=idx,
+            embedded_image_id=p.source.embedded_image_id,
+            ocr_scale=p.source.ocr_scale,
+            paper=new_paper, rotate=new_rot,
+        )
+        new_oriented = orient(raw_img, new_ref)
+        new_deskew = deskew_mod.find_skew(new_oriented)
+
+        M = orient_mod.box_transform_matrix(
+            (float(raw_w), float(raw_h)),
+            p.source.paper, int(p.source.rotate or 0),
+            float(p.deskew.angle_deg if p.deskew else 0.0),
+            new_paper, new_rot, float(new_deskew.angle_deg),
+        )
+        for reg in p.regions:
+            nx0, ny0, nx1, ny1 = orient_mod.map_box_coords(
+                (reg.box.x0, reg.box.y0, reg.box.x1, reg.box.y1), M,
+            )
+            reg.box = Box(nx0, ny0, nx1, ny1)
+        if p.margin.nombre_box is not None:
+            nb = p.margin.nombre_box
+            nx0, ny0, nx1, ny1 = orient_mod.map_box_coords(
+                (nb.x0, nb.y0, nb.x1, nb.y1), M,
+            )
+            p.margin.nombre_box = Box(nx0, ny0, nx1, ny1)
+
+        p.source.paper = new_paper
+        p.source.rotate = new_rot
+        p.deskew = new_deskew
+        if new_rot and Flag.PAGE_REORIENTED not in p.flags:
+            p.flags.append(Flag.PAGE_REORIENTED)
+        elif not new_rot:
+            p.flags = [f for f in p.flags if f != Flag.PAGE_REORIENTED]
+
+
 def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
                                   output_margin_mm: float = 5.0,
                                   max_workers: int = 1,
@@ -921,6 +1105,7 @@ def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
     if err := check_doc_conflict(store, source_path, doc_id):
         raise ValueError(err)
     pages = [r.params for r in rows]
+    _fix_oversized_paper_pages(pages, source_path)
     prev_nombre = [
         (
             p.margin.nombre_box if p.margin else None,

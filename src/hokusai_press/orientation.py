@@ -87,3 +87,102 @@ def choose_rotation(img: np.ndarray, engine, candidates=(90, 270)) -> tuple[int,
             scores[r] = (-1e9, -1.0)
     best = max(scores, key=lambda r: (scores[r], -candidates.index(r)))
     return best, scores
+
+
+def _crop_rect(paper: list[float] | None, raw_w: float, raw_h: float) -> tuple[float, float, float, float]:
+    if paper:
+        x0, y0, x1, y1 = (float(v) for v in paper)
+        return max(0.0, x0), max(0.0, y0), min(raw_w, x1), min(raw_h, y1)
+    return 0.0, 0.0, float(raw_w), float(raw_h)
+
+
+def oriented_size(paper: list[float] | None, rotate: int,
+                  raw_w: float, raw_h: float) -> tuple[float, float]:
+    x0, y0, x1, y1 = _crop_rect(paper, raw_w, raw_h)
+    cw, ch = max(1.0, x1 - x0), max(1.0, y1 - y0)
+    if int(rotate or 0) % 360 in (90, 270):
+        return ch, cw
+    return cw, ch
+
+
+def _orient_to_raw_matrix(paper: list[float] | None, rotate: int,
+                          raw_w: float, raw_h: float) -> np.ndarray:
+    """3x3 affine matrix mapping oriented-crop coords -> raw-image coords."""
+    x0, y0, x1, y1 = _crop_rect(paper, raw_w, raw_h)
+    cw, ch = max(1.0, x1 - x0), max(1.0, y1 - y0)
+    r = int(rotate or 0) % 360
+    if r == 0:
+        M = np.array([[1.0, 0.0, x0], [0.0, 1.0, y0], [0.0, 0.0, 1.0]])
+    elif r == 90:
+        # x_or = ch - (y_raw - y0), y_or = x_raw - x0
+        M = np.array([[0.0, 1.0, x0], [-1.0, 0.0, y0 + ch], [0.0, 0.0, 1.0]])
+    elif r == 180:
+        # x_or = cw - (x_raw - x0), y_or = ch - (y_raw - y0)
+        M = np.array([[-1.0, 0.0, x0 + cw], [0.0, -1.0, y0 + ch], [0.0, 0.0, 1.0]])
+    else:  # 270
+        # x_or = y_raw - y0, y_or = cw - (x_raw - x0)
+        M = np.array([[0.0, -1.0, x0 + cw], [1.0, 0.0, y0], [0.0, 0.0, 1.0]])
+    return M
+
+
+def _raw_to_orient_matrix(paper: list[float] | None, rotate: int,
+                          raw_w: float, raw_h: float) -> np.ndarray:
+    """3x3 affine matrix mapping raw-image coords -> oriented-crop coords."""
+    return np.linalg.inv(_orient_to_raw_matrix(paper, rotate, raw_w, raw_h))
+
+
+def box_transform_matrix(
+    raw_size: tuple[float, float],
+    old_paper: list[float] | None, old_rotate: int, old_deskew_deg: float,
+    new_paper: list[float] | None, new_rotate: int, new_deskew_deg: float,
+) -> np.ndarray:
+    """2x3 affine matrix mapping boxes in old deskewed-oriented coords
+    to new deskewed-oriented coords."""
+    raw_w, raw_h = raw_size
+    ow, oh = oriented_size(old_paper, old_rotate, raw_w, raw_h)
+    nw, nh = oriented_size(new_paper, new_rotate, raw_w, raw_h)
+
+    R_old = cv2.getRotationMatrix2D((ow / 2.0, oh / 2.0), float(old_deskew_deg), 1.0)
+    R_old_inv = np.vstack([cv2.invertAffineTransform(R_old), [0.0, 0.0, 1.0]])
+
+    M_to_raw = _orient_to_raw_matrix(old_paper, old_rotate, raw_w, raw_h)
+    M_from_raw = _raw_to_orient_matrix(new_paper, new_rotate, raw_w, raw_h)
+
+    R_new = cv2.getRotationMatrix2D((nw / 2.0, nh / 2.0), float(new_deskew_deg), 1.0)
+    R_new_h = np.vstack([R_new, [0.0, 0.0, 1.0]])
+
+    return (R_new_h @ M_from_raw @ M_to_raw @ R_old_inv)[:2, :]
+
+
+def map_box_coords(box: tuple[float, float, float, float], M: np.ndarray) -> tuple[float, float, float, float]:
+    x0, y0, x1, y1 = box
+    pts = np.array([[x0, y0, 1.0], [x1, y0, 1.0], [x0, y1, 1.0], [x1, y1, 1.0]], dtype=np.float64).T
+    out = M @ pts
+    return float(out[0].min()), float(out[1].min()), float(out[0].max()), float(out[1].max())
+
+
+def choose_rotation_from_regions(
+    regions,
+    raw_size: tuple[float, float],
+    old_paper: list[float] | None,
+    old_rotate: int,
+    old_deskew_deg: float,
+    new_paper: list[float] | None,
+    candidates: tuple[int, ...] = (0, 180),
+) -> tuple[int, dict]:
+    """Pick upright rotation among `candidates` using already-stored OCR regions
+    (no OCR re-run)."""
+    scores = {}
+    for r in candidates:
+        M = box_transform_matrix(
+            raw_size, old_paper, old_rotate, old_deskew_deg,
+            new_paper, r, 0.0,
+        )
+        lines = []
+        for reg in regions:
+            b = reg.box
+            nb = map_box_coords((b.x0, b.y0, b.x1, b.y1), M)
+            lines.append({"box": nb, "text": reg.ocr_text or ""})
+        scores[r] = (layout_score(lines), text_score(lines))
+    best = max(scores, key=lambda r: (scores[r], -candidates.index(r)))
+    return best, scores

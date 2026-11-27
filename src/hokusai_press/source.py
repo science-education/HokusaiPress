@@ -478,6 +478,129 @@ def find_paper(img: np.ndarray) -> "list | None":
     return [float(x0), float(y0), float(x1), float(y1)]
 
 
+def _estimate_bed_gray_1d(inner: np.ndarray, axis: int) -> float | None:
+    """Estimate the uniform scanner bed gray level from the outer strips along
+    an axis (axis=0 -> left/right strips, axis=1 -> top/bottom strips)."""
+    n = inner.shape[1] if axis == 0 else inner.shape[0]
+    k = max(3, int(0.02 * n))
+    if 2 * k >= n:
+        return None
+    if axis == 0:
+        s_l, s_r = inner[:, :k], inner[:, -k:]
+    else:
+        s_l, s_r = inner[:k, :], inner[-k:, :]
+    med_l, med_r = float(np.median(s_l)), float(np.median(s_r))
+    std_l, std_r = float(np.std(s_l)), float(np.std(s_r))
+    valid_l = 20.0 < med_l < 235.0
+    valid_r = 20.0 < med_r < 235.0
+    if valid_l and valid_r and abs(med_l - med_r) <= 25.0:
+        return (med_l + med_r) / 2.0
+    if valid_l and std_l < 8.0:
+        return med_l
+    if valid_r and std_r < 8.0:
+        return med_r
+    return None
+
+
+def _find_window_1d(inner: np.ndarray, axis: int, win_len: int) -> tuple[int, int] | None:
+    """Slide a window of width `win_len` along `axis` (0=x, 1=y) to locate the
+    sheet that differs most from the scanner bed, then snap edges."""
+    n = inner.shape[1] if axis == 0 else inner.shape[0]
+    if win_len <= 0 or win_len >= int(0.92 * n):
+        return None
+    bed_gray = _estimate_bed_gray_1d(inner, axis)
+    if bed_gray is None:
+        return None
+
+    g = inner.astype(np.float32)
+    diff = np.abs(g - bed_gray).mean(axis=axis)
+    sd = g.std(axis=axis)
+    score = diff + sd
+
+    cs = np.concatenate([[0.0], np.cumsum(score, dtype=np.float64)])
+    win_scores = cs[win_len:] - cs[:-win_len]
+    bx0 = int(np.argmax(win_scores))
+    bx1 = bx0 + win_len
+
+    in_score = float(np.mean(score[bx0:bx1]))
+    out_parts = []
+    if bx0 > 0:
+        out_parts.append(score[:bx0])
+    if bx1 < n:
+        out_parts.append(score[bx1:])
+    if not out_parts:
+        return None
+    out_score = float(np.median(np.concatenate(out_parts)))
+    if in_score - out_score < 8.0 and in_score < 2.0 * max(out_score, 1.0):
+        return None
+
+    # Snap left/right edges to where the page stands out above the bed
+    edge_sig = diff + 0.5 * sd
+    in_edge = float(np.median(edge_sig[bx0:bx1]))
+    thr = max(8.0, 0.45 * out_score + 0.35 * in_edge)
+    pad = max(10, int(0.08 * win_len))
+
+    lo_lim = max(0, bx0 - pad)
+    hi_lim = min(n, bx1 + pad)
+    a = bx0
+    while a > lo_lim and edge_sig[a - 1] >= thr:
+        a -= 1
+    while a < bx1 - 1 and edge_sig[a] < thr:
+        a += 1
+    b = bx1
+    while b < hi_lim and edge_sig[b] >= thr:
+        b += 1
+    while b > a + 1 and edge_sig[b - 1] < thr:
+        b -= 1
+    if b - a < int(0.70 * win_len):
+        return bx0, bx1
+    return a, b
+
+
+def find_paper_by_book_size(
+    img: np.ndarray, target_w: float, target_h: float,
+) -> "list[float] | None":
+    """Locate the sheet [x0, y0, x1, y1] in an oversized scan using the book's
+    normal page size (target_w, target_h in this image's pixels) as a guide."""
+    if target_w <= 0 or target_h <= 0:
+        return None
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    h, w = gray.shape
+    px0, px1 = _white_pad(gray, 0)
+    py0, py1 = _white_pad(gray, 1)
+    inner = gray[py0:py1, px0:px1]
+    ih, iw = inner.shape
+    if ih == 0 or iw == 0:
+        return None
+
+    big_x = iw > target_w * 1.25
+    big_y = ih > target_h * 1.25
+    if big_x and not big_y:
+        win_w = max(1, min(iw - 1, int(round(ih * (target_w / target_h)))))
+        xs = _find_window_1d(inner, 0, win_w)
+        if xs is None:
+            return None
+        return [float(px0 + xs[0]), 0.0, float(px0 + xs[1]), float(h)]
+    if big_y and not big_x:
+        win_h = max(1, min(ih - 1, int(round(iw * (target_h / target_w)))))
+        ys = _find_window_1d(inner, 1, win_h)
+        if ys is None:
+            return None
+        return [0.0, float(py0 + ys[0]), float(w), float(py0 + ys[1])]
+    if big_x and big_y:
+        win_w = max(1, min(iw - 1, int(round(target_w))))
+        xs = _find_window_1d(inner, 0, win_w)
+        if xs is None:
+            return None
+        win_h = max(1, min(ih - 1, int(round(target_h))))
+        ys = _find_window_1d(inner[:, xs[0]:xs[1]], 1, win_h)
+        if ys is None:
+            return [float(px0 + xs[0]), 0.0, float(px0 + xs[1]), float(h)]
+        return [float(px0 + xs[0]), float(py0 + ys[0]),
+                float(px0 + xs[1]), float(py0 + ys[1])]
+    return None
+
+
 def orient(img: np.ndarray, ref: SourceRef, scale: float = 1.0) -> np.ndarray:
     """Apply ref.paper (crop) and ref.rotate (clockwise) to a raw page image;
     scale maps raw pixels to img's pixels (ref.ocr_scale for the OCR raster)."""
