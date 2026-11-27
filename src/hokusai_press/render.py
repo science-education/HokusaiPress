@@ -404,30 +404,20 @@ def _binarize_for_preview(bgr: np.ndarray) -> np.ndarray:
     return binarize_bw(bgr)
 
 
-def render_output_preview(
-    original_bgr: np.ndarray,
+def _compose_bilevel_canvas(
+    out_bgr: np.ndarray,
     params: PageParams,
     settings: RenderSettings,
+    photo_boxes: list[tuple],
+    vecfills: list[dict],
+    tint_zones: list,
+    tone_alpha: np.ndarray | None = None,
 ) -> np.ndarray:
-    """A BGR image that mirrors what the final PDF page will actually contain:
-    deskewed + cropped + dpi-normalized, then encoded the way the MRC builder
-    would — bilevel base with photo regions kept as gray/color overlays, or a
-    whole-page gray/color image when page_kind forces it. This is what the
-    review UI labels "output" (vs. the raw warped image, which hid binarization).
-    """
-    out, _, mode, photo_boxes = render_page_image(original_bgr, params, settings)
-    if mode == "gray":
-        g = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
-        return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
-    if mode == "color":
-        return out
-
-    # bw / MRC: binarize with book ink_valley, carve figure vecfills, despeckle,
-    # then composite photo overlays and Multiply-equivalent figure fills.
+    """Composite bilevel base + photo overlays + vector fills + tone restore."""
     from .mrc import _despeckle_bilevel, _is_grayish, apply_vector_fills_to_bilevel
 
-    h, w = out.shape[:2]
-    binary = binarize_bw(out, getattr(settings, "ink_valley", None))
+    h, w = out_bgr.shape[:2]
+    binary = binarize_bw(out_bgr, getattr(settings, "ink_valley", None))
     valid_photos = []
     for (x0, y0, x1, y1, tone) in photo_boxes:
         x0i, y0i = max(0, int(x0)), max(0, int(y0))
@@ -437,20 +427,32 @@ def render_output_preview(
         binary[y0i:y1i, x0i:x1i] = 255
         valid_photos.append((x0i, y0i, x1i, y1i, tone))
 
-    tinted = bool(params.margin and getattr(params.margin, "tinted", False))
-    vecfills = [] if tinted else _figure_vecfills(out, params, settings, original_bgr.shape)
-    apply_vector_fills_to_bilevel(binary, out, vecfills)
+    apply_vector_fills_to_bilevel(binary, out_bgr, vecfills)
+    if tone_alpha is not None:
+        active = tone_alpha > 0
+        if np.any(active):
+            binary[active] = 255
     if getattr(settings, "despeckle", True):
         binary = _despeckle_bilevel(binary)
 
     canvas = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
     for (x0i, y0i, x1i, y1i, tone) in valid_photos:
-        crop = out[y0i:y1i, x0i:x1i]
+        crop = out_bgr[y0i:y1i, x0i:x1i]
         cmode = tone or ("gray" if _is_grayish(crop) else "color")
         if cmode == "gray":
             g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
             crop = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
         canvas[y0i:y1i, x0i:x1i] = crop
+
+    for zone in tint_zones:
+        zx0, zy0, zx1, zy1 = zone.rect
+        zx0i, zy0i = max(0, int(zx0)), max(0, int(zy0))
+        zx1i, zy1i = min(w, int(zx1)), min(h, int(zy1))
+        if zx1i <= zx0i or zy1i <= zy0i:
+            continue
+        ov = zone.overlay_img[:zy1i - zy0i, :zx1i - zx0i].astype(np.float32) / 255.0
+        region = canvas[zy0i:zy1i, zx0i:zx1i].astype(np.float32)
+        canvas[zy0i:zy1i, zx0i:zx1i] = np.clip(np.round(region * ov[..., None]), 0, 255).astype(np.uint8)
 
     for fill in vecfills:
         x0, y0, x1, y1 = fill["rect"]
@@ -463,6 +465,83 @@ def render_output_preview(
             np.round(region.astype(np.float32) * float(fill["gray"])), 0, 255
         ).astype(np.uint8)
 
+    if tone_alpha is not None and np.any(tone_alpha > 0):
+        src = out_bgr
+        if _is_grayish(src):
+            g = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
+            src = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+        a3 = tone_alpha[..., None]
+        canvas = np.rint(
+            canvas.astype(np.float32) * (1.0 - a3) + src.astype(np.float32) * a3
+        ).astype(np.uint8)
+
+    return canvas
+
+
+def _prepare_bilevel_layers(
+    out_bgr: np.ndarray,
+    params: PageParams,
+    settings: RenderSettings,
+    lines: list[dict],
+    photo_boxes: list[tuple],
+    original_shape: tuple[int, int],
+) -> tuple[list[dict], list, np.ndarray | None, np.ndarray, object]:
+    """Compute vecfills, tint_zones, and automatic tone restoration consistently
+    for both output preview and PDF encoding."""
+    from .tone_restore import detect_tone_restore, filter_overlapping_fills
+
+    tinted = bool(params.margin and getattr(params.margin, "tinted", False))
+    vecfills = [] if tinted else _figure_vecfills(out_bgr, params, settings, original_shape)
+    text_boxes = [tuple(line["box"]) for line in lines]
+    tint_zones = (
+        _raster_tint_zones(out_bgr, vecfills, text_boxes)
+        if (settings.tint_overlay and not tinted) else []
+    )
+    baseline_canvas = _compose_bilevel_canvas(
+        out_bgr, params, settings, photo_boxes, vecfills, tint_zones, tone_alpha=None,
+    )
+    restore = detect_tone_restore(
+        out_bgr,
+        baseline_canvas,
+        lines,
+        getattr(settings, "target_dpi", 600),
+        is_gray_or_color=False,
+        is_blank=bool(getattr(params, "blank", False)),
+        is_tinted=tinted,
+    )
+    if restore.adopted and restore.alpha_mask is not None:
+        vecfills, tint_zones = filter_overlapping_fills(
+            restore.alpha_mask, vecfills, tint_zones
+        )
+        final_canvas = _compose_bilevel_canvas(
+            out_bgr, params, settings, photo_boxes, vecfills, tint_zones,
+            tone_alpha=restore.alpha_mask,
+        )
+        return vecfills, tint_zones, restore.alpha_mask, final_canvas, restore
+    return vecfills, tint_zones, None, baseline_canvas, restore
+
+
+def render_output_preview(
+    original_bgr: np.ndarray,
+    params: PageParams,
+    settings: RenderSettings,
+) -> np.ndarray:
+    """A BGR image that mirrors what the final PDF page will actually contain:
+    deskewed + cropped + dpi-normalized, then encoded the way the MRC builder
+    would — bilevel base with photo regions kept as gray/color overlays, or a
+    whole-page gray/color image when page_kind forces it. This is what the
+    review UI labels "output" (vs. the raw warped image, which hid binarization).
+    """
+    out, lines, mode, photo_boxes = render_page_image(original_bgr, params, settings)
+    if mode == "gray":
+        g = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
+        return cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+    if mode == "color":
+        return out
+
+    _, _, _, canvas, _ = _prepare_bilevel_layers(
+        out, params, settings, lines, photo_boxes, original_bgr.shape
+    )
     return canvas
 
 
@@ -474,14 +553,14 @@ def _render_and_encode_page(args) -> dict:
     the highest-value parallel target in the whole pipeline."""
     params, original, settings, encoder = args
     out_bgr, lines, mode, photo_boxes = render_page_image(original, params, settings)
-    tinted = bool(params.margin and getattr(params.margin, "tinted", False))
-    vecfills = [] if tinted else _figure_vecfills(out_bgr, params, settings, original.shape)
-    text_boxes = [tuple(line["box"]) for line in lines]
-    tint_zones = (
-        _raster_tint_zones(out_bgr, vecfills, text_boxes)
-        if (settings.tint_overlay and not tinted) else []
+    if mode in ("gray", "color"):
+        return encoder.encode_page(out_bgr, lines, photo_boxes, mode, [], [])
+    vecfills, tint_zones, tone_alpha, _, _ = _prepare_bilevel_layers(
+        out_bgr, params, settings, lines, photo_boxes, original.shape
     )
-    return encoder.encode_page(out_bgr, lines, photo_boxes, mode, vecfills, tint_zones)
+    return encoder.encode_page(
+        out_bgr, lines, photo_boxes, mode, vecfills, tint_zones, tone_alpha=tone_alpha
+    )
 
 
 def build_pdf(
