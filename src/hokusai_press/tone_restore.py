@@ -77,9 +77,35 @@ _BODY_ROW_OVERLAP_FRAC: float = 0.28
 _SILHOUETTE_AREA_MULT: int = 5
 _SILHOUETTE_PAGE_FRAC: float = 0.085
 _SILHOUETTE_BBOX_FRAC: float = 0.20
+_HOLLOW_FRAME_AREA_FRAC: float = 0.65
 
 _NO_BODY_MIN_W_FRAC: float = 0.32
 _NO_BODY_MIN_H_FRAC: float = 0.28
+_NO_BODY_SOLID_AREA_FRAC: float = 0.0012
+_NO_BODY_SOLID_MIN_AREA: int = 1000
+_NO_BODY_SOLID_MIN_CHANGED: int = 300
+_NO_BODY_SOLID_STABLE_FRAC: float = 0.35
+
+_FULLPAGE_SOLID_MAX_AREA_FRAC: float = 0.65
+_FULLPAGE_SOLID_MIN_CHANGED: int = 5000
+_SOLID_STABLE_FRAC: float = 0.40
+_SOLID_MIN_STABLE_PX: int = 250
+_SOLID_SUPPORT_FRAC: float = 0.13
+_SOLID_MIN_SUPPORT_PX: int = 180
+_SOLID_CHANGED_STABLE_FRAC: float = 0.30
+
+_SMALL_LABEL_AREA_FRAC: float = 0.0008
+_SMALL_LABEL_MIN_AREA: int = 900
+_SMALL_LABEL_MIN_SIDE_FRAC: float = 0.025
+_SMALL_LABEL_CHANGED_STABLE_FRAC: float = 0.50
+
+_THIN_WIDE_MAX_H_FRAC: float = 0.008
+_THICK_WIDE_SUPPORT_FRAC: float = 0.15
+_THICK_WIDE_MIN_SUPPORT_PX: int = 200
+
+_FILLED_BANNER_STABLE_FRAC: float = 0.45
+_FILLED_BANNER_SUPPORT_FRAC: float = 0.25
+_FILLED_BANNER_CHANGED_STABLE_FRAC: float = 0.70
 
 # --- OCR body-line detection thresholds (auto_group.py) ---
 _BODY_MIN_CHARS: int = 15
@@ -210,21 +236,22 @@ def _find_tone_candidates(
 
     chosen = np.zeros(original_gray.shape, np.uint8)
     rows: list[tuple[int, int, int, int, int, int, int, int]] = []
+    skipped_adjacent: list[tuple[int, int, int, int, int, int, int, int, int]] = []
     min_dim = min(width, height)
 
     for i in range(1, count):
         x, y, w, h, area = map(int, stats[i])
-        if (
-            area < max(_MIN_AREA_PX, page_area * _MIN_AREA_FRAC)
-            or min(w, h) < _MIN_SIDE_PX
-            or (w < width * _TINY_W_FRAC and h < height * _TINY_H_FRAC)
-            or (w >= _FULLPAGE_W_FRAC * width and h >= _FULLPAGE_H_FRAC * height)
-            or x < _BORDER_X0_FRAC * width
+        if area < max(_MIN_AREA_PX, page_area * _MIN_AREA_FRAC) or min(w, h) < _MIN_SIDE_PX:
+            continue
+
+        is_tiny = w < width * _TINY_W_FRAC and h < height * _TINY_H_FRAC
+        is_fullpage = w >= _FULLPAGE_W_FRAC * width and h >= _FULLPAGE_H_FRAC * height
+        at_border = (
+            x < _BORDER_X0_FRAC * width
             or y < _BORDER_Y0_FRAC * height
             or x + w > _BORDER_X1_FRAC * width
             or y + h > _BORDER_Y1_FRAC * height
-        ):
-            continue
+        )
 
         patch = np.s_[y:y + h, x:x + w]
         label = labels[patch] == i
@@ -232,43 +259,129 @@ def _find_tone_candidates(
         core_mid = mid[patch] & label
         changed = int(core_loss.sum())
         stable = int(core_mid.sum())
-        if changed < max(_MIN_CHANGED_PX, page_area * _MIN_CHANGED_FRAC) or stable < max(_MIN_STABLE_PX, _MIN_STABLE_AREA_FRAC * area):
+        if changed < max(_MIN_CHANGED_PX, page_area * _MIN_CHANGED_FRAC):
             continue
 
         strips = max(int(core_loss.sum(axis=0).max()), int(core_loss.sum(axis=1).max()))
         long_loss = strips >= min_dim * _LONG_LOSS_FRAC
+        adj_ok = (
+            not is_fullpage
+            and not at_border
+            and area >= max(_SMALL_LABEL_MIN_AREA, page_area * _SMALL_LABEL_AREA_FRAC)
+            and min(w, h) >= min_dim * _SMALL_LABEL_MIN_SIDE_FRAC
+            and changed >= stable * _SMALL_LABEL_CHANGED_STABLE_FRAC
+            and not (h > _RELEASE_TALL_ASPECT * w and w < width * _RELEASE_TALL_MAX_W_FRAC)
+            and not (w > _WIDE_ASPECT_RATIO * h and h < height * _WIDE_MAX_H_FRAC)
+        )
+        if stable < max(_MIN_STABLE_PX, _MIN_STABLE_AREA_FRAC * area):
+            if adj_ok:
+                skipped_adjacent.append((i, x, y, w, h, area, stable, changed, strips))
+            continue
+
         if changed < stable * _MIN_CHANGED_STABLE_FRAC and not long_loss:
             continue
 
         solid_core = cv2.erode(core_mid.astype(np.uint8), _ellipse(2))
         support = int(solid_core.sum())
         long_side = max(w / width, h / height)
-        if support < max(_MIN_SUPPORT_PX, _MIN_SUPPORT_AREA_FRAC * area) or long_side < _MIN_LONG_SIDE_FRAC:
+        if support < max(_MIN_SUPPORT_PX, _MIN_SUPPORT_AREA_FRAC * area):
+            if adj_ok:
+                skipped_adjacent.append((i, x, y, w, h, area, stable, changed, strips))
+            continue
+
+        # Strong uniform midtone fill (distinguishes solid banners/labels/frames from scan edges & thin lines).
+        is_solid_tone = (
+            stable >= max(_SOLID_MIN_STABLE_PX, _SOLID_STABLE_FRAC * area)
+            and support >= max(_SOLID_MIN_SUPPORT_PX, _SOLID_SUPPORT_FRAC * area)
+            and (changed >= stable * _SOLID_CHANGED_STABLE_FRAC or long_loss)
+        )
+
+        if is_fullpage and not (
+            is_solid_tone and area < _FULLPAGE_SOLID_MAX_AREA_FRAC * page_area and changed >= _FULLPAGE_SOLID_MIN_CHANGED
+        ):
+            continue
+        if at_border and not is_solid_tone:
+            continue
+
+        is_solid_small_label = (
+            is_solid_tone
+            and area >= max(_SMALL_LABEL_MIN_AREA, page_area * _SMALL_LABEL_AREA_FRAC)
+            and min(w, h) >= min_dim * _SMALL_LABEL_MIN_SIDE_FRAC
+            and changed >= stable * _SMALL_LABEL_CHANGED_STABLE_FRAC
+        )
+        if (is_tiny or long_side < _MIN_LONG_SIDE_FRAC) and not is_solid_small_label:
             continue
 
         bbox = (x, y, x + w, y + h)
-        if (h > _TALL_ASPECT_RATIO * w and w < width * _TALL_MAX_W_FRAC) or (
-            w > _WIDE_ASPECT_RATIO * h and h < height * _WIDE_MAX_H_FRAC
-        ):
+        if h > _TALL_ASPECT_RATIO * w and w < width * _TALL_MAX_W_FRAC:
             continue
+        if w > _WIDE_ASPECT_RATIO * h and h < height * _WIDE_MAX_H_FRAC:
+            # Reject thin horizontal rules; keep thick solid decorative bars.
+            if h < height * _THIN_WIDE_MAX_H_FRAC or support < max(_THICK_WIDE_MIN_SUPPORT_PX, _THICK_WIDE_SUPPORT_FRAC * area):
+                continue
         if h > _RELEASE_TALL_ASPECT * w and w < width * _RELEASE_TALL_MAX_W_FRAC:
             continue
         if w > _BODY_ROW_ASPECT * h and h < height * _BODY_ROW_MAX_H_FRAC:
-            if any(not vertical and _box_overlap_area(bbox, b) > _BODY_ROW_OVERLAP_FRAC * w * h for b, vertical in body):
+            is_filled_banner = (
+                stable >= _FILLED_BANNER_STABLE_FRAC * area
+                and support >= _FILLED_BANNER_SUPPORT_FRAC * area
+                and changed >= _FILLED_BANNER_CHANGED_STABLE_FRAC * stable
+            )
+            if not is_filled_banner and any(
+                not vertical and _box_overlap_area(bbox, b) > _BODY_ROW_OVERLAP_FRAC * w * h for b, vertical in body
+            ):
                 continue
 
         contours, _ = cv2.findContours(label.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         silhouette = cv2.drawContours(np.zeros(label.shape, np.uint8), contours, -1, 1, cv2.FILLED)
-        if int(silhouette.sum()) > max(area * _SILHOUETTE_AREA_MULT, page_area * _SILHOUETTE_PAGE_FRAC) and (
-            w * h > page_area * _SILHOUETTE_BBOX_FRAC
-        ):
+        sil_area = int(silhouette.sum())
+        if (
+            sil_area > max(area * _SILHOUETTE_AREA_MULT, page_area * _SILHOUETTE_PAGE_FRAC)
+            or area < _HOLLOW_FRAME_AREA_FRAC * sil_area
+        ) and (w * h > page_area * _SILHOUETTE_BBOX_FRAC):
             silhouette = label.astype(np.uint8)
 
         chosen[patch] |= silhouette
         rows.append((x, y, w, h, area, stable, changed, strips))
 
+    # Recover adjacent label boxes in the same horizontal row (e.g. "第" "2" "章") whose
+    # knockout text reduced 5x5 eroded support below the standalone threshold.
+    if skipped_adjacent and rows:
+        max_gap = max(8, round(0.025 * width))
+        added = True
+        while added:
+            added = False
+            remaining: list[tuple[int, int, int, int, int, int, int, int, int]] = []
+            for item in skipped_adjacent:
+                i, x, y, w, h, area, stable, changed, strips = item
+                near = False
+                for rx, ry, rw, rh, *_ in rows:
+                    h_gap = max(x - (rx + rw), rx - (x + w), 0)
+                    v_ov = min(y + h, ry + rh) - max(y, ry)
+                    if h_gap <= max_gap and v_ov >= 0.70 * min(h, rh) and 0.75 <= (h / max(1, rh)) <= 1.33:
+                        near = True
+                        break
+                if near:
+                    patch = np.s_[y:y + h, x:x + w]
+                    chosen[patch] |= (labels[patch] == i).astype(np.uint8)
+                    rows.append((x, y, w, h, area, stable, changed, strips))
+                    added = True
+                else:
+                    remaining.append(item)
+            skipped_adjacent = remaining
+
     if not body and rows:
-        if not any(w >= width * _NO_BODY_MIN_W_FRAC or h >= height * _NO_BODY_MIN_H_FRAC for _, _, w, h, *_ in rows):
+        has_strong_anchor = any(
+            w >= width * _NO_BODY_MIN_W_FRAC
+            or h >= height * _NO_BODY_MIN_H_FRAC
+            or (
+                area >= max(_NO_BODY_SOLID_MIN_AREA, page_area * _NO_BODY_SOLID_AREA_FRAC)
+                and chg >= _NO_BODY_SOLID_MIN_CHANGED
+                and stable >= _NO_BODY_SOLID_STABLE_FRAC * area
+            )
+            for _, _, w, h, area, stable, chg, _ in rows
+        )
+        if not has_strong_anchor:
             return np.zeros_like(chosen), [], loss
 
     return chosen, rows, loss

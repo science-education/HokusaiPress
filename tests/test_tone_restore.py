@@ -309,3 +309,85 @@ def test_legacy_saved_document_json_opens_and_renders(tmp_path):
     out_pdf = tmp_path / "legacy_out.pdf"
     build_pdf(loaded, [img], str(out_pdf))
     assert out_pdf.exists() and out_pdf.stat().st_size > 0
+
+
+def test_wide_flat_gray_background_near_edges_is_restored():
+    """Type A: a wide flat gray chapter-cover background touching page edges is restored without vecfill."""
+    w, h = 700, 1000
+    img = np.full((h, w, 3), 255, dtype=np.uint8)
+    # Gray background touching left, right, and bottom edges with a white inner card
+    img[140:1000, 0:700] = 190
+    img[260:860, 80:620] = 255
+    # Dark title text inside the white card (anchors Otsu threshold)
+    regions = _add_horizontal_body_lines(img, 420, 620, x0=160, x1=540)
+    params = _make_params(w, h, regions=regions)
+    settings = RenderSettings(target_dpi=144, output_margin_mm=0.0)
+
+    out_bgr, lines, _, photo_boxes = render_page_image(img, params, settings)
+    _, _, tone_alpha, canvas, restore = _prepare_bilevel_layers(
+        out_bgr, params, settings, lines, photo_boxes, img.shape
+    )
+    assert restore.adopted is True
+    assert tone_alpha is not None
+    # Outer gray background is restored instead of whiting out
+    bg_med = float(np.median(canvas[160:220, 100:600, 0]))
+    assert 165 <= bg_med <= 215
+    # Inner white card body text stays strictly bilevel
+    assert set(np.unique(canvas[420:620, 160:540]).tolist()).issubset({0, 255})
+
+
+def test_small_gray_label_boxes_without_body_lines_are_restored():
+    """Type B: small solid gray chapter/section label boxes with knockout text are restored."""
+    w, h = 700, 1000
+    img = np.full((h, w, 3), 255, dtype=np.uint8)
+    # Three adjacent small gray label boxes ("第" "2" "章" style), each ~44x44
+    for x0 in (280, 328, 376):
+        img[110:155, x0:x0 + 44] = 120
+        img[122:143, x0 + 14:x0 + 30] = 252
+    # Vertical title ink below (no corroborated body lines)
+    for y in range(250, 750, 40):
+        img[y:y + 24, 336:362] = 20
+
+    params = _make_params(w, h, regions=[])
+    settings = RenderSettings(target_dpi=144, output_margin_mm=0.0)
+    out_bgr, lines, _, photo_boxes = render_page_image(img, params, settings)
+    _, _, tone_alpha, canvas, restore = _prepare_bilevel_layers(
+        out_bgr, params, settings, lines, photo_boxes, img.shape
+    )
+    assert restore.adopted is True
+    assert tone_alpha is not None
+    # All three label boxes stay midtone gray rather than crushing to black
+    for x0 in (280, 328, 376):
+        med = float(np.median(canvas[113:120, x0 + 4:x0 + 40, 0]))
+        assert 90 <= med <= 150
+
+
+def test_thick_gray_decorative_bar_is_restored_while_thin_rule_is_ignored():
+    """Type B: a thick gray decorative bar (~14px) is restored, whereas a thin 3px rule is not."""
+    w, h = 700, 1000
+    img = np.full((h, w, 3), 255, dtype=np.uint8)
+    # Thick gray bar above heading (150x14, tone 150)
+    img[200:214, 480:630] = 150
+    regions = _add_horizontal_body_lines(img, 320, 820)
+
+    params = _make_params(w, h, regions=regions)
+    settings = RenderSettings(target_dpi=144, output_margin_mm=0.0)
+    out_bgr, lines, _, photo_boxes = render_page_image(img, params, settings)
+    _, _, tone_alpha, canvas, restore = _prepare_bilevel_layers(
+        out_bgr, params, settings, lines, photo_boxes, img.shape
+    )
+    assert restore.adopted is True
+    assert tone_alpha is not None
+    assert 120 <= float(np.median(canvas[202:212, 500:610, 0])) <= 180
+
+    # Now test a thin 3px horizontal rule alone -> must NOT be restored
+    img_rule = np.full((h, w, 3), 255, dtype=np.uint8)
+    img_rule[200:203, 200:600] = 150
+    regions_rule = _add_horizontal_body_lines(img_rule, 320, 820)
+    params_rule = _make_params(w, h, regions=regions_rule)
+    out_r, lines_r, _, photo_r = render_page_image(img_rule, params_rule, settings)
+    _, _, alpha_r, _, restore_r = _prepare_bilevel_layers(
+        out_r, params_rule, settings, lines_r, photo_r, img_rule.shape
+    )
+    assert restore_r.adopted is False
+    assert alpha_r is None
