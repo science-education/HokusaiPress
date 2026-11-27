@@ -413,7 +413,9 @@ class MrcPageBuilder:
                         np.rint(255.0 * cv2.resize(alpha_crop, (ds_w, ds_h), interpolation=cv2.INTER_LINEAR)),
                         0, 255,
                     ).astype(np.uint8)
-                    cmode = "gray" if _is_grayish(crop) else "color"
+                    from .tone_restore import has_significant_color
+
+                    cmode = "color" if has_significant_color(out_bgr, active_mask) else "gray"
                     tone_overlays.append({
                         "pdf": encode_masked_image_pdf(ds_crop, ds_alpha, cmode, self.jpeg_quality),
                         "rect": (tx0, h - ty1, tx1, h - ty0),

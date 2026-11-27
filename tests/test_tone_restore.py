@@ -391,3 +391,74 @@ def test_thick_gray_decorative_bar_is_restored_while_thin_rule_is_ignored():
     )
     assert restore_r.adopted is False
     assert alpha_r is None
+
+
+def test_color_banner_on_bw_page_is_restored_in_color(tmp_path):
+    """A colored banner on a predominantly B&W page is restored in color in both preview and PDF."""
+    w, h = 700, 1000
+    img = np.full((h, w, 3), 255, dtype=np.uint8)
+    # Soft blue banner (BGR: 230, 190, 140) with white knockout text; page-wide chroma is low
+    img[140:210, 80:620] = (230, 190, 140)
+    for x in range(130, 570, 28):
+        img[160:192, x:x + 14] = 252
+    regions = _add_horizontal_body_lines(img, 320, 860)
+
+    params = _make_params(w, h, regions=regions)
+    settings = RenderSettings(target_dpi=144, output_margin_mm=0.0)
+    out_bgr, lines, _, photo_boxes = render_page_image(img, params, settings)
+    _, _, tone_alpha, canvas, restore = _prepare_bilevel_layers(
+        out_bgr, params, settings, lines, photo_boxes, img.shape
+    )
+    assert restore.adopted is True
+    assert restore.is_color is True
+    assert tone_alpha is not None
+    # Preview retains blue tint (B > R by a clear margin)
+    b_med = float(np.median(canvas[145:158, 100:500, 0]))
+    r_med = float(np.median(canvas[145:158, 100:500, 2]))
+    assert b_med - r_med > 50.0
+    # Body text stays bilevel
+    assert set(np.unique(canvas[350:820, 80:620]).tolist()).issubset({0, 255})
+
+    # Built PDF also retains color in the banner
+    out_pdf = tmp_path / "color_banner.pdf"
+    doc = Document(source_path="synthetic.png", pages=[params], render=settings)
+    build_pdf(doc, [img], str(out_pdf))
+    pdf_doc = pdfium.PdfDocument(str(out_pdf))
+    try:
+        pdf_img = pdf_doc[0].render(scale=144.0 / 72.0).to_numpy()
+        # pypdfium2 returns BGRx/RGB; check channel spread (non-gray)
+        patch = pdf_img[145:158, 100:500, :3].astype(np.int32)
+        assert float(np.median(patch.max(axis=2) - patch.min(axis=2))) > 50.0
+    finally:
+        pdf_doc.close()
+
+
+def test_photo_box_overlapping_tone_candidate_is_not_overwritten():
+    """Tone restoration must never overlap photo_boxes even when surrounded by a filled frame."""
+    w, h = 700, 1000
+    img = np.full((h, w, 3), 255, dtype=np.uint8)
+    # Outer pale gray frame surrounding a colored photo region
+    img[180:560, 100:600] = 205
+    img[220:520, 140:560] = 255
+    # Colorful photo inside the frame (BGR: orange-ish sky + green ground)
+    img[260:380, 180:520] = (90, 150, 220)
+    img[380:480, 180:520] = (80, 180, 90)
+    regions = _add_horizontal_body_lines(img, 640, 880)
+    regions.append(Region(kind=RegionKind.PHOTO, box=Box(180, 260, 520, 480)))
+
+    params = _make_params(w, h, regions=regions)
+    settings = RenderSettings(target_dpi=144, output_margin_mm=0.0)
+    out_bgr, lines, _, photo_boxes = render_page_image(img, params, settings)
+    assert len(photo_boxes) == 1
+    _, _, tone_alpha, canvas, restore = _prepare_bilevel_layers(
+        out_bgr, params, settings, lines, photo_boxes, img.shape
+    )
+    assert restore.adopted is True
+    assert restore.is_color is False
+    assert tone_alpha is not None
+    # Photo box interior must have zero tone_alpha and retain original color pixels
+    px0, py0, px1, py1 = map(int, photo_boxes[0][:4])
+    assert float(tone_alpha[py0:py1, px0:px1].max()) == 0.0
+    assert np.array_equal(canvas[py0:py1, px0:px1], out_bgr[py0:py1, px0:px1])
+    # Outer gray frame is still restored
+    assert 175 <= float(np.median(canvas[185:210, 120:580, 0])) <= 225

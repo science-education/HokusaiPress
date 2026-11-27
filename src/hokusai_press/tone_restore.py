@@ -136,6 +136,12 @@ _INK_DENSITY_FRAC: float = 0.009
 _SAFE_ROW_FRAC: float = 0.028
 _CUT_ROW_MAX_FRAC: float = 0.055
 
+# --- Color saturation detection within restored regions ---
+_COLOR_MIN_AB_DIST: float = 10.0
+_COLOR_MIN_RGB_SPAN: int = 18
+_COLOR_MIN_FRAC: float = 0.03
+_COLOR_MIN_SAMPLE_PX: int = 1000
+
 
 @dataclass
 class ToneRestoreResult:
@@ -148,6 +154,48 @@ class ToneRestoreResult:
     loss_after: int = 0
     adopted: bool = False
     reason: str = "no_candidates"
+    is_color: bool = False
+
+
+def has_significant_color(bgr: np.ndarray, mask: np.ndarray | None = None) -> bool:
+    """Return True if the masked region of ``bgr`` has significant color saturation."""
+    if bgr.ndim != 3 or bgr.shape[2] < 3:
+        return False
+    if mask is not None:
+        if not np.any(mask):
+            return False
+        pts = bgr[mask]
+    else:
+        pts = bgr.reshape(-1, bgr.shape[2])
+    if pts.shape[0] > 200_000:
+        step = max(1, pts.shape[0] // 200_000)
+        pts = pts[::step]
+    pts_bgr = pts[:, :3]
+    span = pts_bgr.max(axis=1).astype(np.int32) - pts_bgr.min(axis=1).astype(np.int32)
+    if int(span.max()) < _COLOR_MIN_RGB_SPAN:
+        return False
+    lab = cv2.cvtColor(pts_bgr.reshape(-1, 1, 3), cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float32)
+    ab_dist = np.hypot(lab[:, 1] - 128.0, lab[:, 2] - 128.0)
+    colored = (ab_dist >= _COLOR_MIN_AB_DIST) & (span >= _COLOR_MIN_RGB_SPAN)
+    return float(colored.mean()) >= _COLOR_MIN_FRAC or int(colored.sum()) >= _COLOR_MIN_SAMPLE_PX
+
+
+def _build_photo_mask(shape: tuple[int, int], photo_boxes: list[tuple] | None) -> np.ndarray | None:
+    """Build a boolean mask of valid photo overlay boxes in output pixel coordinates."""
+    if not photo_boxes:
+        return None
+    h, w = shape
+    mask = np.zeros((h, w), dtype=bool)
+    has_any = False
+    for box in photo_boxes:
+        x0, y0, x1, y1 = box[:4]
+        x0i, y0i = max(0, int(x0)), max(0, int(y0))
+        x1i, y1i = min(w, int(x1)), min(h, int(y1))
+        if x1i - x0i < 4 or y1i - y0i < 4:
+            continue
+        mask[y0i:y1i, x0i:x1i] = True
+        has_any = True
+    return mask if has_any else None
 
 
 def _ellipse(radius: int) -> np.ndarray:
@@ -552,6 +600,7 @@ def detect_tone_restore(
     lines: list[dict],
     target_dpi: int,
     *,
+    photo_boxes: list[tuple] | None = None,
     is_gray_or_color: bool = False,
     is_blank: bool = False,
     is_tinted: bool = False,
@@ -574,6 +623,14 @@ def detect_tone_restore(
     if aw < 150 or ah < 150:
         return ToneRestoreResult(reason="too_small")
 
+    photo_mask_full = _build_photo_mask((h, w), photo_boxes)
+    if photo_mask_full is not None and (aw != w or ah != h):
+        photo_mask_small: np.ndarray | None = (
+            cv2.resize(photo_mask_full.astype(np.uint8), (aw, ah), interpolation=cv2.INTER_NEAREST) > 0
+        )
+    else:
+        photo_mask_small = photo_mask_full
+
     src_gray_full = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2GRAY) if out_bgr.ndim == 3 else out_bgr
     cur_gray_full = cv2.cvtColor(current_bgr, cv2.COLOR_BGR2GRAY) if current_bgr.ndim == 3 else current_bgr
 
@@ -591,9 +648,13 @@ def detect_tone_restore(
 
     mask, expanded = _grow_diagrams(mask, zones, src_gray, body)
     alpha_small = _build_soft_alpha(mask)
+    if photo_mask_small is not None:
+        loss[photo_mask_small] = False
+        loss_after = int((loss & (alpha_small < 1.0)).sum())
+    else:
+        loss_after = int((loss & (alpha_small < 1.0)).sum())
 
     loss_before = int(loss.sum())
-    loss_after = int((loss & (alpha_small < 1.0)).sum())
     if loss_after >= loss_before:
         return ToneRestoreResult(
             zones=[(z[0], z[1], z[2], z[3]) for z in zones],
@@ -609,6 +670,8 @@ def detect_tone_restore(
     else:
         alpha_full = alpha_small
     alpha_full = np.clip(alpha_full, 0.0, 1.0).astype(np.float32)
+    if photo_mask_full is not None:
+        alpha_full[photo_mask_full] = 0.0
     alpha_full[alpha_full < (1.0 / 255.0)] = 0.0
 
     if not np.any(alpha_full > 0):
@@ -620,10 +683,10 @@ def detect_tone_restore(
     cand_bgr = out_bgr.copy()
     if cand_bgr.ndim == 2:
         cand_bgr = cv2.cvtColor(cand_bgr, cv2.COLOR_GRAY2BGR)
-    # Grayscale restoration preserves neutral tone; color pages stay RGB if needed.
-    from .mrc import _is_grayish
-
-    if _is_grayish(cand_bgr):
+    # Restore in color only when the restored region itself has significant chroma;
+    # otherwise keep grayscale so neutral pages remain byte-identical.
+    is_color = has_significant_color(cand_bgr, active)
+    if not is_color:
         g = cv2.cvtColor(cand_bgr, cv2.COLOR_BGR2GRAY)
         cand_bgr = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
     a3 = alpha_full[..., None]
@@ -647,4 +710,5 @@ def detect_tone_restore(
         loss_after=loss_after,
         adopted=True,
         reason="adopted",
+        is_color=is_color,
     )

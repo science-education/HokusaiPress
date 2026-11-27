@@ -466,8 +466,10 @@ def _compose_bilevel_canvas(
         ).astype(np.uint8)
 
     if tone_alpha is not None and np.any(tone_alpha > 0):
+        from .tone_restore import has_significant_color
+
         src = out_bgr
-        if _is_grayish(src):
+        if not has_significant_color(src, tone_alpha > 0):
             g = cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
             src = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
         a3 = tone_alpha[..., None]
@@ -505,6 +507,7 @@ def _prepare_bilevel_layers(
         baseline_canvas,
         lines,
         getattr(settings, "target_dpi", 600),
+        photo_boxes=photo_boxes,
         is_gray_or_color=False,
         is_blank=bool(getattr(params, "blank", False)),
         is_tinted=tinted,
