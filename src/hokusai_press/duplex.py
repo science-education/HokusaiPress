@@ -68,6 +68,9 @@ def _is_trusted_folio(p: PageParams) -> bool:
     m = p.margin
     return bool(
         m and m.crop and m.page_w and m.page_h and not p.blank
+        # A tinted (full-sheet ground) page is cropped as the whole sheet,
+        # not by its type area, so its offset is no reference for its partner.
+        and not getattr(m, "tinted", False)
         and p.page_number is not None
         and p.page_number_source in TRUSTED_FOLIO_SOURCES
         and m.nombre_box is not None
