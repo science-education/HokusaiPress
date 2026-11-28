@@ -7,10 +7,13 @@ import pypdfium2 as pdfium
 import pytest
 
 from hokusai_press.duplex import (
+    align_after_blank_insertions,
+    align_illustrated_folios,
     apply_duplex_skew_exceptions,
     apply_duplex_translation_exceptions,
     detect_blank_insertions,
     determine_duplex_pairing,
+    logical_page_indices,
 )
 from hokusai_press.model import (
     Box,
@@ -134,6 +137,60 @@ def test_duplex_translation_partner_median_uncorrected():
     # Uncorrected page 8 keeps base crop and gets warning flag
     assert pages[8].margin.crop == p8_base
     assert Flag.MARGIN_INCONSISTENT in pages[8].flags
+
+
+@pytest.mark.parametrize("kind", [RegionKind.PHOTO, RegionKind.FIGURE])
+@pytest.mark.parametrize("case", ["align", "clip", "blank", "known_box", "broken_run", "caption"])
+def test_align_illustrated_folio_from_local_numbered_run(kind, case):
+    pages = _make_duplex_book()
+    for p in pages:
+        p.page_number += 20
+        m = p.margin
+        m.crop = Box(150, 200, 1750, 2900)
+        m.target_h = m.crop.height
+        m.nombre_box = (
+            Box(320, 2800, 334, 2830) if p.page_number % 2 else Box(1560, 2800, 1574, 2830)
+        )
+    idx = 8
+    page = pages[idx]
+    m = page.margin
+    plate = Box(280, 500, 1670, 2550)
+    m.content = Box(280, 500, 1670, 2830)
+    page.regions = [Region(kind, plate)]
+    if case != "known_box":
+        m.nombre_box = None
+        m.nombre_source = None
+    if case == "broken_run":
+        pages[idx + 1].page_number += 1
+    if case == "clip":
+        # Crop must keep the entire plate even when there is no OCR text.
+        m.content.x0 = 152
+        plate.x0 = 152
+    if case == "caption":
+        page.regions.append(Region(RegionKind.TEXT, Box(325, 2770, 600, 2850), ocr_text="caption"))
+    image = np.full((3000, 2000), 255, dtype=np.uint8)
+    if case != "blank":
+        image[2800:2830, 330:339] = 0
+        image[2800:2830, 346:355] = 0
+    crops = [p.margin.crop for p in pages]
+    loaded = []
+
+    def load(index):
+        loaded.append(index)
+        return image
+
+    changed = align_illustrated_folios(pages, load)
+    assert loaded == ([] if case in ("known_box", "broken_run") else [idx])
+    assert page.page_number == 29
+    if case == "align":
+        assert changed == [idx]
+        assert m.crop == Box(160, 200, 1760, 2900)
+        assert m.nombre_box is None
+        assert align_illustrated_folios(pages, load) == []
+        crops[idx] = m.crop
+    else:
+        assert changed == []
+    assert [p.margin.crop for p in pages] == crops
 
 
 def test_unknown_pairing_leaves_pages_untouched():
@@ -347,3 +404,61 @@ def test_predicted_folio_noop_when_no_ink():
     ef = detect_predicted_folio_box(blank_img, pages, 4, dpi=300.0)
     assert ef is None
     assert p4.margin.edge_folio_box is None
+
+
+@pytest.mark.parametrize("skipped", [False, True])
+def test_supported_internal_blank_keeps_source_indices_and_restores_sheet_parity(skipped):
+    pages = _make_duplex_book(n_pages=40, parity=0)
+    if skipped:
+        del pages[15]
+        for i, page in enumerate(pages):
+            page.source.page_index = i
+
+    before = [page.margin.crop for page in pages]
+    pairing = determine_duplex_pairing(pages)
+    result = detect_blank_insertions(pages, pairing)
+    assert result["insert_before"] == ([15] if skipped else [])
+    slots = logical_page_indices(pages, result["insert_before"])
+    assert [(slot + 1) % 2 for slot in slots] == [p.page_number % 2 for p in pages]
+    assert [p.source.page_index for p in pages] == list(range(len(pages)))
+
+    corrected = determine_duplex_pairing(pages, logical_indices=slots)
+    assert corrected.known
+    assert corrected.partner_of(13) == 12
+    assert corrected.partner_of(14) == (None if skipped else 15)
+    assert corrected.partner_of(15) == (16 if skipped else 14)
+
+    if not skipped:
+        assert align_after_blank_insertions(pages, result) == []
+        assert [page.margin.crop for page in pages] == before
+
+
+def test_recurring_divider_locates_gap_before_unnumbered_title_page():
+    pages = _make_duplex_book(n_pages=46, parity=0)
+    for p in pages:
+        if p.page_number % 2:
+            p.margin.content = Box(280, 390, 1810, 2700)
+            p.margin.nombre_box = Box(320, 2660, 360, 2690)
+        else:
+            p.margin.content = Box(180, 390, 1710, 2700)
+            p.margin.nombre_box = Box(1640, 2660, 1680, 2690)
+    for i in (8, 18):
+        p = pages[i]
+        p.page_number = None
+        p.page_number_source = None
+        p.margin.nombre_box = None
+        p.margin.nombre_source = None
+        p.margin.content = Box(440, 480, 485, 1300)
+        p.regions = [Region(RegionKind.TEXT, p.margin.content, ocr_text="章扉")]
+    del pages[7]
+    for i, p in enumerate(pages):
+        p.source.page_index = i
+
+    pairing = determine_duplex_pairing(pages)
+    assert pairing.known
+    result = detect_blank_insertions(pages, pairing)
+    assert result["gaps"] == {7: "chapter_divider"}
+    assert result["insert_before"] == [7]
+    slots = logical_page_indices(pages, result["insert_before"])
+    assert slots[7] == 8
+    assert slots[17] == 18

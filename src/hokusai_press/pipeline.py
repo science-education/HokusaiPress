@@ -560,13 +560,20 @@ def analyze_document(
         originals_by_idx={p.source.page_index: img for p, img in zip(doc.pages, originals)},
     )
     from .duplex import (
+        align_after_blank_insertions,
+        align_illustrated_folios,
         apply_duplex_skew_exceptions,
         detect_blank_insertions,
         determine_duplex_pairing,
+        logical_page_indices,
     )
     pairing = determine_duplex_pairing(norm_pages)
+    orig_by_idx = {p.source.page_index: img for p, img in zip(doc.pages, originals)}
+    ins = detect_blank_insertions(norm_pages, pairing, orig_by_idx.__getitem__) if pages is None else None
+    if ins and ins.get("gaps"):
+        slots = logical_page_indices(norm_pages, ins["insert_before"])
+        pairing = determine_duplex_pairing(norm_pages, logical_indices=slots)
     if pairing.known:
-        orig_by_idx = {p.source.page_index: img for p, img in zip(doc.pages, originals)}
         skew_changes = apply_duplex_skew_exceptions(
             norm_pages, pairing, lambda idx: orig_by_idx[idx],
         )
@@ -576,7 +583,7 @@ def analyze_document(
                 if p.source.page_index not in changed_idxs:
                     continue
                 img = orig_by_idx[p.source.page_index]
-                if use_ocr:
+                if use_ocr and not (ins and ins.get("gaps")):
                     ocr_up = _apply_deskew(img, p.deskew.angle_deg)
                     new_regs, _ = content_mod.analyze(
                         img, ocr_up, p.source, model_dir=model_dir,
@@ -586,14 +593,24 @@ def analyze_document(
                         openvino_cache_dir=openvino_cache_dir, runtime=runtime,
                     )
                     p.regions = new_regs
+                old_margin = p.margin
                 _, p.margin = compute_margin(img, p.deskew, p.regions, p.dpi)
+                if ins and ins.get("gaps") and old_margin is not None:
+                    p.margin.tinted = old_margin.tinted
+                    if old_margin.nombre_source != "geom":
+                        p.margin.nombre_box = old_margin.nombre_box
+                        p.margin.nombre_source = old_margin.nombre_source
             if align_nombre:
                 margin_mod.normalize_margins(norm_pages, doc.render.output_margin_mm)
             else:
                 margin_mod.normalize_margins_pass1(norm_pages, doc.render.output_margin_mm)
             _apply_edge_folio_protection(norm_pages, originals_by_idx=orig_by_idx)
-        ins = detect_blank_insertions(norm_pages, pairing)
-        doc.blank_insert_before = list(ins["insert_before"])
+    if ins is not None:
+        if align_nombre:
+            align_after_blank_insertions(norm_pages, ins, orig_by_idx.__getitem__)
+        doc.blank_insert_before = ins["insert_before"]
+    if align_nombre:
+        align_illustrated_folios(norm_pages, orig_by_idx.get)
     prof["nombre+normalize"] += perf_counter() - t
 
     # 6. learned page-kind override (from accumulated review decisions)
@@ -704,9 +721,9 @@ def run(
             # structure / statistics only, never OCR text. Only on a full run -- a
             # --pages subset must not overwrite the whole-book profile.
             _save_profile(store, doc_id, result)
-            if result.document.blank_insert_before:
-                meta = store.get_doc_meta(doc_id)
-                meta["blank_insert_before"] = list(result.document.blank_insert_before)
+            meta = store.get_doc_meta(doc_id)
+            if result.document.blank_insert_before or "blank_insert_before" in meta:
+                meta["blank_insert_before"] = result.document.blank_insert_before
                 store.set_doc_meta(doc_id, meta)
         else:
             # key by the TRUE pdf page index (not enumeration) so a --pages subset
@@ -862,15 +879,39 @@ def recompute_margins(store: Store, doc_id: str,
     """Re-run nombre-anchored margin normalization across a document's stored
     pages and persist the new crops. Returns the number of pages.
 
-    Normalize-ONLY: detection (find_content_box / nombre) is never re-run, so
-    manual content/nombre overrides are preserved. Because the output crop SIZE
-    is the largest content extent in each parity group, editing one page's
-    content/nombre changes the crop of its whole group — so the recompute spans
-    every page. This is cheap (pure geometry over stored boxes; no image/OCR).
+    Keep stored content boxes and manual folio overrides. If available, the
+    source can supply missing folio geometry for illustrated pages without OCR.
+    Recompute every page because the output size and folio grid are shared
+    across the document.
     """
+    from .duplex import (
+        _legacy_blank_insertions,
+        align_after_blank_insertions,
+        align_illustrated_folios,
+        determine_duplex_pairing,
+    )
+    from .source import load_single, orient
+
     rows = store.list_pages(doc_id)
     pages = [r.params for r in rows]
     margin_mod.normalize_margins(pages, output_margin_mm)
+    inserts = store.get_doc_meta(doc_id).get("blank_insert_before", [])
+    by_index = {p.source.page_index: p.source for p in pages}
+
+    def load(idx: int) -> np.ndarray:
+        ref = by_index[idx]
+        return orient(load_single(ref.path, idx)[0], ref)
+
+    if inserts:
+        legacy = _legacy_blank_insertions(pages, determine_duplex_pairing(pages))
+        if inserts != legacy["insert_before"]:
+            have_source = all(ref.path and os.path.isfile(ref.path) for ref in by_index.values())
+            align_after_blank_insertions(
+                pages, {"insert_before": inserts, "gaps": inserts}, load if have_source else None,
+            )
+    align_illustrated_folios(
+        pages, lambda idx: load(idx) if os.path.isfile(by_index[idx].path or "") else None,
+    )
     _sync_review_status(pages)
     for p in pages:
         store.upsert_page(doc_id, p.source.page_index, p)
@@ -1184,36 +1225,50 @@ def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
     _apply_edge_folio_protection(pages, source_path=source_path)
 
     from .duplex import (
+        align_after_blank_insertions,
+        align_illustrated_folios,
         apply_duplex_skew_exceptions,
         detect_blank_insertions,
         determine_duplex_pairing,
+        logical_page_indices,
     )
     pairing = determine_duplex_pairing(pages)
+    from .source import load_single, orient
+
+    by_index = {p.source.page_index: p for p in pages}
+
+    def _load_oriented(idx: int) -> np.ndarray:
+        img, _ = load_single(source_path, idx)
+        return orient(img, by_index[idx].source)
+
+    ins = detect_blank_insertions(pages, pairing, _load_oriented)
+    if ins.get("gaps"):
+        slots = logical_page_indices(pages, ins["insert_before"])
+        pairing = determine_duplex_pairing(pages, logical_indices=slots)
     if pairing.known:
-        from .source import load_single, orient
-
-        def _load_oriented(idx: int) -> np.ndarray:
-            img, _ = load_single(source_path, idx)
-            p_match = next(pp for pp in pages if pp.source.page_index == idx)
-            return orient(img, p_match.source)
-
         skew_changes = apply_duplex_skew_exceptions(pages, pairing, _load_oriented)
         if skew_changes:
             changed_idxs = {c["page_index"] for c in skew_changes}
             for p in pages:
                 if p.source.page_index in changed_idxs:
-                    was_tinted = bool(p.margin and p.margin.tinted)
+                    old_margin = p.margin
                     _, p.margin = _load_and_compute_margin((source_path, p))[1:3]
-                    if p.margin is not None:
-                        p.margin.tinted = was_tinted
+                    if p.margin is not None and old_margin is not None:
+                        p.margin.tinted = old_margin.tinted
+                        if ins.get("gaps") and old_margin.nombre_source != "geom":
+                            p.margin.nombre_box = old_margin.nombre_box
+                            p.margin.nombre_source = old_margin.nombre_source
             if align_nombre:
                 margin_mod.normalize_margins(pages, output_margin_mm)
             else:
                 margin_mod.normalize_margins_pass1(pages, output_margin_mm)
             _apply_edge_folio_protection(pages, source_path=source_path)
-        ins = detect_blank_insertions(pages, pairing)
-        meta = store.get_doc_meta(doc_id)
-        meta["blank_insert_before"] = list(ins["insert_before"])
+    if align_nombre:
+        align_after_blank_insertions(pages, ins, _load_oriented)
+        align_illustrated_folios(pages, _load_oriented)
+    meta = store.get_doc_meta(doc_id)
+    if pairing.known or ins["insert_before"] or "blank_insert_before" in meta:
+        meta["blank_insert_before"] = ins["insert_before"]
         store.set_doc_meta(doc_id, meta)
 
     _sync_review_status(pages)
