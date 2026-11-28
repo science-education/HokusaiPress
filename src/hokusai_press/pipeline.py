@@ -561,6 +561,7 @@ def analyze_document(
     )
     from .duplex import (
         align_after_blank_insertions,
+        align_illustrated_folios,
         apply_duplex_skew_exceptions,
         detect_blank_insertions,
         determine_duplex_pairing,
@@ -608,6 +609,8 @@ def analyze_document(
         if align_nombre:
             align_after_blank_insertions(norm_pages, ins, orig_by_idx.__getitem__)
         doc.blank_insert_before = ins["insert_before"]
+    if align_nombre:
+        align_illustrated_folios(norm_pages, orig_by_idx.get)
     prof["nombre+normalize"] += perf_counter() - t
 
     # 6. learned page-kind override (from accumulated review decisions)
@@ -876,36 +879,39 @@ def recompute_margins(store: Store, doc_id: str,
     """Re-run nombre-anchored margin normalization across a document's stored
     pages and persist the new crops. Returns the number of pages.
 
-    Normalize-ONLY: detection (find_content_box / nombre) is never re-run, so
-    manual content/nombre overrides are preserved. Because the output crop SIZE
-    is the largest content extent in each parity group, editing one page's
-    content/nombre changes the crop of its whole group — so the recompute spans
-    every page. This is cheap (pure geometry over stored boxes; no image/OCR).
+    Keep stored content boxes and manual folio overrides. If available, the
+    source can supply missing folio geometry for illustrated pages without OCR.
+    Recompute every page because the output size and folio grid are shared
+    across the document.
     """
+    from .duplex import (
+        _legacy_blank_insertions,
+        align_after_blank_insertions,
+        align_illustrated_folios,
+        determine_duplex_pairing,
+    )
+    from .source import load_single, orient
+
     rows = store.list_pages(doc_id)
     pages = [r.params for r in rows]
     margin_mod.normalize_margins(pages, output_margin_mm)
     inserts = store.get_doc_meta(doc_id).get("blank_insert_before", [])
-    if inserts:
-        from .duplex import (
-            _legacy_blank_insertions,
-            align_after_blank_insertions,
-            determine_duplex_pairing,
-        )
-        from .source import load_single, orient
+    by_index = {p.source.page_index: p.source for p in pages}
 
+    def load(idx: int) -> np.ndarray:
+        ref = by_index[idx]
+        return orient(load_single(ref.path, idx)[0], ref)
+
+    if inserts:
         legacy = _legacy_blank_insertions(pages, determine_duplex_pairing(pages))
         if inserts != legacy["insert_before"]:
-            by_index = {p.source.page_index: p.source for p in pages}
-
-            def load(idx: int) -> np.ndarray:
-                ref = by_index[idx]
-                return orient(load_single(ref.path, idx)[0], ref)
-
             have_source = all(ref.path and os.path.isfile(ref.path) for ref in by_index.values())
             align_after_blank_insertions(
                 pages, {"insert_before": inserts, "gaps": inserts}, load if have_source else None,
             )
+    align_illustrated_folios(
+        pages, lambda idx: load(idx) if os.path.isfile(by_index[idx].path or "") else None,
+    )
     _sync_review_status(pages)
     for p in pages:
         store.upsert_page(doc_id, p.source.page_index, p)
@@ -1220,6 +1226,7 @@ def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
 
     from .duplex import (
         align_after_blank_insertions,
+        align_illustrated_folios,
         apply_duplex_skew_exceptions,
         detect_blank_insertions,
         determine_duplex_pairing,
@@ -1258,6 +1265,7 @@ def recompute_shadows_and_margins(store: Store, doc_id: str, source_path: str,
             _apply_edge_folio_protection(pages, source_path=source_path)
     if align_nombre:
         align_after_blank_insertions(pages, ins, _load_oriented)
+        align_illustrated_folios(pages, _load_oriented)
     meta = store.get_doc_meta(doc_id)
     if pairing.known or ins["insert_before"] or "blank_insert_before" in meta:
         meta["blank_insert_before"] = ins["insert_before"]

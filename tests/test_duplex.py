@@ -8,6 +8,7 @@ import pytest
 
 from hokusai_press.duplex import (
     align_after_blank_insertions,
+    align_illustrated_folios,
     apply_duplex_skew_exceptions,
     apply_duplex_translation_exceptions,
     detect_blank_insertions,
@@ -136,6 +137,60 @@ def test_duplex_translation_partner_median_uncorrected():
     # Uncorrected page 8 keeps base crop and gets warning flag
     assert pages[8].margin.crop == p8_base
     assert Flag.MARGIN_INCONSISTENT in pages[8].flags
+
+
+@pytest.mark.parametrize("kind", [RegionKind.PHOTO, RegionKind.FIGURE])
+@pytest.mark.parametrize("case", ["align", "clip", "blank", "known_box", "broken_run", "caption"])
+def test_align_illustrated_folio_from_local_numbered_run(kind, case):
+    pages = _make_duplex_book()
+    for p in pages:
+        p.page_number += 20
+        m = p.margin
+        m.crop = Box(150, 200, 1750, 2900)
+        m.target_h = m.crop.height
+        m.nombre_box = (
+            Box(320, 2800, 334, 2830) if p.page_number % 2 else Box(1560, 2800, 1574, 2830)
+        )
+    idx = 8
+    page = pages[idx]
+    m = page.margin
+    plate = Box(280, 500, 1670, 2550)
+    m.content = Box(280, 500, 1670, 2830)
+    page.regions = [Region(kind, plate)]
+    if case != "known_box":
+        m.nombre_box = None
+        m.nombre_source = None
+    if case == "broken_run":
+        pages[idx + 1].page_number += 1
+    if case == "clip":
+        # Crop must keep the entire plate even when there is no OCR text.
+        m.content.x0 = 152
+        plate.x0 = 152
+    if case == "caption":
+        page.regions.append(Region(RegionKind.TEXT, Box(325, 2770, 600, 2850), ocr_text="caption"))
+    image = np.full((3000, 2000), 255, dtype=np.uint8)
+    if case != "blank":
+        image[2800:2830, 330:339] = 0
+        image[2800:2830, 346:355] = 0
+    crops = [p.margin.crop for p in pages]
+    loaded = []
+
+    def load(index):
+        loaded.append(index)
+        return image
+
+    changed = align_illustrated_folios(pages, load)
+    assert loaded == ([] if case in ("known_box", "broken_run") else [idx])
+    assert page.page_number == 29
+    if case == "align":
+        assert changed == [idx]
+        assert m.crop == Box(160, 200, 1760, 2900)
+        assert m.nombre_box is None
+        assert align_illustrated_folios(pages, load) == []
+        crops[idx] = m.crop
+    else:
+        assert changed == []
+    assert [p.margin.crop for p in pages] == crops
 
 
 def test_unknown_pairing_leaves_pages_untouched():

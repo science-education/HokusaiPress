@@ -13,7 +13,7 @@ from typing import Callable, Optional
 import cv2
 import numpy as np
 
-from .model import Box, Deskew, Flag, PageParams
+from .model import Box, Deskew, Flag, PageParams, RegionKind
 
 TRUSTED_FOLIO_SOURCES = frozenset({"folio", "inverted_folio", "folio_roman"})
 ARABIC_FOLIO_SOURCES = frozenset({"folio", "inverted_folio"})
@@ -645,7 +645,9 @@ def _folio_geometry(pages: list[PageParams]) -> Optional[np.ndarray]:
     return grid
 
 
-def _scan_folio_box(image: np.ndarray, p: PageParams, grid, side: int) -> Optional[Box]:
+def _scan_folio_box(
+    image: np.ndarray, p: PageParams, grid, side: int, *, expected_digits: Optional[int] = None,
+) -> Optional[Box]:
     """Locate digit-sized ink at a known folio location without recognizing text."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     h, w = gray.shape
@@ -675,10 +677,106 @@ def _scan_folio_box(image: np.ndarray, p: PageParams, grid, side: int) -> Option
         return None
     y = min(glyphs, key=lambda g: abs(top + (g[1] + g[3]) / 2 - (y0 + y1) / 2))[1]
     glyphs = [g for g in glyphs if abs(g[1] - y) <= dh * 0.22]
+    if expected_digits is not None and len(glyphs) != expected_digits:
+        return None
     return Box(
-        left + min(g[0] for g in glyphs), top + min(g[1] for g in glyphs),
-        left + max(g[2] for g in glyphs), top + max(g[3] for g in glyphs),
+        float(left + min(g[0] for g in glyphs)), float(top + min(g[1] for g in glyphs)),
+        float(left + max(g[2] for g in glyphs)), float(top + max(g[3] for g in glyphs)),
     )
+
+
+def align_illustrated_folios(
+    pages: list[PageParams], load_image: Callable[[int], Optional[np.ndarray]],
+) -> list[int]:
+    """Align a read folio with missing geometry on a page dominated by a plate.
+
+    Run after normal alignment. Use the local numbered run for the scan and
+    output positions, and keep the recovered box out of the reference pool.
+    """
+    from .geometry.margin import folio_not_found
+
+    refs = {
+        p.source.page_index: p for p in pages
+        if _is_trusted_folio(p) and p.page_number_source in ARABIC_FOLIO_SOURCES
+        and not folio_not_found(p) and not p.margin.fill and Flag.CONTENT_SCALED_DOWN not in p.flags
+    }
+    changed = []
+    for p in pages:
+        m = p.margin
+        if (p.blank or p.page_number_source not in ARABIC_FOLIO_SOURCES or not p.page_number
+                or not (m and m.crop and m.content and m.page_w and m.page_h)
+                or m.nombre_box is not None or m.nombre_source == "manual" or m.tinted or m.fill
+                or Flag.CONTENT_SCALED_DOWN in p.flags):
+            continue
+        c = m.content
+        if not any(
+            r.kind in (RegionKind.PHOTO, RegionKind.FIGURE)
+            and max(0, min(c.x1, r.box.x1) - max(c.x0, r.box.x0))
+            * max(0, min(c.y1, r.box.y1) - max(c.y0, r.box.y0)) > c.width * c.height / 2
+            for r in p.regions
+        ):
+            continue
+        idx = p.source.page_index
+        offset = p.page_number - idx
+        local = {
+            k: q for k in range(idx - 16, idx + 17)
+            if (q := refs.get(k)) is not None and q.page_number - k == offset
+        }
+        if idx - 1 not in local or idx + 1 not in local:
+            continue
+        grid = _folio_geometry(list(local.values()))
+        if grid is None:
+            continue
+        side = p.page_number % 2
+        left = grid[side, 0] < 0.5
+        targets = []
+        for q in local.values():
+            if q.page_number % 2 == side:
+                b, crop = q.margin.nombre_box, q.margin.crop
+                edge = b.x0 - crop.x0 if left else crop.x1 - b.x1
+                targets.append((edge / crop.width, ((b.y0 + b.y1) / 2 - crop.y0) / crop.height))
+        target = np.median(targets, axis=0)
+        # Require the output grid to agree locally, even when the scan
+        # positions vary. Half a percent is about 0.6 mm on a 120 mm page.
+        if np.count_nonzero(np.all(np.abs(np.asarray(targets) - target) <= 0.005, axis=1)) < 6:
+            continue
+        image = load_image(idx)
+        if image is None:
+            continue
+        b = _scan_folio_box(image, p, grid, side, expected_digits=len(str(p.page_number)))
+        if b is None or any(
+            b.x0 < r.box.x1 and r.box.x0 < b.x1 and b.y0 < r.box.y1 and r.box.y0 < b.y1
+            for r in p.regions
+        ):
+            continue
+
+        crop = m.crop
+        tx, ty = map(float, target)
+        x = b.x0 - tx * crop.width if left else b.x1 - (1 - tx) * crop.width
+        y = (b.y0 + b.y1) / 2 - ty * crop.height
+        shift = max(abs(x - crop.x0), abs(y - crop.y0))
+        dpi = p.dpi or 300.0
+        if shift > 12 * dpi / 25.4:
+            continue
+        candidate = Box(x, y, x + crop.width, y + crop.height)
+        protected = [c, b, *(r.box for r in p.regions)]
+        if m.edge_folio_box is not None:
+            protected.append(m.edge_folio_box)
+        if any(
+            box.x0 < candidate.x0 or box.y0 < candidate.y0
+            or box.x1 > candidate.x1 or box.y1 > candidate.y1
+            for box in protected
+        ):
+            continue
+        protect_folio = m.edge_folio_box is None and (
+            b.x0 < c.x0 - 0.5 or b.y0 < c.y0 - 0.5 or b.x1 > c.x1 + 0.5 or b.y1 > c.y1 + 0.5
+        )
+        if protect_folio:
+            m.edge_folio_box = b
+        if shift > 0.5 or protect_folio:
+            m.crop = candidate
+            changed.append(idx)
+    return changed
 
 
 def _scan_content_sides(pages, grid) -> tuple[list, set[int]]:
