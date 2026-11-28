@@ -6,6 +6,7 @@ first; these routines only intervene on pages that fail a duplex-pair check.
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -35,9 +36,17 @@ class DuplexPairing:
     med: Optional[dict[int, tuple[float, float]]]
     trusted: list[bool]
     n_pages: int
+    logical_indices: Optional[list[int]] = None
 
     def partner_of(self, index: int) -> Optional[int]:
         """Return the partner page index on the same physical sheet, or None."""
+        if self.logical_indices is not None:
+            slot = self.logical_indices[index]
+            partner = slot + 1 if slot % 2 == self.parity else slot - 1
+            j = bisect_left(self.logical_indices, partner)
+            if j < self.n_pages and self.logical_indices[j] == partner:
+                return j
+            return None
         j = index + 1 if (index % 2 == self.parity) else index - 1
         return j if 0 <= j < self.n_pages else None
 
@@ -82,6 +91,7 @@ def determine_duplex_pairing(
     pages: list[PageParams],
     min_pairs: int = MIN_DUPLEX_PAIRS,
     min_corr_x: float = MIN_DUPLEX_CORR_X,
+    logical_indices: Optional[list[int]] = None,
 ) -> DuplexPairing:
     """Part A: determine physical sheet pairing for a book.
 
@@ -90,6 +100,8 @@ def determine_duplex_pairing(
     mirrored horizontal crop-center residuals (Spearman corr <= min_corr_x).
     """
     n = len(pages)
+    slots = logical_indices if logical_indices is not None else list(range(n))
+    positions = {slot: i for i, slot in enumerate(slots)}
     trusted = [_is_trusted_folio(p) for p in pages]
 
     c_norm = 0
@@ -97,7 +109,7 @@ def determine_duplex_pairing(
     for i, p in enumerate(pages):
         if p.blank or p.page_number is None or p.page_number_source not in ARABIC_FOLIO_SOURCES:
             continue
-        if (p.page_number + i) % 2 == 1:
+        if (p.page_number + slots[i]) % 2 == 1:
             c_norm += 1
         else:
             c_shift += 1
@@ -106,7 +118,7 @@ def determine_duplex_pairing(
     offsets = [_crop_center_offset_mm(p) for p in pages]
     med: dict[int, tuple[float, float]] = {}
     for par in (0, 1):
-        pts = [offsets[i] for i in range(n) if trusted[i] and i % 2 == par and offsets[i] is not None]
+        pts = [offsets[i] for i in range(n) if trusted[i] and slots[i] % 2 == par and offsets[i] is not None]
         if len(pts) < 5:
             return DuplexPairing(
                 known=False, parity=parity, status="不明",
@@ -119,12 +131,13 @@ def determine_duplex_pairing(
 
     pairs: list[tuple[tuple[float, float], tuple[float, float]]] = []
     for i in range(n):
-        j = i + 1 if (i % 2 == parity) else i - 1
-        if 0 <= j < n and i < j and trusted[i] and trusted[j]:
+        slot = slots[i]
+        j = positions.get(slot + 1 if slot % 2 == parity else slot - 1)
+        if j is not None and i < j and trusted[i] and trusted[j]:
             oi, oj = offsets[i], offsets[j]
             if oi is not None and oj is not None:
-                ri = (oi[0] - med[i % 2][0], oi[1] - med[i % 2][1])
-                rj = (oj[0] - med[j % 2][0], oj[1] - med[j % 2][1])
+                ri = (oi[0] - med[slots[i] % 2][0], oi[1] - med[slots[i] % 2][1])
+                rj = (oj[0] - med[slots[j] % 2][0], oj[1] - med[slots[j] % 2][1])
                 pairs.append((ri, rj))
 
     if len(pairs) < min_pairs:
@@ -151,6 +164,7 @@ def determine_duplex_pairing(
         med=med,
         trusted=trusted,
         n_pages=n,
+        logical_indices=logical_indices,
     )
 
 
@@ -173,6 +187,7 @@ def apply_duplex_translation_exceptions(
     if not pairing.known or pairing.med is None:
         return result
 
+    slots = pairing.logical_indices if pairing.logical_indices is not None else range(len(pages))
     folio_indices = [i for i, p in enumerate(pages) if p.page_number is not None]
     if not folio_indices:
         return result
@@ -215,10 +230,10 @@ def apply_duplex_translation_exceptions(
         cw, ch = m.crop.width, m.crop.height
         base_crop = Box(m.crop.x0, m.crop.y0, m.crop.x1, m.crop.y1)
 
-        rj_x = oj[0] - pairing.med[j % 2][0]
-        rj_y = oj[1] - pairing.med[j % 2][1]
-        ox_p = pairing.med[i % 2][0] - rj_x
-        oy_p = pairing.med[i % 2][1] + rj_y
+        rj_x = oj[0] - pairing.med[slots[j] % 2][0]
+        rj_y = oj[1] - pairing.med[slots[j] % 2][1]
+        ox_p = pairing.med[slots[i] % 2][0] - rj_x
+        oy_p = pairing.med[slots[i] % 2][1] + rj_y
         x0 = m.page_w / 2.0 + ox_p * px_per_mm - cw / 2.0
         y0 = m.page_h / 2.0 + oy_p * px_per_mm - ch / 2.0
         cand_partner = Box(x0, y0, x0 + cw, y0 + ch)
@@ -238,7 +253,7 @@ def apply_duplex_translation_exceptions(
             result["partner"].append(i)
             continue
 
-        ox_m, oy_m = pairing.med[i % 2]
+        ox_m, oy_m = pairing.med[slots[i] % 2]
         x0_m = m.page_w / 2.0 + ox_m * px_per_mm - cw / 2.0
         y0_m = m.page_h / 2.0 + oy_m * px_per_mm - ch / 2.0
         cand_median = Box(x0_m, y0_m, x0_m + cw, y0_m + ch)
@@ -571,7 +586,7 @@ def apply_duplex_skew_exceptions(
     return changes
 
 
-def detect_blank_insertions(
+def _legacy_blank_insertions(
     pages: list[PageParams],
     pairing: DuplexPairing,
 ) -> dict:
@@ -600,3 +615,286 @@ def detect_blank_insertions(
         "reason": "ambiguous_interval",
         "candidates": candidates,
     }
+
+
+def _sheet_content(p: PageParams) -> Optional[np.ndarray]:
+    m = p.margin
+    if p.blank or not (m and m.content and m.page_w and m.page_h) or m.tinted:
+        return None
+    c = m.content
+    return np.array([c.x0 / m.page_w, c.x1 / m.page_w, c.y1 / m.page_h])
+
+
+def _folio_geometry(pages: list[PageParams]) -> Optional[np.ndarray]:
+    """Learn the two scan-space folio locations from independently read folios."""
+    refs = [[], []]
+    for p in pages:
+        if not _is_trusted_folio(p):
+            continue
+        m = p.margin
+        b = m.nombre_box
+        refs[p.page_number % 2].append(
+            (b.x0 / m.page_w, b.y0 / m.page_h, b.x1 / m.page_w, b.y1 / m.page_h)
+        )
+    if min(map(len, refs)) < 6:
+        return None
+    grid = np.array([np.median(group, axis=0) for group in refs])
+    x = (grid[:, 0] + grid[:, 2]) / 2
+    if abs(x[0] - x[1]) < 0.40 or abs(grid[0, 1] - grid[1, 1]) > 0.02:
+        return None
+    return grid
+
+
+def _scan_folio_box(image: np.ndarray, p: PageParams, grid, side: int) -> Optional[Box]:
+    """Locate digit-sized ink at a known folio location without recognizing text."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    h, w = gray.shape
+    angle = p.deskew.angle_deg
+    if abs(angle) > 1e-3:
+        mat = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1)
+        gray = cv2.warpAffine(gray, mat, (w, h), borderValue=255)
+    x0, y0, x1, y1 = grid[side] * np.array([w, h, w, h])
+    dh = y1 - y0
+    pad_x = min(w * 0.018, dh)
+    pad_y = dh * 0.9
+    left, top = max(0, int(x0 - pad_x)), max(0, int(y0 - pad_y))
+    right, bottom = min(w, int(x1 + pad_x)), min(h, int(y1 + pad_y))
+    roi = gray[top:bottom, left:right]
+    if not roi.size or roi.min() >= 145:
+        return None
+    _, mask = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    _, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+    glyphs = [
+        (x, y, x + bw, y + bh)
+        for x, y, bw, bh, area in stats[1:]
+        if 0 < x < x + bw < roi.shape[1] and 0 < y < y + bh < roi.shape[0]
+        and dh * 0.55 <= bh <= dh * 1.45 and 0.18 * bh <= bw <= 1.15 * bh
+        and area >= bw * bh * 0.16
+    ]
+    if not glyphs:
+        return None
+    y = min(glyphs, key=lambda g: abs(top + (g[1] + g[3]) / 2 - (y0 + y1) / 2))[1]
+    glyphs = [g for g in glyphs if abs(g[1] - y) <= dh * 0.22]
+    return Box(
+        left + min(g[0] for g in glyphs), top + min(g[1] for g in glyphs),
+        left + max(g[2] for g in glyphs), top + max(g[3] for g in glyphs),
+    )
+
+
+def _scan_content_sides(pages, grid) -> tuple[list, set[int]]:
+    """Recognize mirrored type areas plus matching single-column chapter dividers."""
+    shapes = [_sheet_content(p) for p in pages]
+    refs = [[e for p, e in zip(pages, shapes) if e is not None
+             and _is_trusted_folio(p) and p.page_number % 2 == side] for side in (0, 1)]
+    if min(map(len, refs)) < 6:
+        return [], set()
+    med = np.array([np.median(group, axis=0) for group in refs])
+    delta = med[1] - med[0]
+    if (
+        min(abs(delta[:2])) < 0.025 or delta[0] * delta[1] <= 0
+        or abs(delta[2]) > 0.025 or not np.all(med[:, 0] < 0.28)
+        or not np.all(med[:, 1] > 0.72)
+    ):
+        return [], set()
+
+    sides = [None] * len(pages)
+    dividers = set()
+    for i, (p, shape) in enumerate(zip(pages, shapes)):
+        if _is_trusted_folio(p):
+            sides[i] = p.page_number % 2
+        elif shape is not None:
+            dist = np.max(abs(med - shape), axis=1)
+            side = int(np.argmin(dist))
+            if dist[side] < 0.026 and dist[1 - side] - dist[side] > 0.018:
+                sides[i] = side
+            elif (
+                grid[1, 0] < 0.30 and len(p.regions) == 1 and p.regions[0].ocr_text
+                and 0.14 < shape[0] < 0.30 and shape[1] - shape[0] < 0.065
+                and 0.30 < shape[2] < 0.55
+                and 0.10 < p.margin.content.y0 / p.margin.page_h < 0.25
+            ):
+                dividers.add(i)
+    return sides, dividers
+
+
+def _alternates(sides, start: int, step: int, length: int = 3) -> bool:
+    indices = range(start, start + step * length, step)
+    return all(0 <= i < len(sides) and sides[i] is not None
+               and sides[i] == (sides[start] + abs(i - start)) % 2 for i in indices)
+
+
+def detect_blank_insertions(
+    pages: list[PageParams], pairing: DuplexPairing,
+    load_image: Optional[Callable[[int], np.ndarray]] = None,
+) -> dict:
+    """Find single missing sides using corroborated folio runs or scan geometry.
+
+    Return source indices for the renderer. Geometry-only candidates need
+    alternating runs on both sides. An unread page at the boundary needs
+    a visible folio on exactly one side or the recurring chapter-divider layout.
+    """
+    legacy = _legacy_blank_insertions(pages, pairing)
+    if pages and any(p.source.page_index != i for i, p in enumerate(pages)):
+        return {"insert_before": [], "reason": "noncontiguous_scan", "candidates": []}
+    found = {}
+    arabic = [i for i, p in enumerate(pages)
+             if _is_trusted_folio(p) and p.page_number_source in ARABIC_FOLIO_SOURCES]
+    offsets = {i: pages[i].page_number - i for i in arabic}
+    for i in arabic:
+        if (
+            i - 1 in offsets and offsets[i] == offsets[i - 1] + 1
+            and offsets.get(i - 2) == offsets.get(i - 3) == offsets[i - 1]
+            and offsets.get(i + 1) == offsets.get(i + 2) == offsets[i]
+        ):
+            found[i] = "folio_sequence"
+
+    grid = _folio_geometry(pages) if pairing.known else None
+    sides, dividers = _scan_content_sides(pages, grid) if grid is not None else ([], set())
+    # Learn where a divider sits from intact runs whose folios bracket it.
+    # A title's placement alone is insufficient evidence for an omitted side.
+    divider_refs = [
+        _sheet_content(pages[i])[0] for i in dividers
+        if i - 1 in offsets and offsets.get(i + 1) == offsets[i - 1]
+        and sides[i - 1] == sides[i + 1] == 0
+    ]
+    if divider_refs:
+        divider_x = float(np.median(divider_refs))
+        for i in sorted(dividers):
+            if abs(_sheet_content(pages[i])[0] - divider_x) > 0.025:
+                continue
+            if _alternates(sides, i - 1, -1) and _alternates(sides, i + 1, 1):
+                sides[i] = 1
+                if sides[i - 1] == 1 and sides[i + 1] == 0:
+                    found[i] = "chapter_divider"
+
+    if load_image is not None:
+        for i in range(1, len(sides) - 1):
+            if sides[i] is not None or pages[i].blank or _sheet_content(pages[i]) is None:
+                continue
+            if sides[i - 1] is None or sides[i + 1] is None or sides[i - 1] == sides[i + 1]:
+                continue
+            if not (_alternates(sides, i - 1, -1) and _alternates(sides, i + 1, 1, 4)):
+                continue
+            p = pages[i]
+            img = load_image(p.source.page_index)
+            matches = [side for side in (0, 1) if _scan_folio_box(img, p, grid, side)]
+            if len(matches) == 1:
+                sides[i] = matches[0]
+
+    for i in range(1, len(sides)):
+        if (
+            sides[i - 1] is not None and sides[i - 1] == sides[i]
+            and _alternates(sides, i - 1, -1, 4) and _alternates(sides, i, 1, 4)
+        ):
+            found.setdefault(i, "mirrored_type_area")
+
+    # A pair of trusted Arabic folios bounds how many scans can be missing.
+    # Remove ambiguous geometry guesses within the entire contradictory interval.
+    for a, b in zip(arabic, arabic[1:]):
+        guesses = [i for i in found if a < i <= b]
+        if guesses and len(guesses) != offsets[b] - offsets[a]:
+            for i in guesses:
+                del found[i]
+
+    if not found:
+        return legacy
+
+    # Interior gaps can account for a shifted book on their own. Preserve the
+    # established front insertion only when the first observed phase needs it.
+    first = next((i for i, p in enumerate(pages) if _is_trusted_folio(p)), None)
+    front = legacy["insert_before"] if first is None or (
+        pages[first].page_number + first
+    ) % 2 == 0 else []
+    indices = sorted(set(front) | found.keys())
+    return {"insert_before": indices, "reason": "supported_gaps", "candidates": indices,
+            "gaps": found}
+
+
+def logical_page_indices(pages: list[PageParams], insert_before: list[int]) -> list[int]:
+    """Map each scan to its output slot while retaining its source index."""
+    boundaries = sorted(set(insert_before))
+    return [p.source.page_index + bisect_right(boundaries, p.source.page_index) for p in pages]
+
+
+def align_after_blank_insertions(pages, result, load_image=None) -> list[int]:
+    """Use the established folio grid on sides whose scan parity was wrong."""
+    from collections import Counter
+
+    from .geometry.margin import _clips_interior_ocr_text, protect_edge_folio
+
+    if not result.get("gaps"):
+        return []
+    logical = logical_page_indices(pages, result["insert_before"])
+    trusted = [(i, p) for i, p in zip(logical, pages) if _is_trusted_folio(p)
+               and p.page_number_source in ARABIC_FOLIO_SOURCES]
+    if not trusted:
+        return []
+    phase, _ = Counter((p.page_number - i) % 2 for i, p in trusted).most_common(1)[0]
+    baseline, _ = Counter((p.page_number - p.source.page_index) % 2
+                          for _, p in trusted).most_common(1)[0]
+    grid = _folio_geometry(pages)
+    if grid is None:
+        return []
+    scan_sides, dividers = _scan_content_sides(pages, grid)
+    refs = [[], []]
+    for i, p in trusted:
+        if p.page_number % 2 != (i + phase) % 2:
+            continue
+        m = p.margin
+        b = m.nombre_box
+        c = m.crop
+        side = p.page_number % 2
+        left = grid[side, 0] < 0.5
+        edge = b.x0 - c.x0 if left else c.x1 - b.x1
+        refs[side].append((edge / c.width, ((b.y0 + b.y1) / 2 - c.y0) / c.height,
+                           (c.x0 + c.width / 2) / m.page_w,
+                           (c.y0 + c.height / 2) / m.page_h))
+    if min(map(len, refs)) < 6:
+        return []
+    targets = [np.median(group, axis=0) for group in refs]
+
+    changed = []
+    for i, p in zip(logical, pages):
+        idx = p.source.page_index
+        m = p.margin
+        side = (i + phase) % 2
+        if side == (idx + baseline) % 2 or p.blank or not (m and m.crop and m.content
+                and m.page_w and m.page_h) or m.tinted or m.fill or Flag.CONTENT_SCALED_DOWN in p.flags:
+            continue
+        left = grid[side, 0] < 0.5
+        tx, ty, cx, cy = targets[side]
+        c = m.crop
+        box = m.nombre_box if (
+            m.nombre_source == "manual" or (_is_trusted_folio(p) and p.page_number % 2 == side)
+        ) else None
+        old_edge = m.edge_folio_box
+        recovered = None
+        if box is None and load_image is not None:
+            recovered = _scan_folio_box(load_image(idx), p, grid, side)
+            box = recovered
+        if box is not None:
+            x = box.x0 - tx * c.width if left else box.x1 - (1 - tx) * c.width
+            y = (box.y0 + box.y1) / 2 - ty * c.height
+        elif idx in dividers or (scan_sides and scan_sides[idx] == side):
+            x = cx * m.page_w - c.width / 2
+            y = cy * m.page_h - c.height / 2
+        else:
+            # A shifted slot alone does not establish where an irregular,
+            # unnumbered page (e.g. an advertisement) should be positioned.
+            continue
+        dp = p.dpi or 300.0
+        cap = 12 * dp / 25.4
+        if max(abs(x - c.x0), abs(y - c.y0)) > cap:
+            continue
+        cand = Box(x, y, x + c.width, y + c.height)
+        if _clips_interior_ocr_text(p, cand, dp):
+            continue
+        m.crop = cand
+        if recovered is not None and (
+            recovered.x0 < m.content.x0 or recovered.y0 < m.content.y0
+            or recovered.x1 > m.content.x1 or recovered.y1 > m.content.y1
+        ):
+            protect_edge_folio(p, recovered)
+        if m.crop != c or m.edge_folio_box != old_edge:
+            changed.append(idx)
+    return changed

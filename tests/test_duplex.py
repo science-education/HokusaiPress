@@ -7,10 +7,12 @@ import pypdfium2 as pdfium
 import pytest
 
 from hokusai_press.duplex import (
+    align_after_blank_insertions,
     apply_duplex_skew_exceptions,
     apply_duplex_translation_exceptions,
     detect_blank_insertions,
     determine_duplex_pairing,
+    logical_page_indices,
 )
 from hokusai_press.model import (
     Box,
@@ -347,3 +349,61 @@ def test_predicted_folio_noop_when_no_ink():
     ef = detect_predicted_folio_box(blank_img, pages, 4, dpi=300.0)
     assert ef is None
     assert p4.margin.edge_folio_box is None
+
+
+@pytest.mark.parametrize("skipped", [False, True])
+def test_supported_internal_blank_keeps_source_indices_and_restores_sheet_parity(skipped):
+    pages = _make_duplex_book(n_pages=40, parity=0)
+    if skipped:
+        del pages[15]
+        for i, page in enumerate(pages):
+            page.source.page_index = i
+
+    before = [page.margin.crop for page in pages]
+    pairing = determine_duplex_pairing(pages)
+    result = detect_blank_insertions(pages, pairing)
+    assert result["insert_before"] == ([15] if skipped else [])
+    slots = logical_page_indices(pages, result["insert_before"])
+    assert [(slot + 1) % 2 for slot in slots] == [p.page_number % 2 for p in pages]
+    assert [p.source.page_index for p in pages] == list(range(len(pages)))
+
+    corrected = determine_duplex_pairing(pages, logical_indices=slots)
+    assert corrected.known
+    assert corrected.partner_of(13) == 12
+    assert corrected.partner_of(14) == (None if skipped else 15)
+    assert corrected.partner_of(15) == (16 if skipped else 14)
+
+    if not skipped:
+        assert align_after_blank_insertions(pages, result) == []
+        assert [page.margin.crop for page in pages] == before
+
+
+def test_recurring_divider_locates_gap_before_unnumbered_title_page():
+    pages = _make_duplex_book(n_pages=46, parity=0)
+    for p in pages:
+        if p.page_number % 2:
+            p.margin.content = Box(280, 390, 1810, 2700)
+            p.margin.nombre_box = Box(320, 2660, 360, 2690)
+        else:
+            p.margin.content = Box(180, 390, 1710, 2700)
+            p.margin.nombre_box = Box(1640, 2660, 1680, 2690)
+    for i in (8, 18):
+        p = pages[i]
+        p.page_number = None
+        p.page_number_source = None
+        p.margin.nombre_box = None
+        p.margin.nombre_source = None
+        p.margin.content = Box(440, 480, 485, 1300)
+        p.regions = [Region(RegionKind.TEXT, p.margin.content, ocr_text="章扉")]
+    del pages[7]
+    for i, p in enumerate(pages):
+        p.source.page_index = i
+
+    pairing = determine_duplex_pairing(pages)
+    assert pairing.known
+    result = detect_blank_insertions(pages, pairing)
+    assert result["gaps"] == {7: "chapter_divider"}
+    assert result["insert_before"] == [7]
+    slots = logical_page_indices(pages, result["insert_before"])
+    assert slots[7] == 8
+    assert slots[17] == 18
